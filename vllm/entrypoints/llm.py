@@ -157,10 +157,11 @@ class LLM:
         prompt: Optional[str],
         sampling_params: SamplingParams,
         prompt_token_ids: Optional[List[int]],
-    ) -> None:
+    ) -> str:
         request_id = str(next(self.request_counter))
         self.llm_engine.add_request(request_id, prompt, sampling_params,
                                     prompt_token_ids)
+        return request_id
 
     def _run_engine(self, use_tqdm: bool) -> List[RequestOutput]:
         # Initialize tqdm.
@@ -183,3 +184,16 @@ class LLM:
         # its previous requests.
         outputs = sorted(outputs, key=lambda x: int(x.request_id))
         return outputs
+
+    def get_logits(
+        self,
+        prompt: Optional[str],
+        prompt_token_ids: Optional[List[int]] = None,
+    ):
+        sampling_params = SamplingParams(max_tokens=1)
+        request_id = self._add_request(prompt, sampling_params,
+                                       prompt_token_ids)
+        logits = self.llm_engine.get_logits()
+        assert logits is not None
+        self.llm_engine.abort_request(request_id)
+        return logits

@@ -38,13 +38,17 @@ class Sampler(nn.Module):
         hidden_states: torch.Tensor,
         input_metadata: InputMetadata,
         embedding_bias: Optional[torch.Tensor] = None,
+        returns_logits: bool = False,
     ) -> SamplerOutput:
         # Get the hidden states that we use for sampling.
-        hidden_states = _prune_hidden_states(hidden_states, input_metadata)
+        if not returns_logits:
+            hidden_states = _prune_hidden_states(hidden_states, input_metadata)
 
         # Get the logits for the next tokens.
         logits = _get_logits(hidden_states, embedding, embedding_bias,
                              self.vocab_size)
+        if returns_logits:
+            return logits
 
         # Apply presence and frequency penalties.
         output_tokens = _get_output_tokens(input_metadata)

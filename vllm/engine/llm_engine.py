@@ -3,6 +3,8 @@ import time
 from functools import partial
 from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Tuple, Union
 
+import torch
+
 from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
                          SchedulerConfig)
 from vllm.core.scheduler import Scheduler, SchedulerOutputs
@@ -554,9 +556,26 @@ class LLMEngine:
             blocks_to_swap_in=scheduler_outputs.blocks_to_swap_in,
             blocks_to_swap_out=scheduler_outputs.blocks_to_swap_out,
             blocks_to_copy=scheduler_outputs.blocks_to_copy,
+            returns_logits=False,
         )
-
         return self._process_model_outputs(output, scheduler_outputs) + ignored
+
+    def get_logits(self) -> Optional[torch.Tensor]:
+        """Returns the logits of the scheduled sequences."""
+        seq_group_metadata_list, scheduler_outputs, _ = self._schedule()
+        if scheduler_outputs.is_empty():
+            return None
+
+        # Execute the model.
+        output = self._run_workers(
+            "execute_model",
+            seq_group_metadata_list=seq_group_metadata_list,
+            blocks_to_swap_in=scheduler_outputs.blocks_to_swap_in,
+            blocks_to_swap_out=scheduler_outputs.blocks_to_swap_out,
+            blocks_to_copy=scheduler_outputs.blocks_to_copy,
+            returns_logits=True,
+        )
+        return output
 
     def _log_system_stats(
         self,
