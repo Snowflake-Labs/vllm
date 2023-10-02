@@ -403,6 +403,7 @@ class FalconForCausalLM(nn.Module):
         kv_caches: List[KVCache],
         input_metadata: InputMetadata,
         cache_events: Optional[List[torch.cuda.Event]],
+        returns_logits: bool = False,
     ) -> SamplerOutput:
         hidden_states = self.transformer(
             input_ids,
@@ -412,7 +413,7 @@ class FalconForCausalLM(nn.Module):
             cache_events,
         )
         next_tokens = self.sampler(self.lm_head.weight, hidden_states,
-                                   input_metadata)
+                                   input_metadata, returns_logits=returns_logits)
 
         return next_tokens
 

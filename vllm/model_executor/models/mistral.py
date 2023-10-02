@@ -286,11 +286,12 @@ class MistralForCausalLM(nn.Module):
         kv_caches: List[KVCache],
         input_metadata: InputMetadata,
         cache_events: Optional[List[torch.cuda.Event]],
+        returns_logits: bool = False,
     ) -> SamplerOutput:
         hidden_states = self.model(input_ids, positions, kv_caches,
                                    input_metadata, cache_events)
         next_tokens = self.sampler(self.lm_head.weight, hidden_states,
-                                   input_metadata)
+                                   input_metadata, returns_logits=returns_logits)
         return next_tokens
 
     _column_parallel_layers = []
