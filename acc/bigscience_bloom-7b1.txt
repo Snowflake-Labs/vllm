@@ -1,3 +1,6 @@
+WARNING 10-02 18:18:33 config.py:383] The model's config.json does not contain any of the following keys to determine the original maximum length of the model: ['max_position_embeddings', 'n_positions', 'max_seq_len', 'max_sequence_length', 'max_seq_length', 'seq_len']. Assuming the model's maximum length is 2048.
+INFO 10-02 18:18:33 llm_engine.py:74] Initializing an LLM engine with config: model='bigscience/bloom-7b1', tokenizer='bigscience/bloom-7b1', tokenizer_mode=auto, revision=None, trust_remote_code=True, dtype=torch.float16, max_seq_len=2048, download_dir=None, load_format=auto, tensor_parallel_size=1, quantization=None, seed=0)
+INFO 10-02 18:18:48 llm_engine.py:207] # GPU blocks: 7456, # CPU blocks: 546
 Task: arc_challenge; number of docs: 1172
 Task: arc_challenge; document 0; context prompt (starting on next line):
 Question: Many stars can be seen in the sky at night. Which statement best explains why the Sun appears brighter than the stars seen in the night sky?
@@ -86,6 +89,6 @@ Requests: [Req_loglikelihood('Question: Many stars can be seen in the sky at nig
 Running loglikelihood requests
 |    Task     |Version| Metric |Value |   |Stderr|
 |-------------|------:|--------|-----:|---|-----:|
-|arc_challenge|      0|acc     |0.3626|±  |0.0140|
-|             |       |acc_norm|0.4104|±  |0.0144|
+|arc_challenge|      0|acc     |0.3635|±  |0.0141|
+|             |       |acc_norm|0.4113|±  |0.0144|
 

@@ -12,5 +12,5 @@ We used [lm_eval](https://github.com/EleutherAI/lm-evaluation-harness) `arc_chal
 | `tiiuae/falcon-7b` | 47.87 | 47.95 |
 | `mosaicml/mpt-7b` | 47.70 | 47.44 |
 | `EleutherAI/gpt-j-6b` | 41.47 | 41.30 |
-| `bigscience/bloom-7b1` | 41.13 | 41.04 |
+| `bigscience/bloom-7b1` | 41.13 | 41.13 |
 | `codellama/CodeLlama-7b-hf` | 39.93 | 42.66 |
