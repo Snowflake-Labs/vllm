@@ -1,7 +1,7 @@
+import sys
 
 from lm_eval.base import BaseLM
 from lm_eval import evaluator
-
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -55,7 +55,7 @@ class LMEvalAdaptor(BaseLM):
         """
         batch_size, seq_len = inps.shape
         # return torch.empty(batch_size, seq_len, self.vocab_size, device=self.device)
-        # return logits = self.llm(inps).logits
+        # return self.llm(inps).logits
         assert batch_size == 1
         logits = self.llm.get_logits(
             prompt=None,
@@ -69,8 +69,10 @@ class LMEvalAdaptor(BaseLM):
 
 
 if __name__ == "__main__":
-    llm = LLM("meta-llama/Llama-2-7b-chat-hf")
-    # llm = "meta-llama/Llama-2-7b-chat-hf"
+    model_name = sys.argv[-1]
+    quantization = "awq" if "awq" in model_name.lower() else None
+    llm = LLM(model_name, trust_remote_code=True, quantization=quantization)
+    # llm = model_name
     lm_eval_model = LMEvalAdaptor(llm)
     results = evaluator.simple_evaluate(
         model=lm_eval_model,
