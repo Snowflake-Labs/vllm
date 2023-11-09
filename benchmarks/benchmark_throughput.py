@@ -191,8 +191,13 @@ def main(args: argparse.Namespace):
     # Sample the requests.
     tokenizer = AutoTokenizer.from_pretrained(
         args.tokenizer, trust_remote_code=args.trust_remote_code)
-    requests = sample_requests(args.dataset, args.num_prompts, tokenizer,
-                               args.output_len)
+    if args.dataset is None:
+        # This is a hack.
+        requests = [("hi" * (args.input_len - 1), args.input_len,
+                     args.output_len) for _ in range(args.num_prompts)]
+    else:
+        requests = sample_requests(args.dataset, args.num_prompts, tokenizer,
+                                   args.output_len)
 
     if args.backend == "vllm":
         elapsed_time = run_vllm(requests, args.model, args.tokenizer,
@@ -223,8 +228,12 @@ if __name__ == "__main__":
                         default="vllm")
     parser.add_argument("--dataset",
                         type=str,
-                        required=True,
+                        default=None,
                         help="Path to the dataset.")
+    parser.add_argument("--input-len",
+                        type=int,
+                        default=None,
+                        help="Input prompt length for each request")
     parser.add_argument("--output-len",
                         type=int,
                         default=None,
@@ -266,6 +275,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.tokenizer is None:
         args.tokenizer = args.model
+    if args.dataset is None:
+        assert args.input_len is not None
+        assert args.output_len is not None
+    else:
+        assert args.input_len is None
 
     if args.backend == "vllm":
         if args.hf_max_batch_size is not None:
