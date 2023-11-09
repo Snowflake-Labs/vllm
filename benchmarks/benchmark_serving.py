@@ -224,7 +224,8 @@ def main(args: argparse.Namespace):
         url_or_model = args.model
     tokenizer = AutoTokenizer.from_pretrained(
         args.tokenizer, trust_remote_code=args.trust_remote_code)
-    input_requests = sample_requests(args.dataset, args.num_prompts, args.output_len, tokenizer)
+    input_requests = sample_requests(args.dataset, args.num_prompts,
+                                     args.output_len, tokenizer)
 
     benchmark_start_time = time.perf_counter()
     asyncio.run(
