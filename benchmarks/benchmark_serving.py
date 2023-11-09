@@ -23,7 +23,7 @@ import asyncio
 import json
 import random
 import time
-from typing import AsyncGenerator, List, Tuple
+from typing import AsyncGenerator, List, Optional, Tuple
 
 import aiohttp
 import numpy as np
@@ -36,8 +36,12 @@ REQUEST_LATENCY: List[Tuple[int, int, float]] = []
 def sample_requests(
     dataset_path: str,
     num_requests: int,
+    uniform_output_len: Optional[int],
     tokenizer: PreTrainedTokenizerBase,
 ) -> List[Tuple[str, int, int]]:
+    if uniform_output_len is not None and uniform_output_len < 4:
+        raise ValueError("Too small output_len.")
+
     # Load the dataset.
     with open(dataset_path) as f:
         dataset = json.load(f)
@@ -54,7 +58,10 @@ def sample_requests(
     completion_token_ids = tokenizer(completions).input_ids
     tokenized_dataset = []
     for i in range(len(dataset)):
-        output_len = len(completion_token_ids[i])
+        if uniform_output_len is None:
+            output_len = len(completion_token_ids[i])
+        else:
+            output_len = uniform_output_len
         tokenized_dataset.append((prompts[i], prompt_token_ids[i], output_len))
 
     # Filter out too long sequences.
@@ -217,7 +224,7 @@ def main(args: argparse.Namespace):
         url_or_model = args.model
     tokenizer = AutoTokenizer.from_pretrained(
         args.tokenizer, trust_remote_code=args.trust_remote_code)
-    input_requests = sample_requests(args.dataset, args.num_prompts, tokenizer)
+    input_requests = sample_requests(args.dataset, args.num_prompts, args.output_len, tokenizer)
 
     benchmark_start_time = time.perf_counter()
     asyncio.run(
@@ -255,6 +262,10 @@ if __name__ == "__main__":
                         type=str,
                         required=True,
                         help="Path to the dataset.")
+    parser.add_argument("--output-len",
+                        type=int,
+                        default=None,
+                        help="Length of the generated sequence.")
     parser.add_argument("--model",
                         type=str,
                         default=None,
