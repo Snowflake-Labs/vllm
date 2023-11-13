@@ -192,8 +192,9 @@ def main(args: argparse.Namespace):
     tokenizer = AutoTokenizer.from_pretrained(
         args.tokenizer, trust_remote_code=args.trust_remote_code)
     if args.dataset is None:
-        # This is a hack.
-        requests = [("hi" * (args.input_len - 1), args.input_len,
+        # Synthesize a prompt with the given input length.
+        prompt = "hi" * (args.input_len - 1)
+        requests = [(prompt, args.input_len,
                      args.output_len) for _ in range(args.num_prompts)]
     else:
         requests = sample_requests(args.dataset, args.num_prompts, tokenizer,
