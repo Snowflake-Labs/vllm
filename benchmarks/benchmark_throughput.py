@@ -292,16 +292,16 @@ if __name__ == "__main__":
             raise ValueError("Quantization is only for vLLM backend.")
     elif args.backend == "mii":
         if args.dtype != "auto":
-            raise ValueError("dtype must be auto for Mii backend.")
+            raise ValueError("dtype must be auto for MII backend.")
         if args.n != 1:
             raise ValueError("n must be 1 for Mii backend.")
         if args.use_beam_search:
-            raise ValueError("Beam search is not supported for Mii backend.")
+            raise ValueError("Beam search is not supported for MII backend.")
         if args.quantization is not None:
             raise ValueError("Quantization is only for vLLM backend.")
         if args.hf_max_batch_size is not None:
             raise ValueError("HF max batch size is only for HF backend.")
         if args.tokenizer != args.model:
-            raise ValueError("Tokenizer must be the same as the model for Mii "
+            raise ValueError("Tokenizer must be the same as the model for MII "
                              "backend.")
     main(args)
