@@ -12,7 +12,7 @@ from vllm.model_executor.layers.triton_kernel.prefix_prefill import (
 _PARTITION_SIZE = 512
 
 
-class PagedAttention:
+class PagedAttentionImpl:
 
     @staticmethod
     def get_supported_head_sizes() -> List[int]:
@@ -36,7 +36,7 @@ class PagedAttention:
         )
 
     @staticmethod
-    def forward(
+    def decode(
         query: torch.Tensor,
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
@@ -111,7 +111,7 @@ class PagedAttention:
         return output
 
     @staticmethod
-    def forward_prefix(
+    def append(
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
