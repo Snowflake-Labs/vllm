@@ -10,7 +10,7 @@ from vllm.utils import in_wsl, STR_DTYPE_TO_TORCH_DTYPE
 
 logger = init_logger(__name__)
 
-KVCache = Tuple[torch.Tensor, torch.Tensor]
+KVCache = torch.Tensor
 
 
 class CacheEngine:
@@ -54,45 +54,24 @@ class CacheEngine:
         # Initialize the events for stream synchronization.
         self.events = [torch.cuda.Event() for _ in range(self.num_layers)]
 
-    def get_key_block_shape(self) -> Tuple[int, int, int, int]:
-        element_size = torch.tensor([], dtype=self.dtype).element_size()
-        x = 16 // element_size
-        return (
-            self.num_heads,
-            self.head_size // x,
-            self.block_size,
-            x,
-        )
-
-    def get_value_block_shape(self) -> Tuple[int, int, int]:
-        return (
-            self.num_heads,
-            self.head_size,
-            self.block_size,
-        )
+    def get_kv_block_shape(self) -> Tuple[int, int, int, int]:
+        return (2, self.block_size, self.num_heads, self.head_size)
 
     def allocate_gpu_cache(self) -> List[KVCache]:
         gpu_cache: List[KVCache] = []
-        key_block_shape = self.get_key_block_shape()
-        value_block_shape = self.get_value_block_shape()
+        kv_block_shape = self.get_kv_block_shape()
         for _ in range(self.num_layers):
-            key_blocks = torch.empty(
-                size=(self.num_gpu_blocks, *key_block_shape),
+            blocks = torch.empty(
+                size=(self.num_gpu_blocks, *kv_block_shape),
                 dtype=self.dtype,
                 device="cuda",
             )
-            value_blocks = torch.empty(
-                size=(self.num_gpu_blocks, *value_block_shape),
-                dtype=self.dtype,
-                device="cuda",
-            )
-            gpu_cache.append((key_blocks, value_blocks))
+            gpu_cache.append(blocks)
         return gpu_cache
 
     def allocate_cpu_cache(self) -> List[KVCache]:
         cpu_cache: List[KVCache] = []
-        key_block_shape = self.get_key_block_shape()
-        value_block_shape = self.get_value_block_shape()
+        kv_block_shape = self.get_kv_block_shape()
         pin_memory = not in_wsl()
         if not pin_memory:
             # Pinning memory in WSL is not supported.
@@ -100,19 +79,13 @@ class CacheEngine:
             logger.warning("Using 'pin_memory=False' as WSL is detected. "
                            "This may slow down the performance.")
         for _ in range(self.num_layers):
-            key_blocks = torch.empty(
-                size=(self.num_cpu_blocks, *key_block_shape),
+            blocks = torch.empty(
+                size=(self.num_cpu_blocks, *kv_block_shape),
                 dtype=self.dtype,
                 pin_memory=pin_memory,
                 device="cpu",
             )
-            value_blocks = torch.empty(
-                size=(self.num_cpu_blocks, *value_block_shape),
-                dtype=self.dtype,
-                pin_memory=pin_memory,
-                device="cpu",
-            )
-            cpu_cache.append((key_blocks, value_blocks))
+            cpu_cache.append(blocks)
         return cpu_cache
 
     def _swap(

@@ -2,6 +2,7 @@ import contextlib
 import time
 from typing import Dict, List, Optional, Tuple, Set, Union
 
+from flashinfer import BatchDecodeWithPagedKVCacheWrapper
 import numpy as np
 import torch
 import torch.nn as nn
@@ -102,6 +103,10 @@ class ModelRunner:
                 self.lora_config, self.device, self.model.embedding_modules,
                 self.model.embedding_padding_modules)
             self.model = self.lora_manager.create_lora_manager(self.model)
+
+        workspace_buffer = torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device=self.device)
+        self.decoder_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+            workspace_buffer, "NHD")
 
     def set_block_size(self, block_size: int) -> None:
         self.block_size = block_size
@@ -263,12 +268,16 @@ class ModelRunner:
         input_tokens: List[List[int]] = []
         input_positions: List[List[int]] = []
         slot_mapping: List[List[int]] = []
+
         context_lens: List[int] = []
         block_tables: List[List[int]] = []
         lora_index_mapping: List[int] = []
         lora_prompt_mapping: List[int] = []
         lora_requests: Set[LoRARequest] = set()
 
+        kv_page_indptr: List[int] = [0]
+        kv_page_indices: List[int] = []
+        kv_last_page_len: List[int] = []
         for seq_group_metadata in seq_group_metadata_list:
             assert not seq_group_metadata.is_prompt
 
@@ -280,6 +289,8 @@ class ModelRunner:
 
             for seq_id in seq_ids:
                 seq_data = seq_group_metadata.seq_data[seq_id]
+                # NOTE: Here we assume that only a single token is processed
+                # per sequence.
                 generation_token = seq_data.get_last_token_id()
                 input_tokens.append([generation_token])
 
@@ -289,7 +300,12 @@ class ModelRunner:
 
                 context_len = seq_len if self.sliding_window is None else min(
                     seq_len, self.sliding_window)
-                context_lens.append(context_len)
+                num_blocks = (context_len + self.block_size - 1) // self.block_size
+                kv_page_indptr.append(kv_page_indptr[-1] + num_blocks)
+                last_len = context_len % self.block_size
+                if last_len == 0:
+                    last_len = self.block_size
+                kv_last_page_len.append(last_len)
 
                 block_table = seq_group_metadata.block_tables[seq_id]
                 block_number = block_table[position // self.block_size]
@@ -303,14 +319,15 @@ class ModelRunner:
                     sliding_window_blocks = (self.sliding_window //
                                              self.block_size)
                     block_table = block_table[-sliding_window_blocks:]
-                block_tables.append(block_table)
+                kv_page_indices.extend(block_table)
 
         batch_size = len(input_tokens)
-        max_context_len = max(context_lens)
+        max_context_len = 0
         use_captured_graph = (
             not self.model_config.enforce_eager
             and batch_size <= _BATCH_SIZES_TO_CAPTURE[-1]
-            and max_context_len <= self.max_context_len_to_capture)
+            and max_context_len <= self.max_context_len_to_capture
+            and False)
         if use_captured_graph:
             # Pad the input tokens, positions, and slot mapping to match the
             # batch size of the captured graph.
@@ -324,47 +341,22 @@ class ModelRunner:
                 block_tables.append([])
             batch_size = graph_batch_size
 
-        input_tokens = _make_tensor_with_pad(input_tokens,
-                                             max_len=1,
-                                             pad=0,
-                                             dtype=torch.long,
-                                             device=self.device)
-        input_positions = _make_tensor_with_pad(input_positions,
-                                                max_len=1,
-                                                pad=0,
-                                                dtype=torch.long,
-                                                device=self.device)
-        slot_mapping = _make_tensor_with_pad(slot_mapping,
-                                             max_len=1,
-                                             pad=_PAD_SLOT_ID,
-                                             dtype=torch.long,
-                                             device=self.device)
-        context_lens = torch.tensor(context_lens,
-                                    dtype=torch.int,
-                                    device=self.device)
-
-        if use_captured_graph:
-            # The shape of graph_block_tables is
-            # [max batch size, max context len // block size].
-            input_block_tables = self.graph_block_tables[:batch_size]
-            for i, block_table in enumerate(block_tables):
-                if block_table:
-                    input_block_tables[i, :len(block_table)] = block_table
-            block_tables = torch.tensor(input_block_tables, device=self.device)
-        else:
-            max_block_table_len = max(
-                len(block_table) for block_table in block_tables)
-            block_tables = _make_tensor_with_pad(
-                block_tables,
-                max_len=max_block_table_len,
-                pad=0,
-                dtype=torch.int,
-                device=self.device,
-            )
-
-        lora_index_mapping = [
-            _pad_to_max(mapping, 1, pad=0) for mapping in lora_index_mapping
-        ]
+        input_tokens = torch.tensor(input_tokens, dtype=torch.long, device="cuda")
+        input_positions = torch.tensor(input_positions,
+                                        dtype=torch.long,
+                                        device="cuda")
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.long, device="cuda")
+        self.decoder_wrapper.begin_forward(
+            torch.tensor(kv_page_indptr, dtype=torch.int32, device=self.device),
+            torch.tensor(kv_page_indices, dtype=torch.int32, device=self.device),
+            torch.tensor(kv_last_page_len, dtype=torch.int32, device=self.device),
+            self.model_config.get_num_heads(),
+            self.model_config.get_total_num_kv_heads(),
+            self.model_config.get_head_size(),
+            self.block_size,
+            rotary_mode="NONE",
+            data_type=self.model_config.dtype,
+        )
 
         input_metadata = InputMetadata(
             is_prompt=False,
@@ -377,6 +369,7 @@ class ModelRunner:
             block_tables=block_tables,
             use_cuda_graph=use_captured_graph,
             kv_cache_dtype=self.kv_cache_dtype,
+            decode_wrapper=self.decoder_wrapper,
         )
         return (input_tokens, input_positions, input_metadata,
                 lora_index_mapping, lora_prompt_mapping, lora_requests)
@@ -635,7 +628,7 @@ class ModelRunner:
 
         # Run the model with the dummy inputs.
         num_layers = self.model_config.get_num_layers(self.parallel_config)
-        kv_caches = [(None, None)] * num_layers
+        kv_caches = [None] * num_layers
         self.execute_model(seqs, kv_caches)
         torch.cuda.synchronize()
         return

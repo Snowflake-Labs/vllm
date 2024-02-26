@@ -6,7 +6,8 @@ import torch
 
 from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.attention.base import BaseAttention
-from vllm.model_executor.layers.attention.paged_attn import PagedAttentionImpl
+# from vllm.model_executor.layers.attention.paged_attn import PagedAttentionImpl
+from vllm.model_executor.layers.attention.flash_infer import FlashInferImpl
 from vllm.model_executor.layers.attention.utils import expand_gqa
 
 
@@ -23,7 +24,7 @@ class Attention(BaseAttention):
     ) -> None:
         super().__init__(num_heads, head_size, scale, num_kv_heads,
                          alibi_slopes, sliding_window)
-        suppored_head_sizes = PagedAttentionImpl.get_supported_head_sizes()
+        suppored_head_sizes = FlashInferImpl.get_supported_head_sizes()
         if head_size not in suppored_head_sizes:
             raise ValueError(
                 f"Head size {head_size} is not supported by PagedAttention. "
@@ -36,8 +37,7 @@ class Attention(BaseAttention):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        key_cache: Optional[torch.Tensor],
-        value_cache: Optional[torch.Tensor],
+        kv_cache: Optional[torch.Tensor],
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
         """PagedAttention forward pass.
@@ -64,14 +64,12 @@ class Attention(BaseAttention):
         # If key_cache and value_cache are not provided, the new key and value
         # vectors will not be cached. This happens during the initial memory
         # profiling run.
-        if key_cache is not None and value_cache is not None:
-            PagedAttentionImpl.reshape_and_cache(key, value, key_cache,
-                                                 value_cache, input_metadata)
+        if kv_cache is not None:
+            FlashInferImpl.reshape_and_cache(key, value, kv_cache, input_metadata)
 
         if input_metadata.is_prompt:
             # Prompt run.
-            if (key_cache is None or value_cache is None
-                    or input_metadata.block_tables.numel() == 0):
+            if True:
                 # normal attention
                 query = query.unflatten(0, (batch_size, seq_len))
                 key = key.unflatten(0, (batch_size, seq_len))
@@ -86,33 +84,13 @@ class Attention(BaseAttention):
                     alibi_slopes=self.alibi_slopes,
                 )
             else:
-                # prefix-enabled attention
-                if self.num_kv_heads != self.num_heads:
-                    # TODO(woosuk): Use MQA/GQA kernels for higher performance.
-                    query, key, value = expand_gqa(query, key, value,
-                                                   self.num_heads,
-                                                   self.num_kv_heads)
-                output = PagedAttentionImpl.append(
-                    query,
-                    key,
-                    value,
-                    key_cache,
-                    value_cache,
-                    input_metadata,
-                    self.num_heads,
-                    self.num_kv_heads,
-                    self.alibi_slopes,
-                )
+                assert False
         else:
             # Decoding run.
-            output = PagedAttentionImpl.decode(
+            output = FlashInferImpl.decode(
                 query,
-                key_cache,
-                value_cache,
-                input_metadata,
-                self.num_kv_heads,
-                self.scale,
-                self.alibi_slopes,
+                kv_cache,
+                input_metadata.decode_wrapper,
             )
 
         # Reshape the output tensor.

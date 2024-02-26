@@ -27,6 +27,7 @@ class InputMetadata:
         block_tables: Optional[torch.Tensor],
         use_cuda_graph: bool,
         kv_cache_dtype: str,
+        decode_wrapper = None,
     ) -> None:
         self.is_prompt = is_prompt
         self.prompt_lens = prompt_lens
@@ -38,6 +39,7 @@ class InputMetadata:
         self.block_tables = block_tables
         self.use_cuda_graph = use_cuda_graph
         self.kv_cache_dtype = kv_cache_dtype
+        self.decode_wrapper = decode_wrapper
 
         # Set during the execution of the first attention op.
         # FIXME(woosuk): This is a hack.
