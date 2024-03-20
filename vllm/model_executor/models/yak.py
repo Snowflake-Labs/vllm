@@ -3,42 +3,97 @@ from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
-
+import torch.nn.functional as F
 # TODO(Hao): this assume it will depend on the transformer version which includes Yak
 from transformers import YakConfig
-from transformers.activitions import ACT2FN
+from transformers.activations import ACT2FN
 
-from vllm.config import LoRAConfig
+import ray
+
 from vllm.model_executor.input_metadata import InputMetadata
+from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.parallel_utils.communication_op import (
+    tensor_model_parallel_all_reduce)
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.fused_moe import fused_moe
 from vllm.model_executor.parallel_utils.parallel_state import (
     get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
+from vllm.model_executor.layers.linear import (LinearMethodBase,
+                                               MergedColumnParallelLinear,
+                                               QKVParallelLinear,
+                                               ReplicatedLinear,
+                                               RowParallelLinear)
+from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding, ParallelLMHead)
 from vllm.sequence import SamplerOutput
+from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.weight_utils import (default_weight_loader,
                                               hf_model_weights_iterator)
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
 
+m = 0
+
+def pr(x):
+    if m == 13:
+        print(x)
+        exit(0)
+
+# class YakMLP(nn.Module):
+#     def __init__(self, config, layer_id, expert_id=-1, is_residual_mlp=False):
+#         super(YakMLP, self).__init__()
+#         self.hidden_dim = config.hidden_size
+#         self.expert_id = expert_id
+#         self.layer_id = layer_id
+
+#         # TODO(Hao): make this tensor-parallel using RowParallelLinear
+#         self.ffn_dim = config.intermediate_size if not is_residual_mlp else self.hidden_dim
+
+#         self.w1 = nn.Linear(self.hidden_dim, self.ffn_dim , bias=False)
+#         self.w2 = nn.Linear(self.ffn_dim, self.hidden_dim, bias=False)
+#         self.w3 = nn.Linear(self.hidden_dim, self.ffn_dim, bias=False)
+
+#         self.act_fn = ACT2FN[config.hidden_act]
+
+#     def forward(self, hidden_states):
+#         current_hidden_states = self.act_fn(self.w1(hidden_states)) * self.w3(hidden_states)
+#         current_hidden_states = self.w2(current_hidden_states)
+#         return current_hidden_states
+
 class YakMLP(nn.Module):
-    def __init__(self, config, layer_id, expert_id=-1, is_residual_mlp=False):
-        super(YakMLP).__init__()
-        self.hidden_dim = config.hidden_size
+    def __init__(self, config, layer_id, expert_id=-1, is_residual_mlp=False, linear_method: Optional[LinearMethodBase] = None):
+        super(YakMLP, self).__init__()
+        self.hidden_size = config.hidden_size
         self.expert_id = expert_id
         self.layer_id = layer_id
 
         # TODO(Hao): make this tensor-parallel using RowParallelLinear
-        self.ffn_dim = config.intermediate_size if not is_redisual_mlp else self.hidden_dim
+        self.ffn_dim = config.intermediate_size if not is_residual_mlp else self.hidden_dim
 
-        self.w1 = nn.Linear(self.hidden_dim, self.ffn_dim , bias=False)
-        self.w2 = nn.Linear(self.ffn_dim, self.hidden_dim, bias=False)
-        self.w3 = nn.Linear(self.hidden_dim, self.ffn_dim, bias=False)
+        self.w13 = MergedColumnParallelLinear(
+            self.hidden_size, [self.ffn_dim] * 2,
+            bias=False,
+            linear_method=linear_method)
+        self.w2 = RowParallelLinear(self.ffn_dim,
+                                     self.hidden_size,
+                                     bias=False,
+                                     linear_method=linear_method)
+        if config.hidden_act != "silu":
+            raise ValueError(f"Unsupported activation: {config.hidden_act}. "
+                             "Only silu is supported for now.")
+        self.act_fn = SiluAndMul()
 
-        self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, hidden_states):
-        current_hidden_states = self.act_fn(self.w1(hidden_states)) * self.w3(hidden_states)
-        current_hidden_states = self.w2(current_hidden_states)
-        return current_hidden_states
+        gate_up, _ = self.w13(hidden_states)
+        hidden_states = self.act_fn(gate_up)
+        hidden_states, _ = self.w2(hidden_states)
+        return hidden_states
 
 
 class YakMoE(nn.Module):
@@ -50,11 +105,11 @@ class YakMoE(nn.Module):
                  layer_id: int,
                  tp_size: Optional[int] = None,
                  params_dtype: Optional[torch.dtype] = None):
-        super(YakMoE).__init__()
+        super(YakMoE, self).__init__()
 
         self.tp_size = tp_size or get_tensor_model_parallel_world_size()
-        self.hidden_dim = config.hidden_dim
-        self.num_total_experts = config.num_experts
+        self.hidden_dim = config.hidden_size
+        self.num_experts = config.num_local_experts
         self.layer_id = layer_id
         self.top_k = config.num_experts_per_tok
         self.intermediate_dim = self.hidden_dim // self.tp_size
@@ -67,20 +122,27 @@ class YakMoE(nn.Module):
         if not self.is_moe_layer:
             self.mlp = YakMLP(config, layer_id=layer_id)
         else:
+            # TODO(Hao): fix this
             self.gate = ReplicatedLinear(self.hidden_dim,
-                                         self.num_total_experts,
+                                         self.num_experts,
                                          bias=False,
                                          params_dtype=self.params_dtype,
                                          linear_method=None)
             self.experts = nn.ModuleList(
                 [YakMLP(config, layer_id=layer_id, expert_id=i) for i in range(self.num_experts)])
+            # self.moe = MixtralMoE(
+            #     num_experts=self.num_experts,
+            #     top_k=self.top_k,
+            #     hidden_size=self.hidden_dim,
+            #     intermediate_size=self.intermediate_dim
+            # )
 
     # Copied from transformers.models.mixtral.modeling_mixtral.MixtralSparseMoeBlock.forward with Mixtral->Yak
     def local_moe(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (batch * sequence_length, n_experts)
-        router_logits = self.gate(hidden_states)
+        router_logits, _ = self.gate(hidden_states)
 
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
@@ -123,9 +185,13 @@ class YakMoE(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor):
         if self.is_moe_layer:
-            return self.local_moe(hidden_states)
+            final_hidden_states = self.local_moe(hidden_states)
+            # if self.tp_size > 1:
+            #     final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            # final_hidden_states = final_hidden_states.reshape(hidden_states.shape)
         else:
-            return self.mlp(hidden_states)
+            final_hidden_states = self.mlp(hidden_states)
+        return final_hidden_states
 
 
 class YakRMSNorm(nn.Module):
@@ -144,104 +210,75 @@ class YakRMSNorm(nn.Module):
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
 
-class YakRotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
-        super().__init__()
-
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-        # Build here to make `torch.jit.trace` work.
-        self._set_cos_sin_cache(
-            seq_len=max_position_embeddings, device=self.inv_freq.device, dtype=torch.get_default_dtype()
-        )
-
-    def _set_cos_sin_cache(self, seq_len, device, dtype):
-        self.max_seq_len_cached = seq_len
-        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
-
-        freqs = torch.outer(t, self.inv_freq)
-        # Different from paper, but it uses a different permutation in order to obtain the same calculation
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
-        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
-
-    def forward(self, x, seq_len=None):
-        # x: [bs, num_attention_heads, seq_len, head_size]
-        if seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
-
-        return (
-            self.cos_cached[:seq_len].to(dtype=x.dtype),
-            self.sin_cached[:seq_len].to(dtype=x.dtype),
-        )
-
-
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`):
-            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
-            used to pass offsetted position ids when working with a KV-cache.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
-    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
 
 class YakAttention(nn.Module):
-    def __init__(self, config: YakConfig, layer_idx: Optional[int] = None):
+    def __init__(self, 
+                 config: YakConfig, 
+                 layer_idx: Optional[int] = None,
+                 linear_method: Optional[LinearMethodBase] = None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
 
-        # TODO(Hao): finish this for TP
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        tp_size = get_tensor_model_parallel_world_size()
+        self.total_num_heads = config.num_attention_heads
+        assert self.total_num_heads % tp_size == 0
+        self.num_heads = self.total_num_heads // tp_size
+        self.total_num_kv_heads = config.num_key_value_heads
+        if self.total_num_kv_heads >= tp_size:
+            assert self.total_num_kv_heads % tp_size == 0
+        else:
+            assert tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.head_dim = self.hidden_size // self.total_num_heads
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+
+
         self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
-        self.is_causal = True
-        self.attention_dropout = config.attention_dropout
+        self.rope_theta = config.rope_theta        
         self.scaling = self.head_dim**-0.5
 
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads // config.tp_size * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads // config.tp_size * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads // config.tp_size * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads // config.tp_size * self.head_dim, self.hidden_size, bias=False)
+        # self.q_proj = nn.Linear(self.hidden_size, self.num_heads // config.tp_size * self.head_dim, bias=False)
+        # self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads // config.tp_size * self.head_dim, bias=False)
+        # self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads // config.tp_size * self.head_dim, bias=False)
+        # self.o_proj = nn.Linear(self.num_heads // config.tp_size * self.head_dim, self.hidden_size, bias=False)
 
-        self.rotary_emb = YakRotaryEmbedding(
+        # self.rotary_emb = YakRotaryEmbedding(
+        #     self.head_dim,
+        #     max_position_embeddings=self.max_position_embeddings,
+        #     base=self.rope_theta,
+        # )
+
+        self.qkv_proj = QKVParallelLinear(
+            self.hidden_size,
             self.head_dim,
-            max_position_embeddings=self.max_position_embeddings,
-            base=self.rope_theta,
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            bias=False,
+            linear_method=linear_method
+        )
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            self.hidden_size,
+            bias=False,
+            linear_method=linear_method,
         )
 
-        self.attn = PagedAttention(
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position=self.max_position_embeddings,
+            base=int(self.rope_theta),
+            is_neox_style=True,
+        )
+
+        self.attn = Attention(
             self.num_heads,
             self.head_dim,
             self.scaling,
-            num_kv_heads=self.num_key_value_heads
+            num_kv_heads=self.num_kv_heads
         )
 
     def forward(
@@ -252,22 +289,22 @@ class YakAttention(nn.Module):
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
 
-        bsz, q_len, _ = hidden_states.size()
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
-        kv_seq_len = key_states.shape[-2]
-
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-
+        # bsz, q_len, _ = hidden_states.size()
+        # query_states = self.q_proj(hidden_states)
+        # key_states = self.k_proj(hidden_states)
+        # value_states = self.v_proj(hidden_states)
+        # query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        # key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        # value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        # kv_seq_len = key_states.shape[-2]
+        # cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, positions)
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = self.rotary_emb(positions, q, k)
         k_cache, v_cache = kv_cache
         attn_output = self.attn(q, k, v, k_cache, v_cache, input_metadata)
-        output = self.o_proj(attn_output)
+        output, _ = self.o_proj(attn_output)
         return output
 
 class YakDecoderLayer(nn.Module):
@@ -275,7 +312,7 @@ class YakDecoderLayer(nn.Module):
         self,
         config: YakConfig,
         layer_idx: int,
-        linear_method: Optional[LinearM] = None,
+        linear_method: Optional[LinearMethodBase] = None,
     ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
@@ -283,11 +320,12 @@ class YakDecoderLayer(nn.Module):
         self.self_attn = YakAttention(config, layer_idx)
         self.block_sparse_moe = YakMoE(config, layer_id=layer_idx)
 
-        # TODO(Hao): reconsider the YakRMSNorm here.
-        self.input_layernorm = YakRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
         self.use_residual = config.use_residual and self.block_sparse_moe.is_moe_layer
         if self.use_residual:
-            self.residual_layernorm = YakRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.residual_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.residual_mlp = YakMLP(config, layer_id=layer_idx, is_residual_mlp=True)
 
     def forward(
@@ -299,7 +337,6 @@ class YakDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         residual_input = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-
         # self attention
         hidden_states = self.self_attn(
             positions=positions,
@@ -336,15 +373,20 @@ class YakModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        # change this to VocabParallelEmbedding()
-        self.embed_tokens = nn.Embedding(self.vocab_size, config.hidden_size, self.padding_idx)
+        
+        # self.embed_tokens = nn.Embedding(self.vocab_size, config.hidden_size, self.padding_idx)
+        self.embed_tokens = VocabParallelEmbedding(
+            self.vocab_size,
+            config.hidden_size,
+            org_num_embeddings=self.vocab_size
+        )
         self.layers = nn.ModuleList([
             YakDecoderLayer(config, layer_idx, linear_method=linear_method)
             for layer_idx in range(config.num_hidden_layers)
         ])
         self._attn_implementation = config._attn_implementation
         #TODO(Hao): vllm has its own impl or RMSNorm, should we consider?
-        self.norm = YakRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -355,28 +397,38 @@ class YakModel(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
+        global m
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states = layer(positions, hidden_states,
                                   kv_caches[i], input_metadata)
-            hidden_states = self.norm(hidden_states)
-            return hidden_states
+            m = m + 1
+        hidden_states = self.norm(hidden_states)
+        return hidden_states
 
 
-class YakForCausalLM(YakPretrainedModel):
-    def __init__(self, config, **kwargs):
-        super().__init__(config)
+class YakForCausalLM(nn.Module):
+    def __init__(
+        self, 
+        config: YakConfig,
+        linear_method: Optional[LinearMethodBase] = None,
+        **kwargs
+    ) -> None:
+        super().__init__()
         self.model = YakModel(config)
+        self.config = config
+        self.linear_method = linear_method
         self.vocab_size = config.vocab_size
-
-        # TODO(Hao): change this with ParallelLMHead
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.router_aux_loss_coef = config.router_aux_loss_coef
+        # self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = ParallelLMHead(
+            self.vocab_size,
+            config.hidden_size,
+        )
         self.num_experts = config.num_local_experts
         self.num_experts_per_tok = config.num_experts_per_tok
         self.unpadded_vocab_size = config.vocab_size
-        # Initialize weights and apply final processing
-        self.post_init()
+        # # Initialize weights and apply final processing
+        # self.post_init()
         self.sampler = Sampler(self.unpadded_vocab_size, config.vocab_size)
 
     def forward(self,
@@ -394,7 +446,7 @@ class YakForCausalLM(YakPretrainedModel):
         hidden_states: Optional[torch.Tensor],
         sampling_metadata: SamplingMetadata
     ) -> Optional[SamplerOutput]:
-        next_tokens = self.sampler(self.llm_head.weight, hidden_states, sampling_metadata)
+        next_tokens = self.sampler(self.lm_head.weight, hidden_states, sampling_metadata)
         return next_tokens
 
     def load_weights(self,
@@ -409,24 +461,39 @@ class YakForCausalLM(YakPretrainedModel):
             ("qkv_proj", "v_proj", "v"),
         ]
 
+        mlp_params_mapping = [
+            ("w13", "w1", 0),
+            ("w13", "w3", 1),
+        ]
+
         expert_params_mapping = [
             # (param_name, weight_name, expert_id)
-            ("ws" if weight_name in ["w1", "w3"] else "w2s",
+            (f"experts.{expert_id}.w13.weight" if weight_name in ["w1", "w3"] else f"experts.{expert_id}.w2.weight",
              f"experts.{expert_id}.{weight_name}.weight", expert_id)
             for expert_id in range(self.config.num_local_experts)
             for weight_name in ["w1", "w2", "w3"]
         ]
 
-        params_dict = dict(self.named_parameters())
-        for name, loaded_weight in hf_model_weights_iterator(
-                model_name_or_path,
-                cache_dir,
-                load_format,
-                revision,
-                fall_back_to_pt=False):
-            if "rotary_emb.inv_freq" in name:
-                continue
 
+        params_dict = dict(self.named_parameters())
+        # import pdb; pdb.set_trace()
+        loaded_iterators = hf_model_weights_iterator(
+            model_name_or_path,
+            cache_dir,
+            load_format,
+            revision,
+            fall_back_to_pt=False)
+
+        # for name, loaded_weight in loaded_iterators:
+        #     # print(f"Load weight {name} with shape {loaded_weight.shape}.")
+        #     # assert name in params_dict, f"Load weight {name} is not in the param dict."
+        #     param = params_dict[name]
+        #     weight_loader = getattr(param, "weight_loader", 
+        #                             default_weight_loader)
+        #     weight_loader(param, loaded_weight)
+
+        
+        for name, loaded_weight in loaded_iterators:
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -439,22 +506,31 @@ class YakForCausalLM(YakPretrainedModel):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                for param_name, weight_name, expert_id in expert_params_mapping:
+                for param_name, weight_name, shard_id in mlp_params_mapping:
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
                     param = params_dict[name]
                     weight_loader = param.weight_loader
-                    weight_loader(param,
-                                  loaded_weight,
-                                  weight_name,
-                                  expert_id=expert_id)
+                    weight_loader(param, loaded_weight, shard_id)
                     break
+                # else:        
+                #     for param_name, weight_name, shard_id in expert_params_mapping:
+                #         if weight_name not in name:
+                #             continue
+                #         name = name.replace(weight_name, param_name)
+                #         import pdb; pdb.set_trace()
+                #         param = params_dict[name]
+                #         weight_loader = param.weight_loader
+                #         weight_loader(param,
+                #                     loaded_weight,
+                #                     weight_name)
+                #         break
                 else:
-                    # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
                     param = params_dict[name]
                     weight_loader = getattr(param, "weight_loader",
                                             default_weight_loader)
                     weight_loader(param, loaded_weight)
+            # print(f"Load weight {name} with shape {loaded_weight.shape}.")

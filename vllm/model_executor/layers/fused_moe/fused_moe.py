@@ -351,6 +351,7 @@ def fused_moe(
             gating_output.float(),  # TODO(woosuk): Optimize this.
         )
         del token_expert_indicies  # Not used. Will be used in the future.
+    
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 

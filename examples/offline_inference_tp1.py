@@ -17,7 +17,7 @@ yak_model_path = "/shared/finetuning/outputs/checkpoint/hf_ckpts/hao_ckpt/700M_t
 #yak_model_path = "/shared/finetuning/outputs/checkpoint/hf_ckpts/hao_ckpt/tulu-slimorca-sharegpt-magicoder-math-2b-step3000"
 # Create an LLM.
 # llm = LLM(model="mistralai/Mixtral-8x7B-v0.1", enforce_eager=True, tensor_parallel_size=2)
-llm = LLM(model=yak_model_path, enforce_eager=True, tensor_parallel_size=2)
+llm = LLM(model=yak_model_path, enforce_eager=True, tensor_parallel_size=1)
 # Generate texts from the prompts. The output is a list of RequestOutput objects
 # that contain the prompt, generated text, and other information.
 #import pdb; pdb.set_trace()
