@@ -27,16 +27,14 @@ class YQConfig(QuantizationConfig):
 
         if self.weight_bits != 8:
             raise ValueError(
-                "Currently, only 8-bit weight quantization is supported for 
+                "Currently, only 8-bit weight quantization is supported for "
                 f"Yak quantizaiton, but got {self.weight_bits} bits."
             )
-
     def __repr__(self) -> str:
         return (f"YQConfig(weight_bits={self.weight_bits}), "
                 f"group_size={self.group_size}, "
                 f"rounding={self.rounding}, "
                 f"mantissa_bits={self.mantissa_bits}")
-
     @classmethod
     def get_name(cls) -> str:
         return "yq"
@@ -48,7 +46,7 @@ class YQConfig(QuantizationConfig):
         return cls(weight_bis=weight_bits, group_size=group_size)
 
     def get_linear_method(self) -> "YQLinearMethod":
-        return 
+        return YQLinearMethod(self)
 
 
 class YQLinearMethod(LinearMethodBase):
@@ -60,22 +58,29 @@ class YQLinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: yq):
         self.quant_config = quant_config
+        self.weight = None
 
     def create_weights(self, input_size_per_partition: int,
-        output_size_per_partition: input, input_size: input,
-        output_size: int,
-        params_dtype: torch.dtype) -> Dict[str, Any]:
-        return
+                       output_size_per_partition: int, input_size: int,
+                       output_size: int,
+                       params_dtype: torch.dtype) -> Dict[str, Any]:
+        self.weight = torch.empty(
+            input_size_per_partition,
+            output_size_per_partition,
+            dtype=torch.int8,
+        )
+        qweight = YakQuantizedParameter(self.weight, quantization=self.quant_config)
+        return {
+            "qweight": qweight
+        }
+        # TODO(Hao): do the set_weight_attr things
 
-
-
-    def apply_weights(
-        weights: Dict[str, Any],
-        x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def apply_weights(self,
+                      weights: Dict[str, Any],
+                      x: torch.Tensor,
+                      bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         qweights = weights["qweight"]
-        deqweights = self.dequantize(qweights)
-        return F.linear(x, deqweights, bias)
+        return F.linear(x, qweight.dequantized(), bias)
 
 
 class YakQuantizedParameter(nn.Parameter):
