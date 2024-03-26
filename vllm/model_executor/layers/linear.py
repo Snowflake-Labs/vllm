@@ -326,7 +326,13 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                     "MergedColumnParallelLinear, assume the weight is "
                     "the same for all partitions.")
         assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        if hasattr(param, "is_yak") and param.is_yak():
+            qweights = param.quantizer.quantize(loaded_weight)
+            import pdb; pdb.set_trace()
+            param_data.copy_(qweights)
+        else:
+            import pdb; pdb.set_trace()
+            param_data.copy_(loaded_weight)
 
 
 class QKVParallelLinear(ColumnParallelLinear):

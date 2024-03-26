@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional
 import torch
 from torch.nn.parameter import Parameter
 import torch.nn.functional as F
+import torch.nn as nn 
 
 from vllm._C import ops
 from vllm.model_executor.layers.linear import (LinearMethodBase,
@@ -43,11 +44,28 @@ class YQConfig(QuantizationConfig):
     def from_config(cls, config: Dict[str, Any]) -> "YQConfig":
         weight_bits = cls.get_from_keys(config, ["bits"])
         group_size = cls.get_from_keys(config, ["group_size"])
-        return cls(weight_bis=weight_bits, group_size=group_size)
+        return cls(weight_bits=weight_bits, group_size=group_size)
 
     def get_linear_method(self) -> "YQLinearMethod":
         return YQLinearMethod(self)
+    def get_scaled_act_names(self) -> List[str]:
+        return []
+    @classmethod
+    def get_supported_act_dtypes(cls) -> List[torch.dtype]:
+        return [torch.half, torch.bfloat16]
 
+    @classmethod
+    # Need to figure it out
+    def get_min_capability(cls) -> int:
+        return 60
+
+    @staticmethod
+    def get_config_filenames() -> List[str]:
+        return [
+            "quant_config.json",  # E.g., casperhansen/vicuna-7b-v1.5-awq
+            # E.g., abhinavkulkarni/mosaicml-mpt-7b-instruct-w4-g128-awq
+            "quantize_config.json",
+        ]
 
 class YQLinearMethod(LinearMethodBase):
     """Linear method for Yak.
@@ -56,31 +74,46 @@ class YQLinearMethod(LinearMethodBase):
         quant_config: the Yak quantization config.
     """
 
-    def __init__(self, quant_config: yq):
+    def __init__(self, quant_config: YQConfig):
         self.quant_config = quant_config
         self.weight = None
 
-    def create_weights(self, input_size_per_partition: int,
-                       output_size_per_partition: int, input_size: int,
+    def create_weights(self,
+                       input_size_per_partition: int,
+                       output_size_per_partition: int,
+                       input_size: int,
                        output_size: int,
                        params_dtype: torch.dtype) -> Dict[str, Any]:
+        group_size = self.quant_config.group_size
+        orig_numel = input_size_per_partition * output_size_per_partition
+        num_groups = orig_numel // self.quant_config.group_size
         self.weight = torch.empty(
-            input_size_per_partition,
             output_size_per_partition,
-            dtype=torch.int8,
-        )
-        qweight = YakQuantizedParameter(self.weight, quantization=self.quant_config)
+            input_size_per_partition,
+            dtype=torch.bfloat16,
+        ).cpu()
+        self.qweight = torch.empty(
+            num_groups,
+            group_size + 4,
+            # output_size_per_partition,
+            dtype=torch.int8)
+        weight = YakQuantizedParameter(self.weight, self.qweight, quantization=self.quant_config)
+        set_weight_attrs(
+            weight, {
+                "output_dim": 0,
+            })
         return {
-            "qweight": qweight
+            "weight": weight
         }
-        # TODO(Hao): do the set_weight_attr things
 
     def apply_weights(self,
                       weights: Dict[str, Any],
                       x: torch.Tensor,
                       bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-        qweights = weights["qweight"]
-        return F.linear(x, qweight.dequantized(), bias)
+        weight = weights["weight"]
+        print("111111")
+        return F.linear(x, weight.dequantized(), bias)
+
 
 
 class YakQuantizedParameter(nn.Parameter):
@@ -90,31 +123,51 @@ class YakQuantizedParameter(nn.Parameter):
     needed by the model. The weights are actually quantized during any `.to(device)`
     if `device` is a cuda device.
     """
-
-    def __new__(
-        cls,
-        data: Optional[torch.Tensor] = None,
-        requires_grad: bool = False,  # quantized weights should be frozen by default
-        quantization: YakQuantizationConfig = None,
-        quantizer=None,  # HF expects this argument.
+    def __init__(
+        self,
+        original_data,
+        data,
+        quantization: YQConfig = None,
+        quantizer=None
     ):
-        if data is None:
-            data = torch.empty(0)
-        if quantization is None:
-            quantization = YakQuantizationConfig()
-        self = torch.Tensor._make_subclass(cls, data, requires_grad)
+        self.original_data = original_data
+        self.data = data
         from deepspeed.tops import FP_Quantize
         if quantizer is not None:
             self.quantizer = quantizer
         else:
             self.quantizer = FP_Quantize(
-                q_bits=quantization.q_bits,
+                q_bits=quantization.weight_bits,
                 rounding=quantization.rounding,
                 mantisa_bits=quantization.mantissa_bits,
                 group_size=quantization.group_size,
             )
-        self._ensure_quantized(self)
-        return self
+
+    # def __new__(
+    #     cls,
+    #     original_data,
+    #     data,
+    #     requires_grad: bool = False,  # quantized weights should be frozen by default
+    #     quantization: YQConfig = None,
+    #     quantizer=None,  # HF expects this argument.
+    # ):
+    #     self.original_data = original_data
+    #     self.data = data
+    #     if quantization is None:
+    #         quantization = YQConfig()
+    #     self = torch.Tensor._make_subclass(cls, data, requires_grad)
+    #     from deepspeed.tops import FP_Quantize
+    #     if quantizer is not None:
+    #         self.quantizer = quantizer
+    #     else:
+    #         self.quantizer = FP_Quantize(
+    #             q_bits=quantization.weight_bits,
+    #             rounding=quantization.rounding,
+    #             mantisa_bits=quantization.mantissa_bits,
+    #             group_size=quantization.group_size,
+    #         )
+    #     self._ensure_quantized(self)
+    #     return self
 
     def _ensure_quantized(self, tensor: torch.Tensor):
         # If the tensor is on a cuda device and is not quantized, then quantize it in-place.
@@ -132,39 +185,42 @@ class YakQuantizedParameter(nn.Parameter):
                 return self.quantizer.dequantize(self.data)
         return self.data
 
-    def __getstate__(self):
-        state = self.__dict__
-        state["data"] = self.data
-        state["requires_grad"] = self.requires_grad
-        return state
+    # def __getstate__(self):
+    #     state = self.__dict__
+    #     state["data"] = self.data
+    #     state["requires_grad"] = self.requires_grad
+    #     return state
 
-    def __setstate__(self, state):
-        self.quantizer = state["quantizer"]
-        self.data = state["data"]
-        self.requires_grad = state["requires_grad"]
+    # def __setstate__(self, state):
+    #     self.quantizer = state["quantizer"]
+    #     self.data = state["data"]
+    #     self.requires_grad = state["requires_grad"]
 
-    def __deepcopy__(self, memo):
-        new_instance = type(self).__new__(type(self))
-        state = self.__getstate__()
-        new_instance.__setstate__(state)
-        new_instance.quantizer = copy.deepcopy(state["quantizer"])
-        new_instance.data = copy.deepcopy(state["data"])
-        return new_instance
+    # def __deepcopy__(self, memo):
+    #     new_instance = type(self).__new__(type(self))
+    #     state = self.__getstate__()
+    #     new_instance.__setstate__(state)
+    #     new_instance.quantizer = copy.deepcopy(state["quantizer"])
+    #     new_instance.data = copy.deepcopy(state["data"])
+    #     return new_instance
 
-    def __copy__(self):
-        new_instance = type(self).__new__(type(self))
-        state = self.__getstate__()
-        new_instance.__setstate__(state)
-        return new_instance
+    # def __copy__(self):
+    #     new_instance = type(self).__new__(type(self))
+    #     state = self.__getstate__()
+    #     new_instance.__setstate__(state)
+    #     return new_instance
 
-    def cuda(self, device=None, non_blocking=False):
-        return self.to(device="cuda" if device is None else device, non_blocking=non_blocking)
+    # def cuda(self, device=None, non_blocking=False):
+    #     return self.to(device="cuda" if device is None else device, non_blocking=non_blocking)
 
-    def to(self, *args, **kwargs):
-        """
-        Move the parameter to the given device. Then, if the device is a cuda device,
-        quantize it.
-        """
-        tensor = super().to(*args, **kwargs)
-        self._ensure_quantized(tensor)
-        return tensor
+    # def to(self, *args, **kwargs):
+    #     """
+    #     Move the parameter to the given device. Then, if the device is a cuda device,
+    #     quantize it.
+    #     """
+    #     tensor = super().to(*args, **kwargs)
+    #     self._ensure_quantized(tensor)
+    #     return tensor
+
+    def is_yak(self):
+        return True

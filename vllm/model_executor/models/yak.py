@@ -104,7 +104,8 @@ class YakMoE(nn.Module):
     def __init__(self, config: YakConfig,
                  layer_id: int,
                  tp_size: Optional[int] = None,
-                 params_dtype: Optional[torch.dtype] = None):
+                 params_dtype: Optional[torch.dtype] = None,
+                 linear_method: Optional[LinearMethodBase] = None):
         super(YakMoE, self).__init__()
 
         self.tp_size = tp_size or get_tensor_model_parallel_world_size()
@@ -120,16 +121,16 @@ class YakMoE(nn.Module):
         self.params_dtype = None
 
         if not self.is_moe_layer:
-            self.mlp = YakMLP(config, layer_id=layer_id)
+            self.mlp = YakMLP(config, layer_id=layer_id, linear_method=linear_method)
         else:
             # TODO(Hao): fix this
             self.gate = ReplicatedLinear(self.hidden_dim,
                                          self.num_experts,
                                          bias=False,
                                          params_dtype=self.params_dtype,
-                                         linear_method=None)
+                                         linear_method=linear_method)
             self.experts = nn.ModuleList(
-                [YakMLP(config, layer_id=layer_id, expert_id=i) for i in range(self.num_experts)])
+                [YakMLP(config, layer_id=layer_id, expert_id=i, linear_method=linear_method) for i in range(self.num_experts)])
             # self.moe = MixtralMoE(
             #     num_experts=self.num_experts,
             #     top_k=self.top_k,
@@ -316,8 +317,8 @@ class YakDecoderLayer(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
-        self.self_attn = YakAttention(config, layer_idx)
-        self.block_sparse_moe = YakMoE(config, layer_id=layer_idx)
+        self.self_attn = YakAttention(config, layer_idx, linear_method=linear_method)
+        self.block_sparse_moe = YakMoE(config, layer_id=layer_idx, linear_method=linear_method)
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -414,9 +415,10 @@ class YakForCausalLM(nn.Module):
         **kwargs
     ) -> None:
         super().__init__()
-        self.model = YakModel(config)
+        self.model = YakModel(config, linear_method)
         self.config = config
         self.linear_method = linear_method
+        #import pdb; pdb.set_trace()
         self.vocab_size = config.vocab_size
         # self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.lm_head = ParallelLMHead(
@@ -475,7 +477,6 @@ class YakForCausalLM(nn.Module):
 
 
         params_dict = dict(self.named_parameters())
-        # import pdb; pdb.set_trace()
         loaded_iterators = hf_model_weights_iterator(
             model_name_or_path,
             cache_dir,
@@ -509,6 +510,7 @@ class YakForCausalLM(nn.Module):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
+                    import pdb; pdb.set_trace()
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(param, loaded_weight, shard_id)
