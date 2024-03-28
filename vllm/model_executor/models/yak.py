@@ -73,7 +73,7 @@ class YakMLP(nn.Module):
         self.layer_id = layer_id
 
         # TODO(Hao): make this tensor-parallel using RowParallelLinear
-        self.ffn_dim = config.intermediate_size if not is_residual_mlp else self.hidden_dim
+        self.ffn_dim = config.intermediate_size if not is_residual_mlp else self.hidden_size
 
         self.w13 = MergedColumnParallelLinear(
             self.hidden_size, [self.ffn_dim] * 2,
@@ -418,7 +418,6 @@ class YakForCausalLM(nn.Module):
         self.model = YakModel(config, linear_method)
         self.config = config
         self.linear_method = linear_method
-        #import pdb; pdb.set_trace()
         self.vocab_size = config.vocab_size
         # self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.lm_head = ParallelLMHead(
@@ -494,6 +493,7 @@ class YakForCausalLM(nn.Module):
 
         
         for name, loaded_weight in loaded_iterators:
+            print(f"Load weight {name} with shape {loaded_weight.shape}.")
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -510,7 +510,6 @@ class YakForCausalLM(nn.Module):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
-                    import pdb; pdb.set_trace()
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(param, loaded_weight, shard_id)
@@ -534,4 +533,12 @@ class YakForCausalLM(nn.Module):
                     weight_loader = getattr(param, "weight_loader",
                                             default_weight_loader)
                     weight_loader(param, loaded_weight)
-            # print(f"Load weight {name} with shape {loaded_weight.shape}.")
+
+        # For yak, we run a post quantization
+        for name, param in self.named_parameters():
+            if hasattr(param, "is_yak") and param.is_yak() == True:
+            # do quantization after loading and moe to GPU
+                assert param.device.type != "cuda"
+                param.data = param.cuda()
+                print(f"Quantize weight {name} with dtype {param.data.shape}.")
+
