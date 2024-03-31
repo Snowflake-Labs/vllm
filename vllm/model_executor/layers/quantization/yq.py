@@ -90,9 +90,6 @@ class YQLinearMethod(LinearMethodBase):
         # create the quantizer
         from deepspeed.ops.fp_quantizer import FP_Quantize
         self.quantizer = FP_Quantize(
-            q_bits=self.quant_config.weight_bits,
-            rounding=self.quant_config.rounding,
-            mantisa_bits=self.quant_config.mantissa_bits,
             group_size=self.quant_config.group_size,
         )
 
@@ -314,9 +311,6 @@ class YakQuantizedParameter(nn.Parameter):
             self.quantizer = quantizer
         else:
             self.quantizer = FP_Quantize(
-                q_bits=quantization.weight_bits,
-                rounding=quantization.rounding,
-                mantisa_bits=quantization.mantissa_bits,
                 group_size=quantization.group_size,
             )
         self._ensure_quantized(self)
