@@ -494,6 +494,11 @@ class YakForCausalLM(nn.Module):
 
         if use_fused_moe:
             for i in range(num_layers):
+                for weight_name in ["w1", "w3"]:
+                    mapping = (f"layers.{i}.residual_mlp.w13.weight", 
+                               f"layers.{i}.residual_mlp.{weight_name}.weight",
+                               0 if weight_name == "w1" else 1)
+                    mlp_params_mapping.append(mapping)
                 if i % 2 == 0:
                     # MLP layers
                     for weight_name in ["w1", "w3"]:
@@ -538,7 +543,7 @@ class YakForCausalLM(nn.Module):
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(param, loaded_weight, shard_id)
-                    # print(f"Loaded weight {original_name} with shape {loaded_weight.shape} into module {name} ({param.shape}) as shard {shard_id}")
+                    print(f"Loaded weight {original_name} with shape {loaded_weight.shape} into module {name} ({param.shape}) as shard {shard_id}")
                     break
                 else:
                     for param_name, weight_name, shard_id in mlp_params_mapping:
@@ -548,7 +553,7 @@ class YakForCausalLM(nn.Module):
                         param = params_dict[name]
                         weight_loader = param.weight_loader
                         weight_loader(param, loaded_weight, shard_id)
-                        # print(f"Loaded weight {original_name} ({loaded_weight.shape}) into module {name} ({param.shape}) as shard {shard_id}")
+                        print(f"Loaded weight {original_name} ({loaded_weight.shape}) into module {name} ({param.shape}) as shard {shard_id}")
                         break
                     else:        
                         for param_name, weight_name, shard_id in expert_params_mapping:
@@ -558,7 +563,7 @@ class YakForCausalLM(nn.Module):
                             param = params_dict[name]
                             weight_loader = param.weight_loader
                             weight_loader(param, loaded_weight, weight_name, expert_id=shard_id)
-                            # print(f"Loaded weight {original_name} ({loaded_weight.shape}) into module {name} ({param.shape}) as shard {shard_id}")
+                            print(f"Loaded weight {original_name} ({loaded_weight.shape}) into module {name} ({param.shape}) as shard {shard_id}")
                             break
                         else:
                             if name.endswith(".bias") and name not in params_dict:
@@ -567,7 +572,7 @@ class YakForCausalLM(nn.Module):
                             weight_loader = getattr(param, "weight_loader",
                                                     default_weight_loader)
                             weight_loader(param, loaded_weight)
-                            # print(f"Loaded weight {original_name} ({loaded_weight.shape}) into module {name} ({param.shape}) as shard 0")
+                            print(f"Loaded weight {original_name} ({loaded_weight.shape}) into module {name} ({param.shape}) as shard 0")
 
         def unfused_load():
             for name, loaded_weight in loaded_iterators:
