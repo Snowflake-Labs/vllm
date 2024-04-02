@@ -351,7 +351,6 @@ def fused_moe(
             gating_output.float(),  # TODO(woosuk): Optimize this.
         )
         del token_expert_indicies  # Not used. Will be used in the future.
-    
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
@@ -391,22 +390,18 @@ def fused_moe(
     intermediate_cache3 = torch.empty((M, topk_ids.shape[1], w2.shape[1]),
                                       device=hidden_states.device,
                                       dtype=hidden_states.dtype)
-
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids, config['BLOCK_SIZE_M'], E)
-
+    # print(f"Confirm the computation is performed under precision {w1.dtype}, {w2.dtype}")
     invoke_fused_moe_kernel(hidden_states, w1, intermediate_cache1,
                             topk_weights, topk_ids, sorted_token_ids,
                             expert_ids, num_tokens_post_padded, False,
                             topk_ids.shape[1], config)
-
     ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
-
     invoke_fused_moe_kernel(intermediate_cache2, w2, intermediate_cache3,
                             topk_weights, topk_ids, sorted_token_ids,
                             expert_ids, num_tokens_post_padded, True, 1,
                             config)
-
     if inplace:
         return torch.sum(intermediate_cache3.view(*intermediate_cache3.shape),
                          dim=1,

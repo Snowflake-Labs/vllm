@@ -369,6 +369,7 @@ class YakQuantizedParameter(nn.Parameter):
         self._ensure_quantized(tensor)
         return tensor
 
+    @property
     def is_yak(self):
         return True
 
