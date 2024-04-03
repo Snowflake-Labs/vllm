@@ -86,6 +86,7 @@ class YakMoE(nn.Module):
 
     Note that Yak has *every other* layer to be an MoE (different from Mixtral).
     """
+
     def __init__(self, config: YakConfig,
                  layer_id: int,
                  tp_size: Optional[int] = None,
@@ -136,7 +137,6 @@ class YakMoE(nn.Module):
                                     dtype=self.params_dtype).cpu(),
                         requires_grad=False
                     )
-
                 else:
                     self.ws = nn.Parameter(
                         torch.empty(self.num_experts,
@@ -616,4 +616,5 @@ class YakForCausalLM(nn.Module):
             # do quantization after loading and moe to GPU
                 assert param.device.type != "cuda"
                 param.data = param.cuda()
+                torch.cuda.empty_cache()
                 print(f"Quantize weight {name} with dtype {param.data.dtype} and shape {param.data.shape}.")
