@@ -17,7 +17,7 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.parallel_utils.communication_op import (
     tensor_model_parallel_all_reduce)
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.fused_moe import fused_moe
+from vllm.model_executor.layers.fused_moe import fused_topk, fused_experts
 from vllm.model_executor.parallel_utils.parallel_state import (
     get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
 from vllm.model_executor.layers.linear import (LinearMethodBase,
@@ -223,13 +223,42 @@ class YakMoE(nn.Module):
         # router_logits: (batch * sequence_length, n_experts)
         router_logits, _ = self.gate(hidden_states)
         do_normalize = True if self.top_k > 1 else False
-        final_hidden_states = fused_moe(hidden_states,
-                                        self.ws.dequantized() if self.is_quant else self.ws,
-                                        self.w2s.dequantized() if self.is_quant else self.w2s,
-                                        router_logits,
-                                        self.top_k,
-                                        renormalize=do_normalize,
-                                        inplace=True)
+        topk_weights, topk_ids = fused_topk(hidden_states,
+                                            router_logits,
+                                            self.top_k,
+                                            renormalize=do_normalize)
+        # topk_ids: (batch * sequence_length, k)
+        ### <HACK> ###
+        if self.is_quant:
+            ws = self.ws.view((self.num_experts, -1, self.ws.shape[-1]))
+            w2s = self.w2s.view((self.num_experts, -1, self.ws.shape[-1]))
+            ws_dequantized = torch.empty(self.num_experts,
+                                         2 * self.intermediate_size,
+                                         self.hidden_size,
+                                         dtype=self.ws.quantizer.orig_dtype,
+                                         device=self.ws.device)
+            w2s_dequantized = torch.empty(self.num_experts,
+                                          self.hidden_size,
+                                          self.intermediate_size,
+                                          dtype=self.w2s.quantizer.orig_dtype,
+                                          device=self.w2s.device)
+            activated = topk_ids.unique().tolist()
+            # Force quantizer to dequantize into the shape of a single expert.
+            self.ws.quantizer.orig_shape = ws_dequantized.shape[1:]
+            self.w2s.quantizer.orig_shape = w2s_dequantized.shape[1:]
+            for i in activated:
+                # Dequantize each activated expert separately.
+                with torch.cuda.stream(torch.cuda.current_stream(self.ws.data.device)):
+                    ws_dequantized[i] = self.ws.quantizer.dequantize(ws[i])
+                with torch.cuda.stream(torch.cuda.current_stream(self.w2s.data.device)):
+                    w2s_dequantized[i] = self.w2s.quantizer.dequantize(w2s[i])
+        ### </HACK> ###
+        final_hidden_states = fused_experts(hidden_states,
+                                            ws_dequantized if self.is_quant else self.ws,
+                                            w2s_dequantized if self.is_quant else self.w2s,
+                                            topk_weights,
+                                            topk_ids,
+                                            inplace=True)
         # print(f"Exit the kernel, dtype: {self.ws.dtype}, {self.w2s.dtype}")
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(
