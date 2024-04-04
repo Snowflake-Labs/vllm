@@ -231,7 +231,7 @@ class YakMoE(nn.Module):
         ### <HACK> ###
         if self.is_quant:
             ws = self.ws.view((self.num_experts, -1, self.ws.shape[-1]))
-            w2s = self.w2s.view((self.num_experts, -1, self.ws.shape[-1]))
+            w2s = self.w2s.view((self.num_experts, -1, self.w2s.shape[-1]))
             ws_dequantized = torch.empty(self.num_experts,
                                          2 * self.intermediate_size,
                                          self.hidden_size,
@@ -248,10 +248,8 @@ class YakMoE(nn.Module):
             self.w2s.quantizer.orig_shape = w2s_dequantized.shape[1:]
             for i in activated:
                 # Dequantize each activated expert separately.
-                with torch.cuda.stream(torch.cuda.current_stream(self.ws.data.device)):
-                    ws_dequantized[i] = self.ws.quantizer.dequantize(ws[i])
-                with torch.cuda.stream(torch.cuda.current_stream(self.w2s.data.device)):
-                    w2s_dequantized[i] = self.w2s.quantizer.dequantize(w2s[i])
+                self.ws.quantizer.dequantize(ws[i], fp_out=ws_dequantized[i])
+                self.w2s.quantizer.dequantize(w2s[i], fp_out=w2s_dequantized[i])
         ### </HACK> ###
         final_hidden_states = fused_experts(hidden_states,
                                             ws_dequantized if self.is_quant else self.ws,
@@ -640,10 +638,11 @@ class YakForCausalLM(nn.Module):
             unfused_load()
 
         # For yak, we run a post quantization, because the weights are saved in 16 bits.
-        for name, param in self.named_parameters():
+        # Iterate in order of largest to smallest params to reduce fragmentation issues.
+        for name, param in sorted(self.named_parameters(), key=lambda v: -v[1].numel()):
             if hasattr(param, "is_yak") and param.is_yak == True:
-            # do quantization after loading and moe to GPU
+                # do quantization after loading and moe to GPU
                 assert param.device.type != "cuda"
                 param.data = param.cuda()
-                torch.cuda.empty_cache()
+                #torch.cuda.empty_cache()
                 print(f"Quantize weight {name} with dtype {param.data.dtype} and shape {param.data.shape}.")
