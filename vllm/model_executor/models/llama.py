@@ -75,11 +75,8 @@ class LlamaMLP(nn.Module):
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
-        import pdb; pdb.set_trace()
         x = self.act_fn(gate_up)
-        import pdb; pdb.set_trace()
         x, _ = self.down_proj(x)
-        import pdb; pdb.set_trace()
         return x
 
 
