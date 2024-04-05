@@ -51,7 +51,12 @@ def pr(x):
 
 
 class YakMLP(nn.Module):
-    def __init__(self, config, layer_id, expert_id=-1, is_residual_mlp=False, linear_method: Optional[LinearMethodBase] = None):
+    def __init__(self, config: YakConfig,
+                 layer_id: int,
+                 expert_id: int = -1,
+                 is_residual_mlp: bool = False,
+                 linear_method: Optional[LinearMethodBase] = None,
+                 reduce_results: bool = True):
         super(YakMLP, self).__init__()
         self.hidden_size = config.hidden_size
         self.expert_id = expert_id
@@ -67,6 +72,7 @@ class YakMLP(nn.Module):
         self.w2 = RowParallelLinear(self.ffn_dim,
                                      self.hidden_size,
                                      bias=False,
+                                     reduce_results=reduce_results,
                                      linear_method=linear_method)
         if config.hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {config.hidden_act}. "
@@ -91,7 +97,8 @@ class YakMoE(nn.Module):
                  layer_id: int,
                  tp_size: Optional[int] = None,
                  params_dtype: Optional[torch.dtype] = None,
-                 linear_method: Optional[LinearMethodBase] = None):
+                 linear_method: Optional[LinearMethodBase] = None,
+                 reduce_results: bool = True):
         super(YakMoE, self).__init__()
 
         self.tp_size = tp_size or get_tensor_model_parallel_world_size()
@@ -103,6 +110,7 @@ class YakMoE(nn.Module):
 
         self.is_moe_layer = (layer_id+1) % config.moe_layer_frequency == 0
         self.is_quant = isinstance(linear_method, YQLinearMethod)
+        self.reduce_results = reduce_results
 
         # Some other parameters
         if params_dtype is None:
@@ -110,7 +118,8 @@ class YakMoE(nn.Module):
         self.params_dtype = params_dtype
 
         if not self.is_moe_layer:
-            self.mlp = YakMLP(config, layer_id=layer_id, linear_method=linear_method)
+            self.mlp = YakMLP(config, layer_id=layer_id, linear_method=linear_method,
+                              reduce_results=reduce_results)
         else:
             self.gate = ReplicatedLinear(self.hidden_size,
                                          self.num_experts,
@@ -118,8 +127,15 @@ class YakMoE(nn.Module):
                                          params_dtype=self.params_dtype,
                                          linear_method=linear_method)
             if not use_fused_moe:
-                self.experts = nn.ModuleList(
-                    [YakMLP(config, layer_id=layer_id, expert_id=i, linear_method=linear_method) for i in range(self.num_experts)])
+                self.experts = nn.ModuleList([
+                    YakMLP(
+                        config,
+                        layer_id=layer_id,
+                        expert_id=i,
+                        linear_method=linear_method,
+                        reduce_results=reduce_results,
+                    ) for i in range(self.num_experts)
+                ])
             else:
                 # Create it on CPU and later quantize it to GPU.
                 if self.is_quant:
@@ -259,9 +275,8 @@ class YakMoE(nn.Module):
                                             topk_ids,
                                             inplace=True)
         # print(f"Exit the kernel, dtype: {self.ws.dtype}, {self.w2s.dtype}")
-        if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(
-                final_hidden_states)
+        if self.reduce_results and self.tp_size > 1:
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(batch_size, sequence_length,
                                         hidden_size)
 
@@ -372,16 +387,18 @@ class YakDecoderLayer(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
+        self.use_residual = config.use_residual and self.block_sparse_moe.is_moe_layer
         self.self_attn = YakAttention(config, layer_idx, linear_method=linear_method)
-        self.block_sparse_moe = YakMoE(config, layer_id=layer_idx, linear_method=linear_method)
+        self.block_sparse_moe = YakMoE(config, layer_id=layer_idx, linear_method=linear_method,
+                                       reduce_results=(not self.use_residual))
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        self.use_residual = config.use_residual and self.block_sparse_moe.is_moe_layer
         if self.use_residual:
             self.residual_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.residual_mlp = YakMLP(config, layer_id=layer_idx, is_residual_mlp=True)
+            self.residual_mlp = YakMLP(config, layer_id=layer_idx, is_residual_mlp=True,
+                                       reduce_results=False)
 
     def forward(
         self,
@@ -392,30 +409,24 @@ class YakDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         residual_input = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        # self attention
-        #with record_function("ATTN"):
-        if True:
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                kv_cache=kv_cache,
-                input_metadata=input_metadata
-            )
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            kv_cache=kv_cache,
+            input_metadata=input_metadata
+        )
         hidden_states = residual_input + hidden_states
 
         residual_attn = hidden_states
         if self.use_residual:
-            # residual mlp part
-            #with record_function("MLP"):
-            if True:
-                hidden_states = self.residual_layernorm(hidden_states)
-                hidden_states = self.residual_mlp(hidden_states)
-                residual_residual = residual_attn + hidden_states
-            # residual mlp moe part
-            #with record_function("MOE"):
-                hidden_states = self.post_attention_layernorm(residual_input)
-                hidden_states = self.block_sparse_moe(hidden_states)
-                hidden_states = residual_residual + hidden_states
+            hidden_states = self.residual_layernorm(hidden_states)
+            hidden_states = self.residual_mlp(hidden_states)
+            residual_mlp = hidden_states
+            hidden_states = self.post_attention_layernorm(residual_input)
+            hidden_states = self.block_sparse_moe(hidden_states)
+            hidden_states = residual_mlp + hidden_states
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+            hidden_states = residual_attn + hidden_states
         else:
             hidden_states = self.post_attention_layernorm(hidden_states)
             hidden_states = self.block_sparse_moe(hidden_states)
