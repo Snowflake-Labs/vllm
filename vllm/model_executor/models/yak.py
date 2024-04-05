@@ -37,8 +37,6 @@ from vllm.model_executor.weight_utils import (default_weight_loader,
 from vllm.model_executor.layers.quantization.yq import YakQuantizedParameter, YQLinearMethod
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
-KVCache = Tuple[torch.Tensor, torch.Tensor]
-
 use_fused_moe = os.environ.get('USE_FUSE', False)
 use_fused_moe = bool(use_fused_moe)
 use_dummy = os.environ.get("USE_DUMMY", False)
@@ -363,14 +361,13 @@ class YakAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: KVCache,
+        kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
-        k_cache, v_cache = kv_cache
-        attn_output = self.attn(q, k, v, k_cache, v_cache, attn_metadata)
+        attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -402,7 +399,7 @@ class YakDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: KVCache,
+        kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         residual_input = hidden_states
@@ -461,7 +458,7 @@ class YakModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[KVCache],
+        kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
@@ -505,7 +502,7 @@ class YakForCausalLM(nn.Module):
     def forward(self,
                 input_ids: torch.Tensor,
                 positions: torch.Tensor,
-                kv_caches: List[KVCache],
+                kv_caches: List[torch.Tensor],
                 attn_metadata: AttentionMetadata,
             ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, kv_caches, attn_metadata)
