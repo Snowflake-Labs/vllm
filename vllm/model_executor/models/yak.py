@@ -80,7 +80,6 @@ class YakMLP(nn.Module):
         hidden_states, _ = self.w2(hidden_states)
         return hidden_states
 
-activated = torch.tensor([0, 1], dtype=torch.long, device="cuda")
 
 class YakMoE(nn.Module):
     """Model-parallel implementation of Yak MoE Layer.
@@ -241,7 +240,7 @@ class YakMoE(nn.Module):
                                             renormalize=do_normalize)
         # topk_ids: (batch * sequence_length, k)
         if self.is_quant:
-            if 2 * batch_size * self.top_k <= self.num_experts:
+            if 2 * topk_ids.numel() <= self.num_experts:
                 # If much fewer tokens than experts, use selective dequantize.
                 ws_dequantized = self._selective_dequantize(self.ws, topk_ids)
                 w2s_dequantized = self._selective_dequantize(self.w2s, topk_ids)
@@ -467,9 +466,6 @@ class YakModel(nn.Module):
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
-from torch.profiler import profile, record_function, ProfilerActivity
-
-IDX = 0
 
 class YakForCausalLM(nn.Module):
     def __init__(
@@ -501,18 +497,7 @@ class YakForCausalLM(nn.Module):
                 kv_caches: List[KVCache],
                 input_metadata: InputMetadata,
             ) -> torch.Tensor:
-        #global IDX
-        #with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
-        #with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-        #with profile(activities=[ProfilerActivity.CPU]) as prof:
-        if True:
-            hidden_states = self.model(input_ids, positions, kv_caches, input_metadata)
-        #output = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=10)
-        #print(output)
-        #output = prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=10)
-        #print(output)
-        #prof.export_chrome_trace(f"traces/trace_{IDX}.json")
-        #IDX += 1
+        hidden_states = self.model(input_ids, positions, kv_caches, input_metadata)
         return hidden_states
 
     def sample(
@@ -664,5 +649,4 @@ class YakForCausalLM(nn.Module):
                 # do quantization after loading and moe to GPU
                 assert param.device.type != "cuda"
                 param.data = param.cuda()
-                #torch.cuda.empty_cache()
                 print(f"Quantize weight {name} with dtype {param.data.dtype} and shape {param.data.shape}.")

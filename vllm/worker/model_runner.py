@@ -587,12 +587,19 @@ class ModelRunner:
             model_executable = self.graph_runners[graph_batch_size]
         else:
             model_executable = self.model
-        hidden_states = model_executable(
-            input_ids=input_tokens,
-            positions=input_positions,
-            kv_caches=kv_caches,
-            input_metadata=input_metadata,
-        )
+        #from torch.profiler import profile, record_function, ProfilerActivity
+        #with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        if True:
+            hidden_states = model_executable(
+                input_ids=input_tokens,
+                positions=input_positions,
+                kv_caches=kv_caches,
+                input_metadata=input_metadata,
+            )
+        #output = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=10)
+        #print(output)
+        #output = prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=10)
+        #print(output)
 
         # Sample the next token.
         output = self.model.sample(
