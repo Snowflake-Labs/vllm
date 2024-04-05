@@ -21,7 +21,7 @@ class YQConfig(QuantizationConfig):
         rounding: str = "nearest",
         mantissa_bits: int = 3,
         q_range = 480.0,
-        group_size: int = 128
+        group_size: int = 512,
     ) -> None:
         self.weight_bits = weight_bits
         self.group_size = group_size
@@ -30,10 +30,10 @@ class YQConfig(QuantizationConfig):
         self.q_range = q_range
         self.valid_types = [torch.bfloat16, torch.float16]
 
-        if self.weight_bits != 8:
+        if self.weight_bits not in [6, 8]:
             raise ValueError(
-                "Currently, only 8-bit weight quantization is supported for "
-                f"Yak quantizaiton, but got {self.weight_bits} bits."
+                "Currently, only i6-bit or 8-bit weight quantization are "
+                f"supported for Yak quantizaiton, but got {self.weight_bits} bits."
             )
 
     def __repr__(self) -> str:
@@ -320,7 +320,7 @@ class YakQuantizedParameter(nn.Parameter):
         # If the tensor is on a cuda device and is not quantized, then quantize it in-place.
         if tensor.device.type == "cuda" and tensor.dtype != torch.int8:
             with torch.cuda.stream(torch.cuda.current_stream(tensor.device)):
-                tensor.data = self.quantizer.quantize(tensor.data)
+                tensor.data = self.quantizer.quantize(tensor.data, q_bits=6)
             assert tensor.dtype == torch.int8
 
     def dequantized(self) -> torch.Tensor:
@@ -329,7 +329,7 @@ class YakQuantizedParameter(nn.Parameter):
         """
         if self.data.device.type == "cuda" and self.data.dtype == torch.int8:
             with torch.cuda.stream(torch.cuda.current_stream(self.data.device)):
-                return self.quantizer.dequantize(self.data)
+                return self.quantizer.dequantize(self.data, q_bits=6)
         return self.data
 
     def __getstate__(self):

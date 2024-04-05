@@ -48,7 +48,12 @@ print(f"=== DUMMY: {use_dummy}===")
 
 
 class YakMLP(nn.Module):
-    def __init__(self, config, layer_id, expert_id=-1, is_residual_mlp=False, linear_method: Optional[LinearMethodBase] = None):
+    def __init__(self, config: YakConfig,
+                 layer_id: int,
+                 expert_id: int = -1,
+                 is_residual_mlp: bool = False,
+                 linear_method: Optional[LinearMethodBase] = None,
+                 reduce_results: bool = True):
         super(YakMLP, self).__init__()
         self.hidden_size = config.hidden_size
         self.expert_id = expert_id
@@ -64,6 +69,7 @@ class YakMLP(nn.Module):
         self.w2 = RowParallelLinear(self.ffn_dim,
                                      self.hidden_size,
                                      bias=False,
+                                     reduce_results=reduce_results,
                                      linear_method=linear_method)
         if config.hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {config.hidden_act}. "
@@ -88,7 +94,8 @@ class YakMoE(nn.Module):
                  layer_id: int,
                  tp_size: Optional[int] = None,
                  params_dtype: Optional[torch.dtype] = None,
-                 linear_method: Optional[LinearMethodBase] = None):
+                 linear_method: Optional[LinearMethodBase] = None,
+                 reduce_results: bool = True):
         super(YakMoE, self).__init__()
 
         self.tp_size = tp_size or get_tensor_model_parallel_world_size()
@@ -100,6 +107,7 @@ class YakMoE(nn.Module):
 
         self.is_moe_layer = (layer_id+1) % config.moe_layer_frequency == 0
         self.is_quant = isinstance(linear_method, YQLinearMethod)
+        self.reduce_results = reduce_results
 
         # Some other parameters
         if params_dtype is None:
@@ -107,7 +115,8 @@ class YakMoE(nn.Module):
         self.params_dtype = params_dtype
 
         if not self.is_moe_layer:
-            self.mlp = YakMLP(config, layer_id=layer_id, linear_method=linear_method)
+            self.mlp = YakMLP(config, layer_id=layer_id, linear_method=linear_method,
+                              reduce_results=reduce_results)
         else:
             self.gate = ReplicatedLinear(self.hidden_size,
                                          self.num_experts,
@@ -115,8 +124,15 @@ class YakMoE(nn.Module):
                                          params_dtype=self.params_dtype,
                                          linear_method=linear_method)
             if not use_fused_moe:
-                self.experts = nn.ModuleList(
-                    [YakMLP(config, layer_id=layer_id, expert_id=i, linear_method=linear_method) for i in range(self.num_experts)])
+                self.experts = nn.ModuleList([
+                    YakMLP(
+                        config,
+                        layer_id=layer_id,
+                        expert_id=i,
+                        linear_method=linear_method,
+                        reduce_results=reduce_results,
+                    ) for i in range(self.num_experts)
+                ])
             else:
                 # Create it on CPU and later quantize it to GPU.
                 if self.is_quant:
@@ -214,57 +230,50 @@ class YakMoE(nn.Module):
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_size)
         return final_hidden_states
 
+    def _selective_dequantize(self, param, topk_ids):
+        # select the experts in topk_ids
+        tensor = param.view((self.num_experts, -1, param.shape[-1]))
+        tensor = tensor.index_select(0, topk_ids.flatten())
+        # dequantize the selected experts
+        orig_shape = param.quantizer.orig_shape
+        param.quantizer.orig_shape = (tensor.shape[0], *orig_shape[1:])
+        dequantized = param.quantizer.dequantize(tensor, q_bits=6)
+        param.quantizer.orig_shape = orig_shape
+        return dequantized
+
     def local_moe_fused(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
         # router_logits: (batch * sequence_length, n_experts)
         router_logits, _ = self.gate(hidden_states)
         do_normalize = True if self.top_k > 1 else False
-        final_hidden_states = fused_moe(hidden_states,
-                                self.ws.dequantized() if self.is_quant else self.ws,
-                                self.w2s.dequantized() if self.is_quant else self.w2s,
-                                router_logits,
-                                self.top_k,
-                                renormalize=do_normalize,
-                                inplace=True)
-        # topk_weights, topk_ids = fused_topk(hidden_states,
-        #                                     router_logits,
-        #                                     self.top_k,
-        #                                     renormalize=do_normalize)
-        # # topk_ids: (batch * sequence_length, k)
-        # ### <HACK> ###
-        # if self.is_quant:
-        #     ws = self.ws.view((self.num_experts, -1, self.ws.shape[-1]))
-        #     w2s = self.w2s.view((self.num_experts, -1, self.w2s.shape[-1]))
-        #     ws_dequantized = torch.empty(self.num_experts,
-        #                                  2 * self.intermediate_size,
-        #                                  self.hidden_size,
-        #                                  dtype=self.ws.quantizer.orig_dtype,
-        #                                  device=self.ws.device)
-        #     w2s_dequantized = torch.empty(self.num_experts,
-        #                                   self.hidden_size,
-        #                                   self.intermediate_size,
-        #                                   dtype=self.w2s.quantizer.orig_dtype,
-        #                                   device=self.w2s.device)
-        #     activated = topk_ids.unique().tolist()
-        #     # Force quantizer to dequantize into the shape of a single expert.
-        #     self.ws.quantizer.orig_shape = ws_dequantized.shape[1:]
-        #     self.w2s.quantizer.orig_shape = w2s_dequantized.shape[1:]
-        #     for i in activated:
-        #         # Dequantize each activated expert separately.
-        #         self.ws.quantizer.dequantize(ws[i], fp_out=ws_dequantized[i])
-        #         self.w2s.quantizer.dequantize(w2s[i], fp_out=w2s_dequantized[i])
-        # ### </HACK> ###
-        # final_hidden_states = fused_experts(hidden_states,
-        #                                     ws_dequantized if self.is_quant else self.ws,
-        #                                     w2s_dequantized if self.is_quant else self.w2s,
-        #                                     topk_weights,
-        #                                     topk_ids,
-        #                                     inplace=True)
+        topk_weights, topk_ids = fused_topk(hidden_states,
+                                            router_logits,
+                                            self.top_k,
+                                            renormalize=do_normalize)
+        # topk_ids: (batch * sequence_length, k)
+        if self.is_quant:
+            if 2 * topk_ids.numel() <= self.num_experts:
+                # If much fewer tokens than experts, use selective dequantize.
+                ws_dequantized = self._selective_dequantize(self.ws, topk_ids)
+                w2s_dequantized = self._selective_dequantize(self.w2s, topk_ids)
+                # We gathered the experts to the tokens so update the mapping.
+                topk_ids = torch.arange(
+                    0, topk_ids.numel(),
+                    device=topk_ids.device,
+                ).reshape(topk_ids.shape)
+            else:
+                ws_dequantized = self.ws.dequantized()
+                w2s_dequantized = self.w2s.dequantized()
+        final_hidden_states = fused_experts(hidden_states,
+                                            ws_dequantized if self.is_quant else self.ws,
+                                            w2s_dequantized if self.is_quant else self.w2s,
+                                            topk_weights,
+                                            topk_ids,
+                                            inplace=True)
         # print(f"Exit the kernel, dtype: {self.ws.dtype}, {self.w2s.dtype}")
-        if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(
-                final_hidden_states)
+        if self.reduce_results and self.tp_size > 1:
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(batch_size, sequence_length,
                                         hidden_size)
 
@@ -375,16 +384,19 @@ class YakDecoderLayer(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
+        is_moe_layer = (layer_idx+1) % config.moe_layer_frequency == 0
+        self.use_residual = config.use_residual and is_moe_layer
         self.self_attn = YakAttention(config, layer_idx, linear_method=linear_method)
-        self.block_sparse_moe = YakMoE(config, layer_id=layer_idx, linear_method=linear_method)
+        self.block_sparse_moe = YakMoE(config, layer_id=layer_idx, linear_method=linear_method,
+                                       reduce_results=(not self.use_residual))
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        self.use_residual = config.use_residual and self.block_sparse_moe.is_moe_layer
         if self.use_residual:
             self.residual_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.residual_mlp = YakMLP(config, layer_id=layer_idx, is_residual_mlp=True)
+            self.residual_mlp = YakMLP(config, layer_id=layer_idx, is_residual_mlp=True,
+                                       reduce_results=False)
 
     def forward(
         self,
@@ -395,7 +407,6 @@ class YakDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         residual_input = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        # self attention
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -406,14 +417,14 @@ class YakDecoderLayer(nn.Module):
 
         residual_attn = hidden_states
         if self.use_residual:
-            # residual mlp part
             hidden_states = self.residual_layernorm(hidden_states)
             hidden_states = self.residual_mlp(hidden_states)
-            residual_residual = residual_attn + hidden_states
-            # residual mlp moe part
+            residual_mlp = hidden_states
             hidden_states = self.post_attention_layernorm(residual_input)
             hidden_states = self.block_sparse_moe(hidden_states)
-            hidden_states = residual_residual + hidden_states
+            hidden_states = residual_mlp + hidden_states
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+            hidden_states = residual_attn + hidden_states
         else:
             hidden_states = self.post_attention_layernorm(hidden_states)
             hidden_states = self.block_sparse_moe(hidden_states)
@@ -497,8 +508,7 @@ class YakForCausalLM(nn.Module):
                 kv_caches: List[KVCache],
                 attn_metadata: AttentionMetadata,
             ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, kv_caches,
-                                   attn_metadata)
+        hidden_states = self.model(input_ids, positions, kv_caches, input_metadata)
         return hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor,
@@ -664,5 +674,4 @@ class YakForCausalLM(nn.Module):
                 # do quantization after loading and moe to GPU
                 assert param.device.type != "cuda"
                 param.data = param.cuda()
-                #torch.cuda.empty_cache()
                 print(f"Quantize weight {name} with dtype {param.data.dtype} and shape {param.data.shape}.")
