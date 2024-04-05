@@ -5,4 +5,4 @@ USE_FUSE=True python3 benchmark_batch.py \
     --max_new_tokens 256 \
     -tp 8 \
     --framework vllm \
-    --model /checkpoint/dbrx-instruct
+    --model /checkpoint/yak2b-25B-500B-phase2-instruct-v4-hf1
