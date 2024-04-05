@@ -387,7 +387,8 @@ class YakDecoderLayer(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
-        self.use_residual = config.use_residual and self.block_sparse_moe.is_moe_layer
+        is_moe_layer = (layer_idx+1) % config.moe_layer_frequency == 0
+        self.use_residual = config.use_residual and is_moe_layer
         self.self_attn = YakAttention(config, layer_idx, linear_method=linear_method)
         self.block_sparse_moe = YakMoE(config, layer_id=layer_idx, linear_method=linear_method,
                                        reduce_results=(not self.use_residual))
