@@ -508,7 +508,7 @@ class YakForCausalLM(nn.Module):
                 kv_caches: List[KVCache],
                 attn_metadata: AttentionMetadata,
             ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, kv_caches, input_metadata)
+        hidden_states = self.model(input_ids, positions, kv_caches, attn_metadata)
         return hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor,
