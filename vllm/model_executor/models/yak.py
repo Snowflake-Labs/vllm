@@ -1,23 +1,23 @@
 """Inference-only Yak model."""
 from typing import List, Optional, Tuple
+import os
 
 import torch
 from torch import nn
-import os
 import torch.nn.functional as F
-# TODO(Hao): this assume it will depend on the transformer version which includes Yak
+
 from transformers import YakConfig
 from transformers.activations import ACT2FN
 
 import ray
 
-from vllm.model_executor.input_metadata import InputMetadata
+from vllm.attention import Attention, AttentionMetadata
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.attention import Attention
+# from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.parallel_utils.communication_op import (
     tensor_model_parallel_all_reduce)
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.fused_moe import fused_topk, fused_experts
+from vllm.model_executor.layers.fused_moe import fused_topk, fused_experts, fused_moe
 from vllm.model_executor.parallel_utils.parallel_state import (
     get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
 from vllm.model_executor.layers.linear import (LinearMethodBase,
@@ -35,19 +35,16 @@ from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.weight_utils import (default_weight_loader,
                                               hf_model_weights_iterator)
 from vllm.model_executor.layers.quantization.yq import YakQuantizedParameter, YQLinearMethod
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
 use_fused_moe = os.environ.get('USE_FUSE', False)
 use_fused_moe = bool(use_fused_moe)
+use_dummy = os.environ.get("USE_DUMMY", False)
+use_dummy = bool(use_dummy)
 print(f"=== FUSE: {use_fused_moe}===")
-
-m = 0
-
-def pr(x):
-    if m == 13:
-        print(x)
-        exit(0)
+print(f"=== DUMMY: {use_dummy}===")
 
 
 class YakMLP(nn.Module):
@@ -223,40 +220,47 @@ class YakMoE(nn.Module):
         # router_logits: (batch * sequence_length, n_experts)
         router_logits, _ = self.gate(hidden_states)
         do_normalize = True if self.top_k > 1 else False
-        topk_weights, topk_ids = fused_topk(hidden_states,
-                                            router_logits,
-                                            self.top_k,
-                                            renormalize=do_normalize)
-        # topk_ids: (batch * sequence_length, k)
-        ### <HACK> ###
-        if self.is_quant:
-            ws = self.ws.view((self.num_experts, -1, self.ws.shape[-1]))
-            w2s = self.w2s.view((self.num_experts, -1, self.w2s.shape[-1]))
-            ws_dequantized = torch.empty(self.num_experts,
-                                         2 * self.intermediate_size,
-                                         self.hidden_size,
-                                         dtype=self.ws.quantizer.orig_dtype,
-                                         device=self.ws.device)
-            w2s_dequantized = torch.empty(self.num_experts,
-                                          self.hidden_size,
-                                          self.intermediate_size,
-                                          dtype=self.w2s.quantizer.orig_dtype,
-                                          device=self.w2s.device)
-            activated = topk_ids.unique().tolist()
-            # Force quantizer to dequantize into the shape of a single expert.
-            self.ws.quantizer.orig_shape = ws_dequantized.shape[1:]
-            self.w2s.quantizer.orig_shape = w2s_dequantized.shape[1:]
-            for i in activated:
-                # Dequantize each activated expert separately.
-                self.ws.quantizer.dequantize(ws[i], fp_out=ws_dequantized[i])
-                self.w2s.quantizer.dequantize(w2s[i], fp_out=w2s_dequantized[i])
-        ### </HACK> ###
-        final_hidden_states = fused_experts(hidden_states,
-                                            ws_dequantized if self.is_quant else self.ws,
-                                            w2s_dequantized if self.is_quant else self.w2s,
-                                            topk_weights,
-                                            topk_ids,
-                                            inplace=True)
+        final_hidden_states = fused_moe(hidden_states,
+                                self.ws.dequantized() if self.is_quant else self.ws,
+                                self.w2s.dequantized() if self.is_quant else self.w2s,
+                                router_logits,
+                                self.top_k,
+                                renormalize=do_normalize,
+                                inplace=True)
+        # topk_weights, topk_ids = fused_topk(hidden_states,
+        #                                     router_logits,
+        #                                     self.top_k,
+        #                                     renormalize=do_normalize)
+        # # topk_ids: (batch * sequence_length, k)
+        # ### <HACK> ###
+        # if self.is_quant:
+        #     ws = self.ws.view((self.num_experts, -1, self.ws.shape[-1]))
+        #     w2s = self.w2s.view((self.num_experts, -1, self.w2s.shape[-1]))
+        #     ws_dequantized = torch.empty(self.num_experts,
+        #                                  2 * self.intermediate_size,
+        #                                  self.hidden_size,
+        #                                  dtype=self.ws.quantizer.orig_dtype,
+        #                                  device=self.ws.device)
+        #     w2s_dequantized = torch.empty(self.num_experts,
+        #                                   self.hidden_size,
+        #                                   self.intermediate_size,
+        #                                   dtype=self.w2s.quantizer.orig_dtype,
+        #                                   device=self.w2s.device)
+        #     activated = topk_ids.unique().tolist()
+        #     # Force quantizer to dequantize into the shape of a single expert.
+        #     self.ws.quantizer.orig_shape = ws_dequantized.shape[1:]
+        #     self.w2s.quantizer.orig_shape = w2s_dequantized.shape[1:]
+        #     for i in activated:
+        #         # Dequantize each activated expert separately.
+        #         self.ws.quantizer.dequantize(ws[i], fp_out=ws_dequantized[i])
+        #         self.w2s.quantizer.dequantize(w2s[i], fp_out=w2s_dequantized[i])
+        # ### </HACK> ###
+        # final_hidden_states = fused_experts(hidden_states,
+        #                                     ws_dequantized if self.is_quant else self.ws,
+        #                                     w2s_dequantized if self.is_quant else self.w2s,
+        #                                     topk_weights,
+        #                                     topk_ids,
+        #                                     inplace=True)
         # print(f"Exit the kernel, dtype: {self.ws.dtype}, {self.w2s.dtype}")
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(
@@ -351,13 +355,13 @@ class YakAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         kv_cache: KVCache,
-        input_metadata: InputMetadata,
+        attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         k_cache, v_cache = kv_cache
-        attn_output = self.attn(q, k, v, k_cache, v_cache, input_metadata)
+        attn_output = self.attn(q, k, v, k_cache, v_cache, attn_metadata)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -387,7 +391,7 @@ class YakDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         kv_cache: KVCache,
-        input_metadata: InputMetadata,
+        attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         residual_input = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -396,7 +400,7 @@ class YakDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             kv_cache=kv_cache,
-            input_metadata=input_metadata
+            attn_metadata=attn_metadata,
         )
         hidden_states = residual_input + hidden_states
 
@@ -447,7 +451,7 @@ class YakModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         kv_caches: List[KVCache],
-        input_metadata: InputMetadata,
+        attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
@@ -455,7 +459,7 @@ class YakModel(nn.Module):
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states = layer(positions, hidden_states,
-                                  kv_caches[i], input_metadata)
+                                  kv_caches[i], attn_metadata)
             m = m + 1
         hidden_states = self.norm(hidden_states)
         return hidden_states
@@ -483,24 +487,32 @@ class YakForCausalLM(nn.Module):
         self.unpadded_vocab_size = config.vocab_size
         # # Initialize weights and apply final processing
         # self.post_init()
-        self.sampler = Sampler(self.unpadded_vocab_size, config.vocab_size)
+        self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
+                                                config.vocab_size)
+        self.sampler = Sampler()
 
     def forward(self,
                 input_ids: torch.Tensor,
                 positions: torch.Tensor,
                 kv_caches: List[KVCache],
-                input_metadata: InputMetadata,
+                attn_metadata: AttentionMetadata,
             ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, kv_caches,
-                                   input_metadata)
+                                   attn_metadata)
         return hidden_states
+
+    def compute_logits(self, hidden_states: torch.Tensor,
+                       sampling_metadata: SamplingMetadata) -> torch.Tensor:
+        logits = self.logits_processor(self.lm_head.weight, hidden_states,
+                                       sampling_metadata)
+        return logits
 
     def sample(
         self,
-        hidden_states: Optional[torch.Tensor],
-        sampling_metadata: SamplingMetadata
+        logits: Optional[torch.Tensor],
+        sampling_metadata: SamplingMetadata,
     ) -> Optional[SamplerOutput]:
-        next_tokens = self.sampler(self.lm_head.weight, hidden_states, sampling_metadata)
+        next_tokens = self.sampler(logits, sampling_metadata)
         return next_tokens
 
     def load_weights(self,
@@ -549,48 +561,88 @@ class YakForCausalLM(nn.Module):
             ]
 
         params_dict = dict(self.named_parameters())
-        loaded_iterators = hf_model_weights_iterator(
-            model_name_or_path,
-            cache_dir,
-            load_format,
-            revision,
-            fall_back_to_pt=False)
-        
-        def fused_load():
-            for name, loaded_weight in loaded_iterators:
-                original_name = name
-                for (param_name, weight_name, shard_id) in stacked_params_mapping:
-                    if weight_name not in name:
-                        continue
 
-                    name = name.replace(weight_name, param_name)
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(param, loaded_weight, shard_id)
-                    print(f"Loaded weight {original_name} with shape {loaded_weight.shape} into module {name} ({param.shape}) as shard {shard_id}")
-                    break
-                else:
-                    for param_name, weight_name, shard_id in mlp_params_mapping:
+        def dummy_load():
+            for param, value in params_dict.items():
+                value.data = torch.rand(value.shape, dtype=value.dtype).cpu()
+
+        if use_dummy:
+            dummy_load()
+        else:
+            loaded_iterators = hf_model_weights_iterator(
+                model_name_or_path,
+                cache_dir,
+                load_format,
+                revision,
+                fall_back_to_pt=False)
+            
+            def fused_load():
+                for name, loaded_weight in loaded_iterators:
+                    original_name = name
+                    for (param_name, weight_name, shard_id) in stacked_params_mapping:
                         if weight_name not in name:
                             continue
+
                         name = name.replace(weight_name, param_name)
+                        # Skip loading extra bias for GPTQ models.
+                        if name.endswith(".bias") and name not in params_dict:
+                            continue
                         param = params_dict[name]
                         weight_loader = param.weight_loader
                         weight_loader(param, loaded_weight, shard_id)
-                        print(f"Loaded weight {original_name} ({loaded_weight.shape}) into module {name} ({param.shape}) as shard {shard_id}")
+                        print(f"Loaded weight {original_name} with shape {loaded_weight.shape} into module {name} ({param.shape}) as shard {shard_id}")
                         break
-                    else:        
-                        for param_name, weight_name, shard_id in expert_params_mapping:
+                    else:
+                        for param_name, weight_name, shard_id in mlp_params_mapping:
                             if weight_name not in name:
                                 continue
                             name = name.replace(weight_name, param_name)
                             param = params_dict[name]
                             weight_loader = param.weight_loader
-                            weight_loader(param, loaded_weight, weight_name, expert_id=shard_id)
+                            weight_loader(param, loaded_weight, shard_id)
                             print(f"Loaded weight {original_name} ({loaded_weight.shape}) into module {name} ({param.shape}) as shard {shard_id}")
+                            break
+                        else:        
+                            for param_name, weight_name, shard_id in expert_params_mapping:
+                                if weight_name not in name:
+                                    continue
+                                name = name.replace(weight_name, param_name)
+                                param = params_dict[name]
+                                weight_loader = param.weight_loader
+                                weight_loader(param, loaded_weight, weight_name, expert_id=shard_id)
+                                print(f"Loaded weight {original_name} ({loaded_weight.shape}) into module {name} ({param.shape}) as shard {shard_id}")
+                                break
+                            else:
+                                if name.endswith(".bias") and name not in params_dict:
+                                    continue
+                                param = params_dict[name]
+                                weight_loader = getattr(param, "weight_loader",
+                                                        default_weight_loader)
+                                weight_loader(param, loaded_weight)
+                                print(f"Loaded weight {original_name} ({loaded_weight.shape}) into module {name} ({param.shape}) as shard 0")
+
+            def unfused_load():
+                for name, loaded_weight in loaded_iterators:
+                    print(f"Load weight {name} with shape {loaded_weight.shape}.")
+                    for (param_name, weight_name, shard_id) in stacked_params_mapping:
+                        if weight_name not in name:
+                            continue
+                        name = name.replace(weight_name, param_name)
+                        # Skip loading extra bias for GPTQ models.
+                        if name.endswith(".bias") and name not in params_dict:
+                            continue
+                        param = params_dict[name]
+                        weight_loader = param.weight_loader
+                        weight_loader(param, loaded_weight, shard_id)
+                        break
+                    else:
+                        for param_name, weight_name, shard_id in mlp_params_mapping:
+                            if weight_name not in name:
+                                continue
+                            name = name.replace(weight_name, param_name)
+                            param = params_dict[name]
+                            weight_loader = param.weight_loader
+                            weight_loader(param, loaded_weight, shard_id)
                             break
                         else:
                             if name.endswith(".bias") and name not in params_dict:
@@ -599,43 +651,11 @@ class YakForCausalLM(nn.Module):
                             weight_loader = getattr(param, "weight_loader",
                                                     default_weight_loader)
                             weight_loader(param, loaded_weight)
-                            print(f"Loaded weight {original_name} ({loaded_weight.shape}) into module {name} ({param.shape}) as shard 0")
 
-        def unfused_load():
-            for name, loaded_weight in loaded_iterators:
-                print(f"Load weight {name} with shape {loaded_weight.shape}.")
-                for (param_name, weight_name, shard_id) in stacked_params_mapping:
-                    if weight_name not in name:
-                        continue
-                    name = name.replace(weight_name, param_name)
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(param, loaded_weight, shard_id)
-                    break
-                else:
-                    for param_name, weight_name, shard_id in mlp_params_mapping:
-                        if weight_name not in name:
-                            continue
-                        name = name.replace(weight_name, param_name)
-                        param = params_dict[name]
-                        weight_loader = param.weight_loader
-                        weight_loader(param, loaded_weight, shard_id)
-                        break
-                    else:
-                        if name.endswith(".bias") and name not in params_dict:
-                            continue
-                        param = params_dict[name]
-                        weight_loader = getattr(param, "weight_loader",
-                                                default_weight_loader)
-                        weight_loader(param, loaded_weight)
-
-        if use_fused_moe:
-            fused_load()
-        else:
-            unfused_load()
+            if use_fused_moe:
+                fused_load()
+            else:
+                unfused_load()
 
         # For yak, we run a post quantization, because the weights are saved in 16 bits.
         # Iterate in order of largest to smallest params to reduce fragmentation issues.
