@@ -21,7 +21,7 @@ yak_model_path = "/shared/finetuning/outputs/checkpoint/hf_ckpts/hao_ckpt/700M_t
 # llm = LLM(model="mistralai/Mixtral-8x7B-v0.1", enforce_eager=True, tensor_parallel_size=2)
 # llm = LLM(model=yak_model_path, enforce_eager=True, tensor_parallel_size=8)
 llm = LLM(model=yak_model_path, 
-          enforce_eager=True,
+          #enforce_eager=True,
           quantization="yq",
           tensor_parallel_size=8)
 # Generate texts from the prompts. The output is a list of RequestOutput objects

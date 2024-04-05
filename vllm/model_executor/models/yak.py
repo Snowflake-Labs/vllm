@@ -80,6 +80,7 @@ class YakMLP(nn.Module):
         hidden_states, _ = self.w2(hidden_states)
         return hidden_states
 
+activated = torch.tensor([0, 1], dtype=torch.long, device="cuda")
 
 class YakMoE(nn.Module):
     """Model-parallel implementation of Yak MoE Layer.
@@ -217,6 +218,17 @@ class YakMoE(nn.Module):
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_size)
         return final_hidden_states
 
+    def _selective_dequantize(self, param, topk_ids):
+        # select the experts in topk_ids
+        tensor = param.view((self.num_experts, -1, param.shape[-1]))
+        tensor = tensor.index_select(0, topk_ids.flatten())
+        # dequantize the selected experts
+        orig_shape = param.quantizer.orig_shape
+        param.quantizer.orig_shape = (tensor.shape[0], *orig_shape[1:])
+        dequantized = param.quantizer.dequantize(tensor)
+        param.quantizer.orig_shape = orig_shape
+        return dequantized
+
     def local_moe_fused(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
@@ -228,29 +240,19 @@ class YakMoE(nn.Module):
                                             self.top_k,
                                             renormalize=do_normalize)
         # topk_ids: (batch * sequence_length, k)
-        ### <HACK> ###
         if self.is_quant:
-            ws = self.ws.view((self.num_experts, -1, self.ws.shape[-1]))
-            w2s = self.w2s.view((self.num_experts, -1, self.w2s.shape[-1]))
-            ws_dequantized = torch.empty(self.num_experts,
-                                         2 * self.intermediate_size,
-                                         self.hidden_size,
-                                         dtype=self.ws.quantizer.orig_dtype,
-                                         device=self.ws.device)
-            w2s_dequantized = torch.empty(self.num_experts,
-                                          self.hidden_size,
-                                          self.intermediate_size,
-                                          dtype=self.w2s.quantizer.orig_dtype,
-                                          device=self.w2s.device)
-            activated = topk_ids.unique().tolist()
-            # Force quantizer to dequantize into the shape of a single expert.
-            self.ws.quantizer.orig_shape = ws_dequantized.shape[1:]
-            self.w2s.quantizer.orig_shape = w2s_dequantized.shape[1:]
-            for i in activated:
-                # Dequantize each activated expert separately.
-                self.ws.quantizer.dequantize(ws[i], fp_out=ws_dequantized[i])
-                self.w2s.quantizer.dequantize(w2s[i], fp_out=w2s_dequantized[i])
-        ### </HACK> ###
+            if 2 * batch_size * self.top_k <= self.num_experts:
+                # If much fewer tokens than experts, use selective dequantize.
+                ws_dequantized = self._selective_dequantize(self.ws, topk_ids)
+                w2s_dequantized = self._selective_dequantize(self.w2s, topk_ids)
+                # We gathered the experts to the tokens so update the mapping.
+                topk_ids = torch.arange(
+                    0, topk_ids.numel(),
+                    device=topk_ids.device,
+                ).reshape(topk_ids.shape)
+            else:
+                ws_dequantized = self.ws.dequantized()
+                w2s_dequantized = self.w2s.dequantized()
         final_hidden_states = fused_experts(hidden_states,
                                             ws_dequantized if self.is_quant else self.ws,
                                             w2s_dequantized if self.is_quant else self.w2s,
@@ -392,24 +394,29 @@ class YakDecoderLayer(nn.Module):
         residual_input = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # self attention
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            kv_cache=kv_cache,
-            input_metadata=input_metadata
-        )
+        #with record_function("ATTN"):
+        if True:
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                kv_cache=kv_cache,
+                input_metadata=input_metadata
+            )
         hidden_states = residual_input + hidden_states
 
         residual_attn = hidden_states
         if self.use_residual:
             # residual mlp part
-            hidden_states = self.residual_layernorm(hidden_states)
-            hidden_states = self.residual_mlp(hidden_states)
-            residual_residual = residual_attn + hidden_states
+            #with record_function("MLP"):
+            if True:
+                hidden_states = self.residual_layernorm(hidden_states)
+                hidden_states = self.residual_mlp(hidden_states)
+                residual_residual = residual_attn + hidden_states
             # residual mlp moe part
-            hidden_states = self.post_attention_layernorm(residual_input)
-            hidden_states = self.block_sparse_moe(hidden_states)
-            hidden_states = residual_residual + hidden_states
+            #with record_function("MOE"):
+                hidden_states = self.post_attention_layernorm(residual_input)
+                hidden_states = self.block_sparse_moe(hidden_states)
+                hidden_states = residual_residual + hidden_states
         else:
             hidden_states = self.post_attention_layernorm(hidden_states)
             hidden_states = self.block_sparse_moe(hidden_states)
@@ -460,6 +467,9 @@ class YakModel(nn.Module):
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
+from torch.profiler import profile, record_function, ProfilerActivity
+
+IDX = 0
 
 class YakForCausalLM(nn.Module):
     def __init__(
@@ -491,8 +501,18 @@ class YakForCausalLM(nn.Module):
                 kv_caches: List[KVCache],
                 input_metadata: InputMetadata,
             ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, kv_caches,
-                                   input_metadata)
+        #global IDX
+        #with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+        #with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        #with profile(activities=[ProfilerActivity.CPU]) as prof:
+        if True:
+            hidden_states = self.model(input_ids, positions, kv_caches, input_metadata)
+        #output = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=10)
+        #print(output)
+        #output = prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=10)
+        #print(output)
+        #prof.export_chrome_trace(f"traces/trace_{IDX}.json")
+        #IDX += 1
         return hidden_states
 
     def sample(
