@@ -224,7 +224,7 @@ class YakMoE(nn.Module):
         # dequantize the selected experts
         orig_shape = param.quantizer.orig_shape
         param.quantizer.orig_shape = (tensor.shape[0], *orig_shape[1:])
-        dequantized = param.quantizer.dequantize(tensor)
+        dequantized = param.quantizer.dequantize(tensor, q_bits=6)
         param.quantizer.orig_shape = orig_shape
         return dequantized
 
