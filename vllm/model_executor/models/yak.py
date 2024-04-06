@@ -1,6 +1,7 @@
 """Inference-only Yak model."""
 from typing import List, Optional, Tuple
 import os
+import time
 
 import torch
 from torch import nn
@@ -566,12 +567,9 @@ class YakForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
 
-        def dummy_load():
-            for param, value in params_dict.items():
-                value.data = torch.rand(value.shape, dtype=value.dtype).cpu()
-
+        tic = time.time()
         if use_dummy:
-            dummy_load()
+            print("Using dummy weights. Skip loading weights.")
         else:
             loaded_iterators = hf_model_weights_iterator(
                 model_name_or_path,
@@ -580,6 +578,11 @@ class YakForCausalLM(nn.Module):
                 revision,
                 fall_back_to_pt=False)
             
+            def log_weight_loading(original_name, loaded_weight, param, shard_id, time_elapsed):
+                tensor_in_gb = loaded_weight.element_size() * loaded_weight.numel() / 1e9
+                speed = tensor_in_gb / time_elapsed
+                print(f"Load {original_name} ({loaded_weight.shape}, {tensor_in_gb} G), time: {time_elapsed}, gps: {speed}") 
+
             def fused_load():
                 for name, loaded_weight in loaded_iterators:
                     original_name = name
@@ -592,9 +595,9 @@ class YakForCausalLM(nn.Module):
                             continue
                         param = params_dict[name]
                         weight_loader = param.weight_loader
+                        tik = time.time()
                         weight_loader(param, loaded_weight, shard_id)
-                        print(f"Loaded weight {original_name} with shape {loaded_weight.shape} "
-                              f"into module {name} ({param.shape}) as shard {shard_id}")
+                        log_weight_loading(original_name, loaded_weight, param, shard_id, time.time() - tik)
                         break
                     else:
                         for param_name, weight_name, shard_id in mlp_params_mapping:
@@ -603,9 +606,9 @@ class YakForCausalLM(nn.Module):
                             name = name.replace(weight_name, param_name)
                             param = params_dict[name]
                             weight_loader = param.weight_loader
+                            tik = time.time()
                             weight_loader(param, loaded_weight, shard_id)
-                            print(f"Loaded weight {original_name} ({loaded_weight.shape}) "
-                                  f"into module {name} ({param.shape}) as shard {shard_id}")
+                            log_weight_loading(original_name, loaded_weight, param, shard_id, time.time() - tik)
                             break
                         else:        
                             for param_name, weight_name, shard_id in expert_params_mapping:
@@ -614,19 +617,19 @@ class YakForCausalLM(nn.Module):
                                 name = name.replace(weight_name, param_name)
                                 param = params_dict[name]
                                 weight_loader = param.weight_loader
+                                tik = time.time()
                                 weight_loader(param, loaded_weight, weight_name, expert_id=shard_id)
-                                print(f"Loaded weight {original_name} ({loaded_weight.shape}) "
-                                      f"into module {name} ({param.shape}) as shard {shard_id}")
+                                log_weight_loading(original_name, loaded_weight, param, shard_id, time.time() - tik)
                                 break
                             else:
                                 if name.endswith(".bias") and name not in params_dict:
                                     continue
                                 param = params_dict[name]
+
                                 weight_loader = getattr(param, "weight_loader",
                                                         default_weight_loader)
                                 weight_loader(param, loaded_weight)
-                                print(f"Loaded weight {original_name} ({loaded_weight.shape}) "
-                                      f"into module {name} ({param.shape}) as shard 0")
+                                log_weight_loading(original_name, loaded_weight, param, shard_id, time.time() - tik)
 
             def unfused_load():
                 for name, loaded_weight in loaded_iterators:
@@ -658,17 +661,21 @@ class YakForCausalLM(nn.Module):
                             weight_loader = getattr(param, "weight_loader",
                                                     default_weight_loader)
                             weight_loader(param, loaded_weight)
-
             if use_fused_moe:
                 fused_load()
             else:
                 unfused_load()
+        tok = time.time()
+        print(f"It takes {tok - tic} seconds to read the weights")
 
         # For yak, we run a post quantization, because the weights are saved in 16 bits.
         # Iterate in order of largest to smallest params to reduce fragmentation issues.
+        tic = time.time()
         for name, param in sorted(self.named_parameters(), key=lambda v: -v[1].numel()):
             if hasattr(param, "is_yak") and param.is_yak == True:
                 # do quantization after loading and moe to GPU
                 assert param.device.type != "cuda"
                 param.data = param.cuda()
                 print(f"Quantize weight {name} with dtype {param.data.dtype} and shape {param.data.shape}.")
+        tok = time.time()
+        print(f"It takes {tok - tic} seconds to quantize the weights")
