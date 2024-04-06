@@ -184,9 +184,9 @@ class YakMoE(nn.Module):
 
     # Copied from transformers.models.mixtral.modeling_mixtral.MixtralSparseMoeBlock.forward with Mixtral->Yak
     def local_moe(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        batch_size, sequence_length, hidden_size = hidden_states.shape
+        num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        # router_logits: (batch * sequence_length, n_experts)
+        # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
 
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
@@ -197,7 +197,7 @@ class YakMoE(nn.Module):
         # routing_weights = routing_weights.to(hidden_states.dtype)
 
         final_hidden_states = torch.zeros(
-            (batch_size * sequence_length, hidden_size), dtype=hidden_states.dtype, device=hidden_states.device
+            (num_tokens, hidden_size), dtype=hidden_states.dtype, device=hidden_states.device
         )
 
         # One hot encode the selected experts to create an expert mask
@@ -225,7 +225,7 @@ class YakMoE(nn.Module):
             # However `index_add_` only support torch tensors for indexing so we'll use
             # the `top_x` tensor here.
             final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
-        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_size)
+        final_hidden_states = final_hidden_states.reshape(num_tokens, hidden_size)
         return final_hidden_states
 
     def _selective_dequantize(self, param, topk_ids):
@@ -240,18 +240,18 @@ class YakMoE(nn.Module):
         return dequantized
 
     def local_moe_fused(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        batch_size, sequence_length, hidden_size = hidden_states.shape
+        num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
-        # router_logits: (batch * sequence_length, n_experts)
+        # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         do_normalize = True if self.top_k > 1 else False
         topk_weights, topk_ids = fused_topk(hidden_states,
                                             router_logits,
                                             self.top_k,
                                             renormalize=do_normalize)
-        # topk_ids: (batch * sequence_length, k)
+        # topk_ids: (num_tokens, k)
         if self.is_quant:
-            if 2 * topk_ids.numel() <= self.num_experts:
+            if 2 * num_tokens <= self.num_experts:
                 # If much fewer tokens than experts, use selective dequantize.
                 ws_dequantized = self._selective_dequantize(self.ws, topk_ids)
                 w2s_dequantized = self._selective_dequantize(self.w2s, topk_ids)
@@ -272,8 +272,7 @@ class YakMoE(nn.Module):
         # print(f"Exit the kernel, dtype: {self.ws.dtype}, {self.w2s.dtype}")
         if self.reduce_results and self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-        return final_hidden_states.view(batch_size, sequence_length,
-                                        hidden_size)
+        return final_hidden_states.view(num_tokens, hidden_size)
 
 
     def forward(self, hidden_states: torch.Tensor):
@@ -463,12 +462,10 @@ class YakModel(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
-        global m
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states = layer(positions, hidden_states,
                                   kv_caches[i], attn_metadata)
-            m = m + 1
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
@@ -589,7 +586,6 @@ class YakForCausalLM(nn.Module):
                     for (param_name, weight_name, shard_id) in stacked_params_mapping:
                         if weight_name not in name:
                             continue
-
                         name = name.replace(weight_name, param_name)
                         # Skip loading extra bias for GPTQ models.
                         if name.endswith(".bias") and name not in params_dict:
@@ -597,7 +593,8 @@ class YakForCausalLM(nn.Module):
                         param = params_dict[name]
                         weight_loader = param.weight_loader
                         weight_loader(param, loaded_weight, shard_id)
-                        print(f"Loaded weight {original_name} with shape {loaded_weight.shape} into module {name} ({param.shape}) as shard {shard_id}")
+                        print(f"Loaded weight {original_name} with shape {loaded_weight.shape} "
+                              f"into module {name} ({param.shape}) as shard {shard_id}")
                         break
                     else:
                         for param_name, weight_name, shard_id in mlp_params_mapping:
@@ -607,7 +604,8 @@ class YakForCausalLM(nn.Module):
                             param = params_dict[name]
                             weight_loader = param.weight_loader
                             weight_loader(param, loaded_weight, shard_id)
-                            print(f"Loaded weight {original_name} ({loaded_weight.shape}) into module {name} ({param.shape}) as shard {shard_id}")
+                            print(f"Loaded weight {original_name} ({loaded_weight.shape}) "
+                                  f"into module {name} ({param.shape}) as shard {shard_id}")
                             break
                         else:        
                             for param_name, weight_name, shard_id in expert_params_mapping:
@@ -617,7 +615,8 @@ class YakForCausalLM(nn.Module):
                                 param = params_dict[name]
                                 weight_loader = param.weight_loader
                                 weight_loader(param, loaded_weight, weight_name, expert_id=shard_id)
-                                print(f"Loaded weight {original_name} ({loaded_weight.shape}) into module {name} ({param.shape}) as shard {shard_id}")
+                                print(f"Loaded weight {original_name} ({loaded_weight.shape}) "
+                                      f"into module {name} ({param.shape}) as shard {shard_id}")
                                 break
                             else:
                                 if name.endswith(".bias") and name not in params_dict:
@@ -626,7 +625,8 @@ class YakForCausalLM(nn.Module):
                                 weight_loader = getattr(param, "weight_loader",
                                                         default_weight_loader)
                                 weight_loader(param, loaded_weight)
-                                print(f"Loaded weight {original_name} ({loaded_weight.shape}) into module {name} ({param.shape}) as shard 0")
+                                print(f"Loaded weight {original_name} ({loaded_weight.shape}) "
+                                      f"into module {name} ({param.shape}) as shard 0")
 
             def unfused_load():
                 for name, loaded_weight in loaded_iterators:
