@@ -32,7 +32,7 @@ class YQConfig(QuantizationConfig):
 
         if self.weight_bits not in [6, 8]:
             raise ValueError(
-                "Currently, only i6-bit or 8-bit weight quantization are "
+                "Currently, only 6-bit or 8-bit weight quantization are "
                 f"supported for Yak quantizaiton, but got {self.weight_bits} bits."
             )
 
@@ -70,8 +70,7 @@ class YQConfig(QuantizationConfig):
     @staticmethod
     def get_config_filenames() -> List[str]:
         return [
-            "quant_config.json",  # E.g., casperhansen/vicuna-7b-v1.5-awq
-            # E.g., abhinavkulkarni/mosaicml-mpt-7b-instruct-w4-g128-awq
+            "quant_config.json", 
             "quantize_config.json",
         ]
 
@@ -84,6 +83,7 @@ class YQLinearMethod(LinearMethodBase):
     """
 
     def __init__(self, quant_config: YQConfig):
+        print(f"Inside YQLinearMethod init: {quant_config}")
         self.quant_config = quant_config
         self.weight = None
         self.q_weight = None
@@ -109,6 +109,7 @@ class YQLinearMethod(LinearMethodBase):
                 dtype=params_dtype
             ).cpu(),
             requires_grad=False,
+            quantization=self.quant_config,
         )
         # scales = Parameter(
         #     torch.empty(
@@ -305,6 +306,7 @@ class YakQuantizedParameter(nn.Parameter):
         if quantization is None:
             quantization = YQConfig()
         self = torch.Tensor._make_subclass(cls, data, requires_grad)
+        self.quant_config = quantization
         self.data = data
         from deepspeed.ops.fp_quantizer import FP_Quantize
         if quantizer is not None:
@@ -320,7 +322,7 @@ class YakQuantizedParameter(nn.Parameter):
         # If the tensor is on a cuda device and is not quantized, then quantize it in-place.
         if tensor.device.type == "cuda" and tensor.dtype != torch.int8:
             with torch.cuda.stream(torch.cuda.current_stream(tensor.device)):
-                tensor.data = self.quantizer.quantize(tensor.data, q_bits=6)
+                tensor.data = self.quantizer.quantize(tensor.data, q_bits=self.quant_config.weight_bits)
             assert tensor.dtype == torch.int8
 
     def dequantized(self) -> torch.Tensor:
@@ -329,7 +331,7 @@ class YakQuantizedParameter(nn.Parameter):
         """
         if self.data.device.type == "cuda" and self.data.dtype == torch.int8:
             with torch.cuda.stream(torch.cuda.current_stream(self.data.device)):
-                return self.quantizer.dequantize(self.data, q_bits=6)
+                return self.quantizer.dequantize(self.data, q_bits=self.quant_config.weight_bits)
         return self.data
 
     def __getstate__(self):

@@ -140,14 +140,16 @@ class YakMoE(nn.Module):
                                     2 * self.intermediate_size,
                                     self.hidden_size,
                                     dtype=self.params_dtype).cpu(),
-                        requires_grad=False
+                        requires_grad=False,
+                        quantization=linear_method.quant_config,
                     )
                     self.w2s = YakQuantizedParameter(
                         torch.empty(self.num_experts,
                                     self.hidden_size,
                                     self.intermediate_size,
                                     dtype=self.params_dtype).cpu(),
-                        requires_grad=False
+                        requires_grad=False,
+                        quantization=linear_method.quant_config,
                     )
                 else:
                     self.ws = nn.Parameter(
@@ -236,7 +238,8 @@ class YakMoE(nn.Module):
         # dequantize the selected experts
         orig_shape = param.quantizer.orig_shape
         param.quantizer.orig_shape = (tensor.shape[0], *orig_shape[1:])
-        dequantized = param.quantizer.dequantize(tensor, q_bits=6)
+        print(f"bit: {param.quant_config.weight_bits}")
+        dequantized = param.quantizer.dequantize(tensor, q_bits=param.quant_config.weight_bits)
         param.quantizer.orig_shape = orig_shape
         return dequantized
 
@@ -246,30 +249,38 @@ class YakMoE(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         do_normalize = True if self.top_k > 1 else False
-        topk_weights, topk_ids = fused_topk(hidden_states,
-                                            router_logits,
-                                            self.top_k,
-                                            renormalize=do_normalize)
-        # topk_ids: (num_tokens, k)
-        if self.is_quant:
-            if 2 * num_tokens <= self.num_experts:
-                # If much fewer tokens than experts, use selective dequantize.
-                ws_dequantized = self._selective_dequantize(self.ws, topk_ids)
-                w2s_dequantized = self._selective_dequantize(self.w2s, topk_ids)
-                # We gathered the experts to the tokens so update the mapping.
-                topk_ids = torch.arange(
-                    0, topk_ids.numel(),
-                    device=topk_ids.device,
-                ).reshape(topk_ids.shape)
-            else:
-                ws_dequantized = self.ws.dequantized()
-                w2s_dequantized = self.w2s.dequantized()
-        final_hidden_states = fused_experts(hidden_states,
-                                            ws_dequantized if self.is_quant else self.ws,
-                                            w2s_dequantized if self.is_quant else self.w2s,
-                                            topk_weights,
-                                            topk_ids,
-                                            inplace=True)
+        # topk_weights, topk_ids = fused_topk(hidden_states,
+        #                                     router_logits,
+        #                                     self.top_k,
+        #                                     renormalize=do_normalize)
+        # # topk_ids: (num_tokens, k)
+        # if self.is_quant:
+        #     if 2 * num_tokens <= self.num_experts:
+        #         # If much fewer tokens than experts, use selective dequantize.
+        #         ws_dequantized = self._selective_dequantize(self.ws, topk_ids)
+        #         w2s_dequantized = self._selective_dequantize(self.w2s, topk_ids)
+        #         # We gathered the experts to the tokens so update the mapping.
+        #         topk_ids = torch.arange(
+        #             0, topk_ids.numel(),
+        #             device=topk_ids.device,
+        #         ).reshape(topk_ids.shape)
+        #     else:
+        #         ws_dequantized = self.ws.dequantized()
+        #         w2s_dequantized = self.w2s.dequantized()
+        # final_hidden_states = fused_experts(hidden_states,
+        #                                     ws_dequantized if self.is_quant else self.ws,
+        #                                     w2s_dequantized if self.is_quant else self.w2s,
+        #                                     topk_weights,
+        #                                     topk_ids,
+        #                                     inplace=True)
+
+        final_hidden_states = fused_moe(hidden_states,
+                                self.ws.dequantized() if self.is_quant else self.ws,
+                                self.w2s.dequantized() if self.is_quant else self.w2s,
+                                router_logits,
+                                self.top_k,
+                                renormalize=do_normalize,
+                                inplace=True)
         # print(f"Exit the kernel, dtype: {self.ws.dtype}, {self.w2s.dtype}")
         if self.reduce_results and self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
@@ -676,6 +687,7 @@ class YakForCausalLM(nn.Module):
                 # do quantization after loading and moe to GPU
                 assert param.device.type != "cuda"
                 param.data = param.cuda()
+                torch.cuda.empty_cache()
                 print(f"Quantize weight {name} with dtype {param.data.dtype} and shape {param.data.shape}.")
         tok = time.time()
         print(f"It takes {tok - tic} seconds to quantize the weights")

@@ -53,6 +53,7 @@ def parse_args():
                         help="Tensor parallelism",
                         default='1')
     parser.add_argument('--model', type=str, required=True, help="path to the model")
+    parser.add_argument('--quantization', type=str, default="yq", help="quantization method")
 
     args, _ = parser.parse_known_args()
     return args
@@ -176,14 +177,14 @@ def benchmark_mii(model, tensor_parallel, num_queries, warmup, prompt_lengths, m
     return benchmarks
 
 
-def benchmark_vllm(model, tensor_parallel, num_queries, warmup, prompt_lengths, max_prompt_length, max_new_tokens):
+def benchmark_vllm(model, tensor_parallel, num_queries, warmup, prompt_lengths, max_prompt_length, max_new_tokens, quantization):
     from vllm import LLM, SamplingParams
     from vllm.model_executor.parallel_utils.parallel_state import \
         destroy_model_parallel
 
     # Create an LLM.
     start = time.time()
-    llm = LLM(model=model, tensor_parallel_size=tensor_parallel, trust_remote_code=True)
+    llm = LLM(model=model, tensor_parallel_size=tensor_parallel, trust_remote_code=True, quantization=quantization)
     print('took ' + "{:.2f}".format(time.time()-start) + " seconds to start llm engine")
 
     # Create a sampling params object.
@@ -269,7 +270,8 @@ if __name__ == "__main__":
                 warmup=args.warmup,
                 prompt_lengths=args.prompt_length,
                 max_prompt_length=args.max_prompt_length,
-                max_new_tokens=args.max_new_tokens)
+                max_new_tokens=args.max_new_tokens,
+                quantization=args.quantization)
 
     benchmarks = sorted(benchmarks)
 
