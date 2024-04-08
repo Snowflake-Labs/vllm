@@ -1,4 +1,4 @@
-USE_DUMMY=True USE_FUSE=True python3 benchmark_batch.py \
+USE_FUSE=True python3 benchmark_batch.py \
     --warmup 1 \
     -n 1,2,4,8 \
     -l 2048 \
