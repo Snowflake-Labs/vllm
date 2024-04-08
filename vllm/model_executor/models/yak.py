@@ -47,9 +47,6 @@ print(f"=== FUSE: {use_fused_moe}===")
 print(f"=== DUMMY: {use_dummy}===")
 
 
-global m
-m = 0
-
 def print_memory(label=None):
     GB = 1e9
     memory_allocated = torch.cuda.memory_allocated() / GB
@@ -509,9 +506,6 @@ class YakForCausalLM(nn.Module):
                 attn_metadata: AttentionMetadata,
             ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, kv_caches, attn_metadata)
-        global m
-        m += 1
-        print(f"========================{m}")
         return hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor,
