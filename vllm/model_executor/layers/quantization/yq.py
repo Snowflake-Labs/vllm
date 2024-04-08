@@ -134,7 +134,8 @@ class YQLinearMethod(LinearMethodBase):
                       bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         # print(f"Running Yak Linear Method for dtype {weights['weight'].dtype}")
         weight = weights["weight"]
-        return F.linear(x, weight.dequantized(), bias)
+        y = weight.dequantized()
+        return F.linear(x, y, bias)
 
     def dequantize(self, weight):
         assert weight.data.dtype == torch.int8 and weight.data.device.type == "cuda"
@@ -325,13 +326,23 @@ class YakQuantizedParameter(nn.Parameter):
                 tensor.data = self.quantizer.quantize(tensor.data, q_bits=self.quant_config.weight_bits)
             assert tensor.dtype == torch.int8
 
-    def dequantized(self) -> torch.Tensor:
+    def dequantized(self, fp_out=None) -> torch.Tensor:
         """
         Return a tensor containing the dequantized weights of this parameter.
         """
         if self.data.device.type == "cuda" and self.data.dtype == torch.int8:
             with torch.cuda.stream(torch.cuda.current_stream(self.data.device)):
-                return self.quantizer.dequantize(self.data, q_bits=self.quant_config.weight_bits)
+                return self.quantizer.dequantize(self.data, fp_out=fp_out, q_bits=self.quant_config.weight_bits)
+        return self.data
+
+    def selective_dequantized(self, indices, fp_out=None) -> torch.Tensor:
+        """Return a tensor where only the weights at `indices` are dequantized (to save bandwidth)."""
+        if self.data.device.type == "cuda" and self.data.dtype == torch.int8:
+            with torch.cuda.stream(torch.cuda.current_stream(self.data.device)):
+                return self.quantizer.selective_dequantize(self.data, 
+                                                           indices, 
+                                                           fp_out=fp_out, 
+                                                           q_bits=self.quant_config.weight_bits)
         return self.data
 
     def __getstate__(self):

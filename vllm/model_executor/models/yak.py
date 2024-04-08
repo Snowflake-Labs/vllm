@@ -8,10 +8,6 @@ from torch import nn
 import torch.nn.functional as F
 
 from transformers import YakConfig
-from transformers.activations import ACT2FN
-
-import ray
-
 from vllm.attention import Attention, AttentionMetadata
 from vllm.model_executor.layers.activation import SiluAndMul
 # from vllm.model_executor.layers.attention import Attention
@@ -37,6 +33,11 @@ from vllm.model_executor.weight_utils import (default_weight_loader,
                                               hf_model_weights_iterator)
 from vllm.model_executor.layers.quantization.yq import YakQuantizedParameter, YQLinearMethod
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.logger import init_logger
+
+
+logger = init_logger(__name__)
+
 
 use_fused_moe = os.environ.get('USE_FUSE', False)
 use_fused_moe = bool(use_fused_moe)
@@ -44,6 +45,18 @@ use_dummy = os.environ.get("USE_DUMMY", False)
 use_dummy = bool(use_dummy)
 print(f"=== FUSE: {use_fused_moe}===")
 print(f"=== DUMMY: {use_dummy}===")
+
+
+global m
+m = 0
+
+def print_memory(label=None):
+    GB = 1e9
+    memory_allocated = torch.cuda.memory_allocated() / GB
+    max_memory_allocated = torch.cuda.max_memory_allocated() / GB
+    memory_reserved = torch.cuda.memory_reserved() / GB
+    max_memory_reserved = torch.cuda.max_memory_reserved() / GB
+    print(f"At {label}: allocated {memory_allocated}, peak {max_memory_allocated}, reserved {memory_reserved}, max reserved {max_memory_reserved}")
 
 
 class YakMLP(nn.Module):
@@ -107,7 +120,6 @@ class YakMoE(nn.Module):
         self.is_moe_layer = (layer_id+1) % config.moe_layer_frequency == 0
         self.is_quant = isinstance(linear_method, YQLinearMethod)
         self.reduce_results = reduce_results
-
         # Some other parameters
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
@@ -238,7 +250,6 @@ class YakMoE(nn.Module):
         # dequantize the selected experts
         orig_shape = param.quantizer.orig_shape
         param.quantizer.orig_shape = (tensor.shape[0], *orig_shape[1:])
-        print(f"bit: {param.quant_config.weight_bits}")
         dequantized = param.quantizer.dequantize(tensor, q_bits=param.quant_config.weight_bits)
         param.quantizer.orig_shape = orig_shape
         return dequantized
@@ -249,38 +260,34 @@ class YakMoE(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         do_normalize = True if self.top_k > 1 else False
-        # topk_weights, topk_ids = fused_topk(hidden_states,
-        #                                     router_logits,
-        #                                     self.top_k,
-        #                                     renormalize=do_normalize)
-        # # topk_ids: (num_tokens, k)
-        # if self.is_quant:
-        #     if 2 * num_tokens <= self.num_experts:
-        #         # If much fewer tokens than experts, use selective dequantize.
-        #         ws_dequantized = self._selective_dequantize(self.ws, topk_ids)
-        #         w2s_dequantized = self._selective_dequantize(self.w2s, topk_ids)
-        #         # We gathered the experts to the tokens so update the mapping.
-        #         topk_ids = torch.arange(
-        #             0, topk_ids.numel(),
-        #             device=topk_ids.device,
-        #         ).reshape(topk_ids.shape)
-        #     else:
-        #         ws_dequantized = self.ws.dequantized()
-        #         w2s_dequantized = self.w2s.dequantized()
-        # final_hidden_states = fused_experts(hidden_states,
-        #                                     ws_dequantized if self.is_quant else self.ws,
-        #                                     w2s_dequantized if self.is_quant else self.w2s,
-        #                                     topk_weights,
-        #                                     topk_ids,
-        #                                     inplace=True)
+        topk_weights, topk_ids = fused_topk(hidden_states,
+                                            router_logits,
+                                            self.top_k,
+                                            renormalize=do_normalize)        
+        # topk_ids: (num_tokens, k)
+        if self.is_quant:
+            if 2 * num_tokens <= self.num_experts:
+                # If much fewer tokens than experts, use selective dequantize.
+                # ws_dequantized = self._selective_dequantize(self.ws, topk_ids)
+                # w2s_dequantized = self._selective_dequantize(self.w2s, topk_ids)
+                print("Entering the selective dequant path...")
+                ws_dequantized = self.ws.selective_dequantized(topk_ids)
+                w2s_dequantized = self.w2s.selective_dequantized(topk_ids)
+                # We gathered the experts to the tokens so update the mapping.
+                topk_ids = torch.arange(
+                    0, topk_ids.numel(),
+                    device=topk_ids.device,
+                ).reshape(topk_ids.shape)
+            else:                
+                ws_dequantized = self.ws.dequantized()
+                w2s_dequantized = self.w2s.dequantized()
 
-        final_hidden_states = fused_moe(hidden_states,
-                                self.ws.dequantized() if self.is_quant else self.ws,
-                                self.w2s.dequantized() if self.is_quant else self.w2s,
-                                router_logits,
-                                self.top_k,
-                                renormalize=do_normalize,
-                                inplace=True)
+        final_hidden_states = fused_experts(hidden_states,
+                                            ws_dequantized if self.is_quant else self.ws,
+                                            w2s_dequantized if self.is_quant else self.w2s,
+                                            topk_weights,
+                                            topk_ids,
+                                            inplace=True)
         # print(f"Exit the kernel, dtype: {self.ws.dtype}, {self.w2s.dtype}")
         if self.reduce_results and self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
@@ -326,17 +333,6 @@ class YakAttention(nn.Module):
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta        
         self.scaling = self.head_dim**-0.5
-
-        # self.q_proj = nn.Linear(self.hidden_size, self.num_heads // config.tp_size * self.head_dim, bias=False)
-        # self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads // config.tp_size * self.head_dim, bias=False)
-        # self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads // config.tp_size * self.head_dim, bias=False)
-        # self.o_proj = nn.Linear(self.num_heads // config.tp_size * self.head_dim, self.hidden_size, bias=False)
-
-        # self.rotary_emb = YakRotaryEmbedding(
-        #     self.head_dim,
-        #     max_position_embeddings=self.max_position_embeddings,
-        #     base=self.rope_theta,
-        # )
 
         self.qkv_proj = QKVParallelLinear(
             self.hidden_size,
@@ -395,7 +391,9 @@ class YakDecoderLayer(nn.Module):
         is_moe_layer = (layer_idx+1) % config.moe_layer_frequency == 0
         self.use_residual = config.use_residual and is_moe_layer
         self.self_attn = YakAttention(config, layer_idx, linear_method=linear_method)
-        self.block_sparse_moe = YakMoE(config, layer_id=layer_idx, linear_method=linear_method,
+        self.block_sparse_moe = YakMoE(config,
+                                       layer_id=layer_idx, 
+                                       linear_method=linear_method,
                                        reduce_results=(not self.use_residual))
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -448,21 +446,19 @@ class YakModel(nn.Module):
     ) -> None:
         super().__init__()
         self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
-
-        
-        # self.embed_tokens = nn.Embedding(self.vocab_size, config.hidden_size, self.padding_idx)
+        self.vocab_size = config.vocab_size        
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
             org_num_embeddings=self.vocab_size
         )
         self.layers = nn.ModuleList([
-            YakDecoderLayer(config, layer_idx, linear_method=linear_method)
+            YakDecoderLayer(config, 
+                            layer_idx,
+                            linear_method=linear_method)
             for layer_idx in range(config.num_hidden_layers)
         ])
         self._attn_implementation = config._attn_implementation
-        #TODO(Hao): vllm has its own impl or RMSNorm, should we consider?
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -473,7 +469,6 @@ class YakModel(nn.Module):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
-        residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states = layer(positions, hidden_states,
@@ -490,11 +485,12 @@ class YakForCausalLM(nn.Module):
         **kwargs
     ) -> None:
         super().__init__()
+        logger.warning(f"If you are using 8x80G A100/H100 GPUs to serve {type(self)} and encounter OOM, "
+                        "please set `--gpu_memory_utilization` to 0.88.")
         self.model = YakModel(config, linear_method)
         self.config = config
         self.linear_method = linear_method
         self.vocab_size = config.vocab_size
-        # self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.lm_head = ParallelLMHead(
             self.vocab_size,
             config.hidden_size,
@@ -502,8 +498,6 @@ class YakForCausalLM(nn.Module):
         self.num_experts = config.num_local_experts
         self.num_experts_per_tok = config.num_experts_per_tok
         self.unpadded_vocab_size = config.vocab_size
-        # # Initialize weights and apply final processing
-        # self.post_init()
         self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
                                                 config.vocab_size)
         self.sampler = Sampler()
@@ -515,6 +509,9 @@ class YakForCausalLM(nn.Module):
                 attn_metadata: AttentionMetadata,
             ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, kv_caches, attn_metadata)
+        global m
+        m += 1
+        print(f"========================{m}")
         return hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor,
@@ -677,17 +674,12 @@ class YakForCausalLM(nn.Module):
             else:
                 unfused_load()
         tok = time.time()
-        print(f"It takes {tok - tic} seconds to read the weights")
+        logger.info(f"It takes {tok - tic} seconds to read the weights")
 
         # For yak, we run a post quantization, because the weights are saved in 16 bits.
         # Iterate in order of largest to smallest params to reduce fragmentation issues.
-        tic = time.time()
         for name, param in sorted(self.named_parameters(), key=lambda v: -v[1].numel()):
             if hasattr(param, "is_yak") and param.is_yak == True:
                 # do quantization after loading and moe to GPU
                 assert param.device.type != "cuda"
                 param.data = param.cuda()
-                torch.cuda.empty_cache()
-                print(f"Quantize weight {name} with dtype {param.data.dtype} and shape {param.data.shape}.")
-        tok = time.time()
-        print(f"It takes {tok - tic} seconds to quantize the weights")
