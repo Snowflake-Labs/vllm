@@ -383,7 +383,6 @@ def fused_experts(
                                       dtype=hidden_states.dtype)
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids, config['BLOCK_SIZE_M'], E)
-    # print(f"Confirm the computation is performed under precision {w1.dtype}, {w2.dtype}")
     invoke_fused_moe_kernel(hidden_states, w1, intermediate_cache1,
                             topk_weights, topk_ids, sorted_token_ids,
                             expert_ids, num_tokens_post_padded, False,
