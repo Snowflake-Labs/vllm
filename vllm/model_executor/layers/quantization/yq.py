@@ -1,11 +1,9 @@
 from typing import Any, Dict, List, Optional
 
 import torch
-from torch.nn.parameter import Parameter
 import torch.nn.functional as F
 import torch.nn as nn 
 
-from vllm._C import ops
 from vllm.model_executor.layers.linear import (LinearMethodBase,
                                                set_weight_attrs)
 from vllm.model_executor.layers.quantization.base_config import (
@@ -42,6 +40,7 @@ class YQConfig(QuantizationConfig):
                 f"rounding={self.rounding}, "
                 f"mantissa_bits={self.mantissa_bits}, "
                 f"")
+
     @classmethod
     def get_name(cls) -> str:
         return "yq"
@@ -111,14 +110,6 @@ class YQLinearMethod(LinearMethodBase):
             requires_grad=False,
             quantization=self.quant_config,
         )
-        # scales = Parameter(
-        #     torch.empty(
-        #         num_groups,
-        #         4,
-        #         dtype=torch.int8
-        #     ),
-        #     requires_grad=False,
-        # )
         set_weight_attrs(
             weight, {
                 "input_dim": 1,
@@ -146,148 +137,6 @@ class YQLinearMethod(LinearMethodBase):
         # if weight.data.device.type == "cuda" and weight.data.dtype != torch.int8:
         with torch.cuda.stream(torch.cuda.current_stream(weight.data.device)):
             return self.quantizer.quantize(weight.data, return_meta_tensor=return_meta_tensor)
-
-# class YQLinearMethod(LinearMethodBase):
-#     """Linear method for Yak.
-
-#     Args:
-#         quant_config: the Yak quantization config.
-#     """
-
-#     def __init__(self, quant_config: YQConfig):
-#         self.quant_config = quant_config
-#         self.weight = None
-#         self.scales = None
-#         # create the quantizer
-#         from deepspeed.ops.fp_quantizer import FP_Quantize
-#         self.quantizer = FP_Quantize(
-#             q_bits=self.quant_config.weight_bits,
-#             rounding=self.quant_config.rounding,
-#             mantisa_bits=self.quant_config.mantissa_bits,
-#             group_size=self.quant_config.group_size,
-#         )
-
-#     def create_weights(self,
-#                        input_size_per_partition: int,
-#                        output_size_per_partition: int,
-#                        input_size: int,
-#                        output_size: int,
-#                        params_dtype: torch.dtype) -> Dict[str, Any]:
-#         group_size = self.quant_config.group_size
-#         orig_numel = input_size_per_partition * output_size_per_partition
-#         num_groups = orig_numel // group_size
-#         weight = Parameter(
-#             torch.empty(
-#                 output_size_per_partition,
-#                 input_size_per_partition,
-#                 dtype=torch.int8
-#             ),
-#             requires_grad=False,
-#         )
-#         scales = Parameter(
-#             torch.empty(
-#                 num_groups,
-#                 4,
-#                 dtype=torch.int8
-#             ),
-#             requires_grad=False,
-#         )
-#         set_weight_attrs(
-#             weight, {
-#                 "input_dim": 1,
-#                 "output_dim": 0,
-#                 "is_yak": True,
-#                 "scales": scales,
-#             })
-#         return {
-#             "weight": weight,
-#         }
-
-#     def apply_weights(self,
-#                       weights: Dict[str, Any],
-#                       x: torch.Tensor,
-#                       bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-#         print(f"Running Yak Linear Method for dtype {weights['weight'].dtype}")
-#         weight = weights["weight"]
-#         return F.linear(x, self.dequantize(weight), bias)
-
-#     def dequantize(self, weight):
-#         assert weight.data.dtype == torch.int8 and weight.data.device.type == "cuda"
-#         with torch.cuda.stream(torch.cuda.current_stream(weight.data.device)):
-#             return self.quantizer.dequantize(weight.data, self.scales)
-
-#     def quantize(self, weight, return_meta_tensor=True):
-#         # if weight.data.device.type == "cuda" and weight.data.dtype != torch.int8:
-#         with torch.cuda.stream(torch.cuda.current_stream(weight.data.device)):
-#             return self.quantizer.quantize(weight.data, return_meta_tensor=return_meta_tensor)
-
-
-    
-
-# class YQLinearMethod2(LinearMethodBase):
-#     """Linear method for Yak.
-
-#     Args:
-#         quant_config: the Yak quantization config.
-#     """
-
-#     def __init__(self, quant_config: YQConfig):
-#         self.quant_config = quant_config
-#         self.weight = None
-#         self.quantizer = None
-
-#     def create_weights(self,
-#                        input_size_per_partition: int,
-#                        output_size_per_partition: int,
-#                        input_size: int,
-#                        output_size: int,
-#                        params_dtype: torch.dtype) -> Dict[str, Any]:
-#         group_size = self.quant_config.group_size
-#         orig_numel = input_size_per_partition * output_size_per_partition
-#         num_groups = orig_numel // self.quant_config.group_size
-#         self.weight = torch.empty(
-#             output_size_per_partition,
-#             input_size_per_partition,
-#             dtype=torch.bfloat16,
-#         ).cpu()
-#         self.qweight = torch.empty(
-#             num_groups,
-#             group_size + 4,
-#             # output_size_per_partition,
-#             dtype=torch.int8)
-#         weight = YakQuantizedParameter(self.weight, self.qweight, quantization=self.quant_config)
-#         set_weight_attrs(
-#             weight, {
-#                 "output_dim": 0,
-#             })
-#         return {
-#             "weight": weight
-#         }
-
-#     def apply_weights(self,
-#                       weights: Dict[str, Any],
-#                       x: torch.Tensor,
-#                       bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-
-#         if self.quantizer is not None:
-#             from deepspeed.ops.fp_quantizer import FP_Quantize
-#             quantization = self.quant_config
-#             self.quantizer = FP_Quantize(
-#                 q_bits=quantization.weight_bits,
-#                 rounding=quantization.rounding,
-#                 mantisa_bits=quantization.mantissa_bits,
-#                 group_size=quantization.group_size,
-#             )
-#         weight = weights["weight"]
-#         print("111111")
-#         return F.linear(x, weight.dequantized(), bias)
-
-#     def _dequantize(self):
-#         if self.data.device.type == "cuda" and self.data.dtype == torch.int8:
-#             with torch.cuda.stream(torch.cuda.current_stream(self.data.device)):
-#                 return self.quantizer.dequantize(self.data)
-#         return self.data
-
 
 
 class YakQuantizedParameter(nn.Parameter):
