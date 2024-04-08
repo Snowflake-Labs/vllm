@@ -37,23 +37,7 @@ from vllm.logger import init_logger
 
 
 logger = init_logger(__name__)
-
-
-use_fused_moe = os.environ.get('USE_FUSE', False)
-use_fused_moe = bool(use_fused_moe)
-use_dummy = os.environ.get("USE_DUMMY", False)
-use_dummy = bool(use_dummy)
-print(f"=== FUSE: {use_fused_moe}===")
-print(f"=== DUMMY: {use_dummy}===")
-
-
-def print_memory(label=None):
-    GB = 1e9
-    memory_allocated = torch.cuda.memory_allocated() / GB
-    max_memory_allocated = torch.cuda.max_memory_allocated() / GB
-    memory_reserved = torch.cuda.memory_reserved() / GB
-    max_memory_reserved = torch.cuda.max_memory_reserved() / GB
-    print(f"At {label}: allocated {memory_allocated}, peak {max_memory_allocated}, reserved {memory_reserved}, max reserved {max_memory_reserved}")
+use_dummy = bool(os.environ.get("USE_DUMMY", False))
 
 
 class YakMLP(nn.Module):
@@ -67,8 +51,6 @@ class YakMLP(nn.Module):
         self.hidden_size = config.hidden_size
         self.expert_id = expert_id
         self.layer_id = layer_id
-
-        # TODO(Hao): make this tensor-parallel using RowParallelLinear
         self.ffn_dim = config.intermediate_size if not is_residual_mlp else self.hidden_size
 
         self.w13 = MergedColumnParallelLinear(
@@ -76,15 +58,14 @@ class YakMLP(nn.Module):
             bias=False,
             linear_method=linear_method)
         self.w2 = RowParallelLinear(self.ffn_dim,
-                                     self.hidden_size,
-                                     bias=False,
-                                     reduce_results=reduce_results,
-                                     linear_method=linear_method)
+                                    self.hidden_size,
+                                    bias=False,
+                                    reduce_results=reduce_results,
+                                    linear_method=linear_method)
         if config.hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {config.hidden_act}. "
                              "Only silu is supported for now.")
         self.act_fn = SiluAndMul()
-
 
     def forward(self, hidden_states):
         gate_up, _ = self.w13(hidden_states)
@@ -131,54 +112,43 @@ class YakMoE(nn.Module):
                                          bias=False,
                                          params_dtype=self.params_dtype,
                                          linear_method=linear_method)
-            if not use_fused_moe:
-                self.experts = nn.ModuleList([
-                    YakMLP(
-                        config,
-                        layer_id=layer_id,
-                        expert_id=i,
-                        linear_method=linear_method,
-                        reduce_results=reduce_results,
-                    ) for i in range(self.num_experts)
-                ])
+            # Create it on CPU and later quantize it to GPU.
+            if self.is_quant:
+                self.ws = YakQuantizedParameter(
+                    torch.empty(self.num_experts,
+                                2 * self.intermediate_size,
+                                self.hidden_size,
+                                dtype=self.params_dtype).cpu(),
+                    requires_grad=False,
+                    quantization=linear_method.quant_config,
+                )
+                self.w2s = YakQuantizedParameter(
+                    torch.empty(self.num_experts,
+                                self.hidden_size,
+                                self.intermediate_size,
+                                dtype=self.params_dtype).cpu(),
+                    requires_grad=False,
+                    quantization=linear_method.quant_config,
+                )
             else:
-                # Create it on CPU and later quantize it to GPU.
-                if self.is_quant:
-                    self.ws = YakQuantizedParameter(
-                        torch.empty(self.num_experts,
-                                    2 * self.intermediate_size,
-                                    self.hidden_size,
-                                    dtype=self.params_dtype).cpu(),
-                        requires_grad=False,
-                        quantization=linear_method.quant_config,
-                    )
-                    self.w2s = YakQuantizedParameter(
-                        torch.empty(self.num_experts,
-                                    self.hidden_size,
-                                    self.intermediate_size,
-                                    dtype=self.params_dtype).cpu(),
-                        requires_grad=False,
-                        quantization=linear_method.quant_config,
-                    )
-                else:
-                    self.ws = nn.Parameter(
-                        torch.empty(self.num_experts,
-                                    2 * self.intermediate_size,
-                                    self.hidden_size,
-                                    device="cuda",
-                                    dtype=self.params_dtype))
-                    self.w2s = nn.Parameter(
-                        torch.empty(self.num_experts,
-                                    self.hidden_size,
-                                    self.intermediate_size,
-                                    device="cuda",
-                                    dtype=self.params_dtype))
-                set_weight_attrs(self.ws, {
-                    "weight_loader": self.weight_loader,
-                })
-                set_weight_attrs(self.w2s, {
-                    "weight_loader": self.weight_loader,                
-                })
+                self.ws = nn.Parameter(
+                    torch.empty(self.num_experts,
+                                2 * self.intermediate_size,
+                                self.hidden_size,
+                                device="cuda",
+                                dtype=self.params_dtype))
+                self.w2s = nn.Parameter(
+                    torch.empty(self.num_experts,
+                                self.hidden_size,
+                                self.intermediate_size,
+                                device="cuda",
+                                dtype=self.params_dtype))
+            set_weight_attrs(self.ws, {
+                "weight_loader": self.weight_loader,
+            })
+            set_weight_attrs(self.w2s, {
+                "weight_loader": self.weight_loader,                
+            })
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor,
                       weight_name: str, expert_id: int):
@@ -194,63 +164,6 @@ class YakMoE(nn.Module):
         if weight_name.endswith("w2.weight"):
             param_data[expert_id, :, :] = loaded_weight[:, shard]
 
-    # Copied from transformers.models.mixtral.modeling_mixtral.MixtralSparseMoeBlock.forward with Mixtral->Yak
-    def local_moe(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        num_tokens, hidden_size = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_size)
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-        if self.top_k > 1:
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-        # we cast back to the input dtype
-        # routing_weights = routing_weights.to(hidden_states.dtype)
-
-        final_hidden_states = torch.zeros(
-            (num_tokens, hidden_size), dtype=hidden_states.dtype, device=hidden_states.device
-        )
-
-        # One hot encode the selected experts to create an expert mask
-        # this will be used to easily index which expert is going to be sollicitated
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
-
-        # Loop over all available experts in the model and perform the computation on each expert
-        for expert_idx in range(self.num_experts):
-            expert_layer = self.experts[expert_idx]
-            idx, top_x = torch.where(expert_mask[expert_idx])
-
-            if top_x.shape[0] == 0:
-                continue
-
-            # in torch it is faster to index using lists than torch tensors
-            top_x_list = top_x.tolist()
-            idx_list = idx.tolist()
-
-            # Index the correct hidden states and compute the expert hidden state for
-            # the current expert. We need to make sure to multiply the output hidden
-            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-            current_state = hidden_states[None, top_x_list].reshape(-1, hidden_size)
-            current_hidden_states = expert_layer(current_state) * routing_weights[top_x_list, idx_list, None]
-
-            # However `index_add_` only support torch tensors for indexing so we'll use
-            # the `top_x` tensor here.
-            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
-        final_hidden_states = final_hidden_states.reshape(num_tokens, hidden_size)
-        return final_hidden_states
-
-    def _selective_dequantize(self, param, topk_ids):
-        # select the experts in topk_ids
-        tensor = param.view((self.num_experts, -1, param.shape[-1]))
-        tensor = tensor.index_select(0, topk_ids.flatten())
-        # dequantize the selected experts
-        orig_shape = param.quantizer.orig_shape
-        param.quantizer.orig_shape = (tensor.shape[0], *orig_shape[1:])
-        dequantized = param.quantizer.dequantize(tensor, q_bits=param.quant_config.weight_bits)
-        param.quantizer.orig_shape = orig_shape
-        return dequantized
-
     def local_moe_fused(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
@@ -265,11 +178,12 @@ class YakMoE(nn.Module):
         if self.is_quant:
             if 2 * num_tokens <= self.num_experts:
                 # If much fewer tokens than experts, use selective dequantize.
-                # ws_dequantized = self._selective_dequantize(self.ws, topk_ids)
-                # w2s_dequantized = self._selective_dequantize(self.w2s, topk_ids)
-                print("Entering the selective dequant path...")
-                ws_dequantized = self.ws.selective_dequantized(topk_ids)
-                w2s_dequantized = self.w2s.selective_dequantized(topk_ids)
+                ws_dequantized = self._selective_dequantize(self.ws, topk_ids)
+                w2s_dequantized = self._selective_dequantize(self.w2s, topk_ids)
+
+                # Faster path but buggy.
+                # ws_dequantized = self.ws.selective_dequantized(topk_ids)
+                # w2s_dequantized = self.w2s.selective_dequantized(topk_ids)
                 # We gathered the experts to the tokens so update the mapping.
                 topk_ids = torch.arange(
                     0, topk_ids.numel(),
@@ -290,13 +204,9 @@ class YakMoE(nn.Module):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_size)
 
-
     def forward(self, hidden_states: torch.Tensor):
         if self.is_moe_layer:
-            if use_fused_moe:
-                final_hidden_states = self.local_moe_fused(hidden_states)
-            else:
-                final_hidden_states = self.local_moe(hidden_states)
+            final_hidden_states = self.local_moe(hidden_states)
         else:
             final_hidden_states = self.mlp(hidden_states)
         return final_hidden_states
@@ -374,6 +284,7 @@ class YakAttention(nn.Module):
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
         output, _ = self.o_proj(attn_output)
         return output
+
 
 class YakDecoderLayer(nn.Module):
     def __init__(
@@ -538,34 +449,28 @@ class YakForCausalLM(nn.Module):
         expert_params_mapping = []
         num_layers = self.config.num_hidden_layers
 
-        if use_fused_moe:
-            for i in range(num_layers):
+        for i in range(num_layers):
+            for weight_name in ["w1", "w3"]:
+                mapping = (f"layers.{i}.residual_mlp.w13.weight", 
+                            f"layers.{i}.residual_mlp.{weight_name}.weight",
+                            0 if weight_name == "w1" else 1)
+                mlp_params_mapping.append(mapping)
+            if i % 2 == 0:
+                # MLP layers
                 for weight_name in ["w1", "w3"]:
-                    mapping = (f"layers.{i}.residual_mlp.w13.weight", 
-                               f"layers.{i}.residual_mlp.{weight_name}.weight",
-                               0 if weight_name == "w1" else 1)
+                    mapping = (f"layers.{i}.block_sparse_moe.mlp.w13.weight", 
+                                f"layers.{i}.block_sparse_moe.mlp.{weight_name}.weight",
+                                0 if weight_name == "w1" else 1)
                     mlp_params_mapping.append(mapping)
-                if i % 2 == 0:
-                    # MLP layers
-                    for weight_name in ["w1", "w3"]:
-                        mapping = (f"layers.{i}.block_sparse_moe.mlp.w13.weight", 
-                                    f"layers.{i}.block_sparse_moe.mlp.{weight_name}.weight",
-                                    0 if weight_name == "w1" else 1)
-                        mlp_params_mapping.append(mapping)
-                else:
-                    # MoE layers
-                    for expert_id in range(self.config.num_local_experts):
-                        for weight_name in ["w1", "w2", "w3"]:
-                            if weight_name in ["w1", "w3"]:
-                                mapping = ("ws", f"experts.{expert_id}.{weight_name}.weight", expert_id)
-                            else:
-                                mapping = ("w2s", f"experts.{expert_id}.{weight_name}.weight", expert_id)
-                            expert_params_mapping.append(mapping)
-        else:
-            mlp_params_mapping = [
-                ("w13", "w1", 0),
-                ("w13", "w3", 1),
-            ]
+            else:
+                # MoE layers
+                for expert_id in range(self.config.num_local_experts):
+                    for weight_name in ["w1", "w2", "w3"]:
+                        if weight_name in ["w1", "w3"]:
+                            mapping = ("ws", f"experts.{expert_id}.{weight_name}.weight", expert_id)
+                        else:
+                            mapping = ("w2s", f"experts.{expert_id}.{weight_name}.weight", expert_id)
+                        expert_params_mapping.append(mapping)
 
         params_dict = dict(self.named_parameters())
 
@@ -583,7 +488,7 @@ class YakForCausalLM(nn.Module):
             def log_weight_loading(original_name, loaded_weight, param, shard_id, time_elapsed):
                 tensor_in_gb = loaded_weight.element_size() * loaded_weight.numel() / 1e9
                 speed = tensor_in_gb / time_elapsed
-                print(f"Load {original_name} ({loaded_weight.shape}, {tensor_in_gb} G), time: {time_elapsed}, gps: {speed}") 
+                logger.debug(f"Load {original_name} ({loaded_weight.shape}, {tensor_in_gb} G), time: {time_elapsed}, gps: {speed}") 
 
             def fused_load():
                 for name, loaded_weight in loaded_iterators:
@@ -633,40 +538,7 @@ class YakForCausalLM(nn.Module):
                                 weight_loader(param, loaded_weight)
                                 log_weight_loading(original_name, loaded_weight, param, shard_id, time.time() - tik)
 
-            def unfused_load():
-                for name, loaded_weight in loaded_iterators:
-                    print(f"Load weight {name} with shape {loaded_weight.shape}.")
-                    for (param_name, weight_name, shard_id) in stacked_params_mapping:
-                        if weight_name not in name:
-                            continue
-                        name = name.replace(weight_name, param_name)
-                        # Skip loading extra bias for GPTQ models.
-                        if name.endswith(".bias") and name not in params_dict:
-                            continue
-                        param = params_dict[name]
-                        weight_loader = param.weight_loader
-                        weight_loader(param, loaded_weight, shard_id)
-                        break
-                    else:
-                        for param_name, weight_name, shard_id in mlp_params_mapping:
-                            if weight_name not in name:
-                                continue
-                            name = name.replace(weight_name, param_name)
-                            param = params_dict[name]
-                            weight_loader = param.weight_loader
-                            weight_loader(param, loaded_weight, shard_id)
-                            break
-                        else:
-                            if name.endswith(".bias") and name not in params_dict:
-                                continue
-                            param = params_dict[name]
-                            weight_loader = getattr(param, "weight_loader",
-                                                    default_weight_loader)
-                            weight_loader(param, loaded_weight)
-            if use_fused_moe:
-                fused_load()
-            else:
-                unfused_load()
+            fused_load()
         tok = time.time()
         logger.info(f"It takes {tok - tic} seconds to read the weights")
 
