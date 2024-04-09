@@ -164,6 +164,17 @@ class YakMoE(nn.Module):
         if weight_name.endswith("w2.weight"):
             param_data[expert_id, :, :] = loaded_weight[:, shard]
 
+    def _selective_dequantize(self, param, topk_ids):
+        # select the experts in topk_ids
+        tensor = param.view((self.num_experts, -1, param.shape[-1]))
+        tensor = tensor.index_select(0, topk_ids.flatten())
+        # dequantize the selected experts
+        orig_shape = param.quantizer.orig_shape
+        param.quantizer.orig_shape = (tensor.shape[0], *orig_shape[1:])
+        dequantized = param.quantizer.dequantize(tensor, q_bits=param.quant_config.weight_bits)
+        param.quantizer.orig_shape = orig_shape
+        return dequantized
+
     def local_moe_fused(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
@@ -180,10 +191,6 @@ class YakMoE(nn.Module):
                 # If much fewer tokens than experts, use selective dequantize.
                 ws_dequantized = self._selective_dequantize(self.ws, topk_ids)
                 w2s_dequantized = self._selective_dequantize(self.w2s, topk_ids)
-
-                # Faster path but buggy.
-                # ws_dequantized = self.ws.selective_dequantized(topk_ids)
-                # w2s_dequantized = self.w2s.selective_dequantized(topk_ids)
                 # We gathered the experts to the tokens so update the mapping.
                 topk_ids = torch.arange(
                     0, topk_ids.numel(),
@@ -199,14 +206,13 @@ class YakMoE(nn.Module):
                                             topk_weights,
                                             topk_ids,
                                             inplace=True)
-        # print(f"Exit the kernel, dtype: {self.ws.dtype}, {self.w2s.dtype}")
         if self.reduce_results and self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_size)
 
     def forward(self, hidden_states: torch.Tensor):
         if self.is_moe_layer:
-            final_hidden_states = self.local_moe(hidden_states)
+            final_hidden_states = self.local_moe_fused(hidden_states)
         else:
             final_hidden_states = self.mlp(hidden_states)
         return final_hidden_states
@@ -476,7 +482,7 @@ class YakForCausalLM(nn.Module):
 
         tic = time.time()
         if use_dummy:
-            print("Using dummy weights. Skip loading weights.")
+            logger.info("Using dummy weights. Skip loading weights.")
         else:
             loaded_iterators = hf_model_weights_iterator(
                 model_name_or_path,
