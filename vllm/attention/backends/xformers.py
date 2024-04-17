@@ -146,12 +146,18 @@ class XFormersImpl(AttentionImpl):
         num_kv_heads: Optional[int] = None,
         alibi_slopes: Optional[List[float]] = None,
         sliding_window: Optional[int] = None,
+        sink_size: Optional[int] = None,
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
         self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
         self.sliding_window = sliding_window
+        self.sink_size = sink_size
+        if torch.distributed.get_rank() == 0:
+            print(f"XFormersImpl, self.sliding_window = {self.sliding_window}")
+            print(f"XFormersImpl, self.sink_size = {self.sink_size}")
+
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
         self.alibi_slopes = alibi_slopes

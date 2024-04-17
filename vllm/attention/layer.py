@@ -29,12 +29,13 @@ class Attention(nn.Module):
         num_kv_heads: Optional[int] = None,
         alibi_slopes: Optional[List[float]] = None,
         sliding_window: Optional[int] = None,
+        sink_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.backend = get_attn_backend(torch.get_default_dtype())
         impl_cls = self.backend.get_impl_cls()
         self.impl = impl_cls(num_heads, head_size, scale, num_kv_heads,
-                             alibi_slopes, sliding_window)
+                             alibi_slopes, sliding_window, sink_size)
 
     def forward(
         self,

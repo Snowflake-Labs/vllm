@@ -124,6 +124,10 @@ class ModelRunner:
         # FIXME(woosuk): This is a hack to make the tests work. Refactor this.
         self.sliding_window = (model_config.get_sliding_window()
                                if model_config is not None else None)
+        self.sink_size = (model_config.get_sink_size()
+                               if model_config is not None else None)
+        print(f"MODEL RUNNER, self.sliding_window = {self.sliding_window}")
+        print(f"MODEL RUNNER, self.sink_size = {self.sink_size}")
         self.device_config = (device_config
                               if device_config is not None else DeviceConfig())
         self.device = self.device_config.device
@@ -451,11 +455,11 @@ class ModelRunner:
                 input_positions.append(position)
 
                 context_len = seq_len if self.sliding_window is None else min(
-                    seq_len, self.sliding_window)
+                    seq_len, self.sliding_window)       #  Todo: sink
                 context_lens.append(context_len)
 
                 block_table = seq_group_metadata.block_tables[seq_id]
-                block_number = block_table[position // self.block_size]
+                block_number = block_table[position // self.block_size]        #  Todo: sink
                 block_offset = position % self.block_size
                 slot = block_number * self.block_size + block_offset
                 slot_mapping.append(slot)
@@ -464,7 +468,7 @@ class ModelRunner:
 
                 if self.sliding_window is not None:
                     sliding_window_blocks = (self.sliding_window //
-                                             self.block_size)
+                                             self.block_size)        #  Todo: sink
                     block_table = block_table[-sliding_window_blocks:]
                 block_tables.append(block_table)
 
