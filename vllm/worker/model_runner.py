@@ -260,8 +260,7 @@ class ModelRunner:
             # We should use get_len here because in case of preemption
             # it contains output tokens.
             print(f"Prepare prompt, seq_data.get_len()={seq_data.get_len()}, "
-                  f"computed_len = {computed_len}, "
-                  f"seq_group_metadata.block_tables = {seq_group_metadata.block_tables[seq_id]}")
+                  f"computed_len = {computed_len}")
             prefill_end = min(seq_data.get_len(),
                               computed_len + token_chunk_size)
             prompt_tokens = seq_data.get_token_ids()[computed_len:prefill_end]
@@ -288,7 +287,7 @@ class ModelRunner:
                 # Right now, prefill start is always 0. However, this
                 # assumption can be changed once chunked prefill is introduced.
                 assert computed_len == 0
-
+            print(f"prompt_tokens = {prompt_tokens}, prefix_block_tables= {prefix_block_tables}")
             # actual prompt lens
             context_lens.append(computed_len)
             subquery_lens.append(prompt_len - computed_len)
