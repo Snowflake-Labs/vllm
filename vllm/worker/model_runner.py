@@ -125,7 +125,7 @@ class ModelRunner:
         self.sliding_window = (model_config.get_sliding_window()
                                if model_config is not None else None)
         self.sink_size = (model_config.get_sink_size()
-                               if model_config is not None else None)
+                               if model_config is not None else 0)
         print(f"MODEL RUNNER, self.sliding_window = {self.sliding_window}")
         print(f"MODEL RUNNER, self.sink_size = {self.sink_size}")
         self.device_config = (device_config
@@ -322,6 +322,8 @@ class ModelRunner:
             # For example, if the prompt len is 10, sliding window is 8, and
             # block size is 4, the first two tokens are masked and the slot
             # mapping will be [-1, -1, 2, 3, 4, 5, 6, 7, 0, 1].
+            # FIXME [MP] : this is untrue in vllm^
+            # FIXME: mapping will be [-1, -1, 2, 3, 4, 5, 6, 7, 8, 9].
             start_idx = 0
             if self.sliding_window is not None:
                 assert computed_len == 0, (
@@ -330,7 +332,7 @@ class ModelRunner:
                 start_idx = max(0, prompt_len - self.sliding_window)
 
             for i in range(computed_len, prefill_end):
-                if i < start_idx:
+                if i < start_idx and i >= self.sink_size:
                     slot_mapping.append(_PAD_SLOT_ID)
                     continue
 
@@ -455,7 +457,7 @@ class ModelRunner:
                 input_positions.append(position)
 
                 context_len = seq_len if self.sliding_window is None else min(
-                    seq_len, self.sliding_window)       #  Todo: sink
+                    seq_len, self.sliding_window+self.sink_size)
                 context_lens.append(context_len)
 
                 block_table = seq_group_metadata.block_tables[seq_id]
@@ -468,8 +470,15 @@ class ModelRunner:
 
                 if self.sliding_window is not None:
                     sliding_window_blocks = (self.sliding_window //
-                                             self.block_size)        #  Todo: sink
-                    block_table = block_table[-sliding_window_blocks:]
+                                             self.block_size)
+                    sink_window_blocks = (self.sink_size //
+                                             self.block_size)
+                    # Calculate the point at which to start the sliding window to avoid overlap
+                    start_sliding_index = max(sink_window_blocks, len(block_table) - sliding_window_blocks)
+
+                    # Update the block table to include the sink blocks and the sliding window blocks
+                    block_table = block_table[:sink_window_blocks] + block_table[start_sliding_index:]
+                    # block_table = block_table[-sliding_window_blocks:]
                 block_tables.append(block_table)
 
         # vLLM uses cuda graph only for decoding requests.

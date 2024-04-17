@@ -207,9 +207,9 @@ class ModelConfig:
         """Get the sink size, or None if disabled.
         """
         if (hasattr(self.hf_text_config, "use_sink")
-                and not self.hf_text_config.use_sliding_window):
+                and not self.hf_text_config.use_sink):
             return None
-        return getattr(self.hf_text_config, "sink_size", None)
+        return getattr(self.hf_text_config, "sink_size", 0)
 
     def get_vocab_size(self) -> int:
         return self.hf_text_config.vocab_size
