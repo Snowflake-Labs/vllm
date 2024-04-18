@@ -231,6 +231,8 @@ class BlockSpaceManagerV1(BlockSpaceManager):
                                                       block_size)
             self.block_sink_size = sink_size // block_size
 
+        self.sink_incr = 0 if self.block_sink_size is None else self.block_sink_size
+        self.sw_incr = int(1e7) if self.block_sliding_window is None else self.block_sliding_window
         self.watermark = watermark
         assert watermark >= 0.0
 
@@ -552,7 +554,7 @@ class BlockSpaceManagerV1(BlockSpaceManager):
         # reuse in the block table, so we must free all blocks.
         blocks_to_free = (block_table[-self.block_sliding_window:]
                           if self.block_sliding_window is not None else
-                          block_table)
+                          block_table) + (block_table[:self.sw_incr])
         print(f"block_manager_v1, _free_block_table(), block_table = {block_table},"
               f"blocks_to_free = {blocks_to_free}")
         for block in set(blocks_to_free):
