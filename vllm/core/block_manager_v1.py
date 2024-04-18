@@ -208,6 +208,7 @@ class BlockSpaceManagerV1(BlockSpaceManager):
         num_cpu_blocks: int,
         watermark: float = 0.01,
         sliding_window: Optional[int] = None,
+        sink_size: Optional[int] = None,
         enable_caching: bool = False,
     ) -> None:
         self.block_size = block_size
@@ -223,6 +224,12 @@ class BlockSpaceManagerV1(BlockSpaceManager):
             assert sliding_window % block_size == 0, (sliding_window,
                                                       block_size)
             self.block_sliding_window = sliding_window // block_size
+
+        self.block_sink = None
+        if sink_size is not None:
+            assert sink_size % block_size == 0, (sink_size,
+                                                      block_size)
+            self.block_sink_size = sink_size // block_size
 
         self.watermark = watermark
         assert watermark >= 0.0
@@ -250,10 +257,13 @@ class BlockSpaceManagerV1(BlockSpaceManager):
         # the same prompt. This may not be true for preempted sequences.
         seq = seq_group.get_seqs(status=SequenceStatus.WAITING)[0]
         num_required_blocks = len(seq.logical_token_blocks)
-
+        print(f"block_manager_v1, can_allocate(), len seq.logical_token_blocks={num_required_blocks},"
+              f"self.block_sliding_window={self.block_sliding_window}, "
+              f" self.block_sink_size = {self.block_sink_size}")
         if self.block_sliding_window is not None:
+            sink_incr = 0 if self.block_sink_size is None else self.block_sink_size
             num_required_blocks = min(num_required_blocks,
-                                      self.block_sliding_window)
+                                      self.block_sliding_window + sink_incr)
         num_free_gpu_blocks = self.gpu_allocator.get_num_free_blocks()
 
         # Use watermark to avoid frequent cache eviction.
@@ -272,19 +282,22 @@ class BlockSpaceManagerV1(BlockSpaceManager):
 
         # Allocate new physical token blocks that will store the prompt tokens.
         num_prompt_blocks = len(seq.logical_token_blocks)
-
+        print(f"block_manager_v1, allocate(), num_prompt_blocks={num_prompt_blocks}")
         block_table: BlockTable = []
         for logical_idx in range(num_prompt_blocks):
             if (self.block_sliding_window is not None
                     and logical_idx >= self.block_sliding_window):
                 block = block_table[logical_idx % self.block_sliding_window]
+                print(f"block_manager_v1, allocate() loop, logical_idx={logical_idx}, block = {block}")
                 # Set the reference counts of the token blocks.
                 block.ref_count = seq_group.num_seqs()
             elif self.enable_caching:
+                print(f"block_manager_v1, allocate() this -> elif enable_caching")
                 block = self.gpu_allocator.allocate(
                     seq.hash_of_block(logical_idx),
                     seq.num_hashed_tokens_of_block(logical_idx))
             else:
+                print(f"block_manager_v1, allocate() this -> else")
                 block = self.gpu_allocator.allocate()
                 # Set the reference counts of the token blocks.
                 block.ref_count = seq_group.num_seqs()
@@ -380,6 +393,8 @@ class BlockSpaceManagerV1(BlockSpaceManager):
         logical_blocks = seq.logical_token_blocks
         block_table = self.block_tables[seq.seq_id]
         # If we need to allocate a new physical block
+        print(f"block_manager_v1, append_slots(), logical_blocks={logical_blocks}, block_table= {block_table}")
+
         if len(block_table) < len(logical_blocks):
             # Currently this code only supports adding one physical block
             assert len(block_table) == len(logical_blocks) - 1
@@ -387,6 +402,7 @@ class BlockSpaceManagerV1(BlockSpaceManager):
             if (self.block_sliding_window
                     and len(block_table) >= self.block_sliding_window):
                 # reuse a block
+                print(f"block_manager_v1, append_slots(), reuse a block")
                 block_table.append(block_table[len(block_table) %
                                                self.block_sliding_window])
             else:
@@ -394,6 +410,7 @@ class BlockSpaceManagerV1(BlockSpaceManager):
                 # Allocate a new physical block.
                 new_block = self._allocate_last_physical_block(seq)
                 block_table.append(new_block)
+                print(f"block_manager_v1, append_slots(), Allocate a new physical block = {new_block}")
                 return {}
 
         # We want to append the token to the last physical block.
@@ -525,6 +542,8 @@ class BlockSpaceManagerV1(BlockSpaceManager):
         blocks_to_free = (block_table[-self.block_sliding_window:]
                           if self.block_sliding_window is not None else
                           block_table)
+        print(f"block_manager_v1, _free_block_table(), block_table = {block_table},"
+              f"blocks_to_free = {blocks_to_free}")
         for block in set(blocks_to_free):
             if block.device == Device.GPU:
                 self.gpu_allocator.free(block)
