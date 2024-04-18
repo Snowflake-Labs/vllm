@@ -333,9 +333,11 @@ class XFormersImpl(AttentionImpl):
                 attn_bias = BlockDiagonalCausalMask.from_seqlens(
                     attn_metadata.prompt_lens)
                 if self.sliding_window is not None:
-                    print(f"XFORMERS making local attention with sw ={self.sliding_window} ")
-                    attn_bias = attn_bias.make_local_attention(
-                        self.sliding_window)
+                    # FIXME: hack for sink
+                    # print(f"XFORMERS making local attention with sw ={self.sliding_window} ")
+                    print(f"XFORMERS making local attention with sw = {int(1e4)} ")
+                    attn_bias = attn_bias.make_local_attention(int(1e4))
+                        # self.sliding_window)
                 attn_metadata.attn_bias = [attn_bias]
             else:
                 attn_metadata.attn_bias = _make_alibi_bias(
