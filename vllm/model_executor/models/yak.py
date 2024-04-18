@@ -233,7 +233,7 @@ class YakAttention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
 
-        self.sliding_window = getattr(self.config, "sliding_window", int(1e6))
+        self.sliding_window = getattr(self.config, "sliding_window", int(1e7))
         if self.sliding_window is None:
             self.sliding_window = int(1e6)
         self.sink_size = getattr(self.config, "sink_size", 0)

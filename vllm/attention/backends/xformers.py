@@ -154,9 +154,6 @@ class XFormersImpl(AttentionImpl):
         self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
         self.sliding_window = sliding_window
         self.sink_size = sink_size
-        if torch.distributed.get_rank() == 0:
-            print(f"XFormersImpl, self.sliding_window = {self.sliding_window}")
-            print(f"XFormersImpl, self.sink_size = {self.sink_size}")
 
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
@@ -231,10 +228,6 @@ class XFormersImpl(AttentionImpl):
                 # normal attention.
                 # block tables are empty if the prompt does not have a cached
                 # prefix.
-                print(f"xformers kv_cache is none,"
-                      f"query = {query.shape},"
-                      f" key = {key.shape},"
-                      f" value = {value.shape}, num_prefill_tokens={num_prefill_tokens}")
                 out = self._run_memory_efficient_xformers_forward(
                     query, key, value, prefill_meta)
                 assert out.shape == output[:num_prefill_tokens].shape
@@ -244,14 +237,6 @@ class XFormersImpl(AttentionImpl):
                 # TODO(Hai) this triton kernel has regression issue (broke) to
                 # deal with different data types between KV and FP8 KV cache,
                 # to be addressed separately.
-
-                print(f"xformers (first else) forward_prefix,"
-                      f"query = {query.shape},"
-                      f" key = {key.shape},"
-                      f" value = {value.shape},"
-                      f" key_cache = {key_cache.shape},"
-                      f" value_cache = {value_cache.shape},"
-                      f" num_prefill_tokens={num_prefill_tokens}")
                 out = PagedAttention.forward_prefix(
                     query,
                     key,
@@ -269,11 +254,6 @@ class XFormersImpl(AttentionImpl):
                 output[:num_prefill_tokens] = out
 
         if decode_meta := attn_metadata.decode_metadata:
-            print(f"xformers (first else) forward_decode,"
-                  f"decode_query = {decode_query.shape},"
-                  f" key_cache = {key_cache.shape},"
-                  f" value_cache = {value_cache.shape},"
-                  f" num_prefill_tokens={num_prefill_tokens}")
             output[num_prefill_tokens:] = PagedAttention.forward_decode(
                 decode_query,
                 key_cache,
@@ -333,11 +313,8 @@ class XFormersImpl(AttentionImpl):
                 attn_bias = BlockDiagonalCausalMask.from_seqlens(
                     attn_metadata.prompt_lens)
                 if self.sliding_window is not None:
-                    # FIXME: hack for sink
-                    # print(f"XFORMERS making local attention with sw ={self.sliding_window} ")
-                    print(f"XFORMERS making local attention with sw = {int(1e4)} ")
+                    # FIXME [MP]: hack for sink, as dense is still ok in the prompt
                     attn_bias = attn_bias.make_local_attention(int(1e4))
-                        # self.sliding_window)
                 attn_metadata.attn_bias = [attn_bias]
             else:
                 attn_metadata.attn_bias = _make_alibi_bias(

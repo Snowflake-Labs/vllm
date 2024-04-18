@@ -126,8 +126,6 @@ class ModelRunner:
                                if model_config is not None else None)
         self.sink_size = (model_config.get_sink_size()
                                if model_config is not None else 0)
-        print(f"MODEL RUNNER, self.sliding_window = {self.sliding_window}")
-        print(f"MODEL RUNNER, self.sink_size = {self.sink_size}")
         self.device_config = (device_config
                               if device_config is not None else DeviceConfig())
         self.device = self.device_config.device
@@ -259,8 +257,6 @@ class ModelRunner:
             computed_len = seq_data.get_num_computed_tokens()
             # We should use get_len here because in case of preemption
             # it contains output tokens.
-            print(f"Prepare prompt, seq_data.get_len()={seq_data.get_len()}, "
-                  f"computed_len = {computed_len}")
             prefill_end = min(seq_data.get_len(),
                               computed_len + token_chunk_size)
             prompt_tokens = seq_data.get_token_ids()[computed_len:prefill_end]
@@ -287,7 +283,7 @@ class ModelRunner:
                 # Right now, prefill start is always 0. However, this
                 # assumption can be changed once chunked prefill is introduced.
                 assert computed_len == 0
-            print(f"prompt_tokens = {prompt_tokens}, prefix_block_tables= {prefix_block_tables}")
+
             # actual prompt lens
             context_lens.append(computed_len)
             subquery_lens.append(prompt_len - computed_len)
@@ -332,9 +328,7 @@ class ModelRunner:
                     "Prefix caching is currently not supported with "
                     "sliding window attention")
                 start_idx = max(0, prompt_len - self.sliding_window)
-            print(f"looping, for seq_id={seq_id}, from computed_len={computed_len}, "
-                  f"to prefill_end={prefill_end},"
-                  f"")
+
             for i in range(computed_len, prefill_end):
                 if i < start_idx and i >= self.sink_size:
                     slot_mapping.append(_PAD_SLOT_ID)
@@ -344,8 +338,7 @@ class ModelRunner:
                 block_offset = i % self.block_size
                 slot = block_number * self.block_size + block_offset
                 slot_mapping.append(slot)
-        print(f"slot_mappings = {slot_mapping}"
-              f"")
+
         max_subquery_len = max(subquery_lens)
         max_prompt_len = max(prompt_lens)
         assert max_subquery_len > 0
@@ -472,10 +465,6 @@ class ModelRunner:
                 slot_mapping.append(slot)
                 lora_index_mapping.append(lora_id)
                 lora_prompt_mapping.append(lora_id)
-                print(f"Prepare prompt, seq_data.get_len()={seq_data.get_len()}, "
-                      f"context_len = {context_len},"
-                      f"position = {position} "
-                      f"seq_group_metadata.block_tables = {seq_group_metadata.block_tables[seq_id]}")
 
                 if self.sliding_window is not None:
                     sliding_window_blocks = (self.sliding_window //
@@ -487,11 +476,7 @@ class ModelRunner:
 
                     # Update the block table to include the sink blocks and the sliding window blocks
                     block_table = block_table[:sink_window_blocks] + block_table[start_sliding_index:]
-                    # block_table = block_table[-sliding_window_blocks:]
                 block_tables.append(block_table)
-                print(f"Appended to block tables, this: {block_table}, sink={sink_window_blocks}, "
-                      f"and {sliding_window_blocks} blocks (starting from {start_sliding_index}")
-
 
         # vLLM uses cuda graph only for decoding requests.
         # See `capture_model` API for more details.
@@ -635,8 +620,7 @@ class ModelRunner:
 
             if sampling_params.seed is not None:
                 generators.append(seq_group_metadata.state.generator)
-        print(f"SAmple prepare. selected_token_indices = {selected_token_indices}, "
-              f"prompt_lens = {prompt_lens}")
+
         selected_token_indices = async_tensor_h2d(selected_token_indices,
                                                   dtype=torch.long,
                                                   target_device=self.device,
