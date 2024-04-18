@@ -285,9 +285,19 @@ class BlockSpaceManagerV1(BlockSpaceManager):
         print(f"block_manager_v1, allocate(), num_prompt_blocks={num_prompt_blocks}")
         block_table: BlockTable = []
         for logical_idx in range(num_prompt_blocks):
-            if (self.block_sliding_window is not None
-                    and logical_idx >= self.block_sliding_window):
-                block = block_table[logical_idx % self.block_sliding_window]
+            sink_incr = 0 if self.block_sink_size is None else self.block_sink_size
+            sw_incr = int(1e6) if self.block_sliding_window is None else self.block_sliding_window
+            if logical_idx > sw_incr + sink_incr:
+                # reuse
+                    # (self.block_sliding_window is not None
+                    # and logical_idx >= self.block_sliding_window):
+
+                if logical_idx > sink_incr:
+                    adjusted_logical_idx = sink_incr + ((logical_idx - sink_incr) % sw_incr)
+                else:
+                    adjusted_logical_idx = logical_idx
+
+                block = block_table[adjusted_logical_idx]  # logical_idx % self.block_sliding_window]
                 print(f"block_manager_v1, allocate() loop, logical_idx={logical_idx}, block = {block}")
                 # Set the reference counts of the token blocks.
                 block.ref_count = seq_group.num_seqs()
@@ -398,13 +408,14 @@ class BlockSpaceManagerV1(BlockSpaceManager):
         if len(block_table) < len(logical_blocks):
             # Currently this code only supports adding one physical block
             assert len(block_table) == len(logical_blocks) - 1
+            sink_incr = 0 if self.block_sink_size is None else self.block_sink_size
 
             if (self.block_sliding_window
-                    and len(block_table) >= self.block_sliding_window):
+                    and len(block_table) >= (self.block_sliding_window + sink_incr)):
                 # reuse a block
-                print(f"block_manager_v1, append_slots(), reuse a block")
-                block_table.append(block_table[len(block_table) %
-                                               self.block_sliding_window])
+                new_idx = sink_incr + ((len(block_table) - sink_incr) % self.block_sliding_window)
+                print(f"block_manager_v1, append_slots(), reuse a block, new_idx = {new_idx}")
+                block_table.append(block_table[new_idx])
             else:
                 # The sequence has a new logical block.
                 # Allocate a new physical block.
