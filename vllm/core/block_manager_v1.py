@@ -532,7 +532,7 @@ class BlockSpaceManagerV1(BlockSpaceManager):
         # reuse in the block table, so we must free all blocks.
         blocks_to_free = (block_table[-self.block_sliding_window:]
                           if self.block_sliding_window is not None else
-                          block_table) + (block_table[:self.sw_incr])
+                          block_table) + (block_table[:self.sink_incr])
         for block in set(blocks_to_free):
             if block.device == Device.GPU:
                 self.gpu_allocator.free(block)
