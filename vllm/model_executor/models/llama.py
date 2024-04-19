@@ -92,6 +92,7 @@ class LlamaAttention(nn.Module):
         linear_method: Optional[LinearMethodBase] = None,
         bias: bool = False,
         sliding_window: Optional[int] = None,
+        sink_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -151,7 +152,8 @@ class LlamaAttention(nn.Module):
                               self.head_dim,
                               self.scaling,
                               num_kv_heads=self.num_kv_heads,
-                              sliding_window=sliding_window)
+                              sliding_window=sliding_window,
+                              sink_size=sink_size)
 
     def forward(
         self,
@@ -183,6 +185,8 @@ class LlamaDecoderLayer(nn.Module):
         max_position_embeddings = getattr(config, "max_position_embeddings",
                                           8192)
         sliding_window = getattr(config, "sliding_window", None)
+        sink_size = getattr(config, "sink_size", None)
+        print(f"SINK SIZE = {sink_size}, SW = {sliding_window}")
         # Support abacusai/Smaug-72B-v0.1 with attention_bias
         # Support internlm/internlm-7b with bias
         attention_bias = getattr(config, "attention_bias", False) or getattr(
@@ -198,6 +202,7 @@ class LlamaDecoderLayer(nn.Module):
             linear_method=linear_method,
             bias=attention_bias,
             sliding_window=sliding_window,
+            sink_size=sink_size,
         )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
