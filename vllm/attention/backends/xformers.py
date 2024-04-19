@@ -314,7 +314,7 @@ class XFormersImpl(AttentionImpl):
                     attn_metadata.prompt_lens)
                 if self.sliding_window is not None:
                     # FIXME [MP]: hack for sink, as dense is still ok in the prompt
-                    attn_bias = attn_bias.make_local_attention(int(1e4))
+                    attn_bias = attn_bias.make_local_attention(int(1e5))
                 attn_metadata.attn_bias = [attn_bias]
             else:
                 attn_metadata.attn_bias = _make_alibi_bias(
