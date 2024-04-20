@@ -313,7 +313,7 @@ class XFormersImpl(AttentionImpl):
         if attn_metadata.attn_bias is None:
             if self.alibi_slopes is None:
                 print(f"attn_metadata.prompt_lens = {attn_metadata.prompt_lens}")
-                attn_bias = BlockDiagonalCausalLocalAttentionAndSinkMask.from_seqlens(
+                attn_bias = BlockDiagonalCausalMask.from_seqlens(
                     attn_metadata.prompt_lens)
                 if self.sliding_window is not None:
                     # FIXME [MP]: hack for sink, as dense is still ok in the prompt

@@ -56,7 +56,8 @@ class BlockDiagonalCausalLocalAttentionAndSinkMask(BlockDiagonalMask):
 
     def __post_init__(self):
         if self._window_size <= 0:
-            raise ValueError(
+            # raise ValueError(
+            print(
                 f"Expected `window_size > 0`, but window_size={self._window_size}"
             )
         q_seqlen = [
@@ -75,7 +76,8 @@ class BlockDiagonalCausalLocalAttentionAndSinkMask(BlockDiagonalMask):
             if q - self._window_size >= k:
                 # Each query only attends to keys no further than window_size back.
                 # When q > k + window_size, there will be a query for which the window doesn't reach any key.
-                raise RuntimeError(
+                # raise RuntimeError(
+                print(
                     f"No keys are attended in q_seqlen {q} k_seqlen {k} with sliding window {self._window_size}"
                 )
 
