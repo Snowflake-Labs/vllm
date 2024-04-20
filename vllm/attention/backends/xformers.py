@@ -155,7 +155,8 @@ class XFormersImpl(AttentionImpl):
         self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
         self.sliding_window = sliding_window
         self.sink_size = sink_size
-
+        print(f"self.sliding_window = {self.sliding_window}")
+        print(f"self.sink_size = {self.sink_size}")
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
         self.alibi_slopes = alibi_slopes
@@ -311,10 +312,16 @@ class XFormersImpl(AttentionImpl):
         # FIXME(woosuk): This is a hack.
         if attn_metadata.attn_bias is None:
             if self.alibi_slopes is None:
-                attn_bias = BlockDiagonalCausalLocalAttentionMask.from_seqlens(
+                print(f"attn_metadata.prompt_lens = {attn_metadata.prompt_lens}")
+                attn_bias = BlockDiagonalCausalLocalAttentionAndSinkMask.from_seqlens(
                     attn_metadata.prompt_lens)
                 if self.sliding_window is not None:
                     # FIXME [MP]: hack for sink, as dense is still ok in the prompt
+                    print(f"attn_bias.q_seqinfo = {attn_bias.q_seqinfo}")
+                    print(f"attn_bias.k_seqinfo = {attn_bias.k_seqinfo}")
+                    print(f"attn_bias._batch_sizes = {attn_bias._batch_sizes}")
+                    print(f"self.sliding_window = {self.sliding_window}")
+                    print(f"self.sink_size = {self.sink_size}")
                     attn_bias = BlockDiagonalCausalLocalAttentionAndSinkMask(
                         q_seqinfo=attn_bias.q_seqinfo,
                         k_seqinfo=attn_bias.k_seqinfo,
