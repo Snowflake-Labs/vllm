@@ -1,4 +1,4 @@
-from xformers.ops.fmha.attn_bias import BlockDiagonalCausalLocalAttentionMask
+from xformers.ops.fmha.attn_bias import BlockDiagonalCausalLocalAttentionMask, BlockDiagonalMask
 from dataclasses import dataclass
 from typing import (
     Optional,
@@ -41,7 +41,7 @@ def _materialize_causal_mask_with_sink(
 
 
 @dataclass
-class BlockDiagonalCausalLocalAttentionAndSinkMask(BlockDiagonalCausalLocalAttentionMask):
+class BlockDiagonalCausalLocalAttentionAndSinkMask(BlockDiagonalMask):
     """
     (Experimental feature)
     Same as :attr:`xformers.ops.fmha.attn_bias.BlockDiagonalCausalMask`.
