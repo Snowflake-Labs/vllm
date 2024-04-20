@@ -6,6 +6,7 @@ import torch
 from xformers import ops as xops
 from xformers.ops.fmha.attn_bias import (AttentionBias,
                                          BlockDiagonalCausalMask,
+                                         BlockDiagonalCausalLocalAttentionMask,
                                          LowerTriangularMaskWithTensorBias)
 from vllm.attention.backends.causal_and_sink_attn import BlockDiagonalCausalLocalAttentionAndSinkMask
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
@@ -310,7 +311,7 @@ class XFormersImpl(AttentionImpl):
         # FIXME(woosuk): This is a hack.
         if attn_metadata.attn_bias is None:
             if self.alibi_slopes is None:
-                attn_bias = BlockDiagonalCausalLocalAttentionAndSinkMask.from_seqlens(
+                attn_bias = BlockDiagonalCausalLocalAttentionMask.from_seqlens(
                     attn_metadata.prompt_lens)
                 if self.sliding_window is not None:
                     # FIXME [MP]: hack for sink, as dense is still ok in the prompt
