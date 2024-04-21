@@ -17,6 +17,10 @@ def _materialize_causal_mask_with_sink(
     sink_size: Optional[int] = None,
     from_bottomright: bool = False,
 ) -> torch.Tensor:
+    attn_bias_stride = 8
+    new_shape = [shape[0], shape[1]]
+    new_shape[0] = shape[0] + (attn_bias_stride - (shape[0] % attn_bias_stride)) if shape[0] % attn_bias_stride != 0 else 0
+    new_shape[1] = shape[1] + (attn_bias_stride - (shape[1] % attn_bias_stride)) if shape[1] % attn_bias_stride != 0 else 0
     create_as = dtype if dtype is not torch.bfloat16 else torch.float32
     tensor = torch.full(  # type: ignore
         shape,
@@ -37,7 +41,7 @@ def _materialize_causal_mask_with_sink(
         mask[:, :sink_size] = 1
         mask = torch.tril(mask)
     mask = torch.log(mask)
-    return mask.to(dtype)
+    return mask.to(dtype)[:shape[0], :shape[1]]
 
 
 @dataclass
@@ -96,12 +100,12 @@ class BlockDiagonalCausalLocalAttentionAndSinkMask(BlockDiagonalMask):
         )
 
 
-# q_len = 40
-# k_len = 100
-# _materialize_causal_mask_with_sink(
-#         (q_len, k_len),
-#         # dtype=dtype,
-#         # device=device,
-#         window_size=20,
-#         sink_size=10
-#     )
+q_len = 40
+k_len = 100
+_materialize_causal_mask_with_sink(
+        (q_len, k_len),
+        # dtype=dtype,
+        # device=device,
+        window_size=20,
+        sink_size=10
+    )
