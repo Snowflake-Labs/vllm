@@ -19,8 +19,8 @@ def _materialize_causal_mask_with_sink(
 ) -> torch.Tensor:
     attn_bias_stride = 8
     new_shape = [shape[0], shape[1]]
-    new_shape[0] = shape[0] + (attn_bias_stride - (shape[0] % attn_bias_stride)) if shape[0] % attn_bias_stride != 0 else 0
-    new_shape[1] = shape[1] + (attn_bias_stride - (shape[1] % attn_bias_stride)) if shape[1] % attn_bias_stride != 0 else 0
+    new_shape[0] = shape[0] + (attn_bias_stride - (shape[0] % attn_bias_stride)) if shape[0] % attn_bias_stride != 0 else shape[0]
+    new_shape[1] = shape[1] + (attn_bias_stride - (shape[1] % attn_bias_stride)) if shape[1] % attn_bias_stride != 0 else shape[1]
     create_as = dtype if dtype is not torch.bfloat16 else torch.float32
     tensor = torch.full(  # type: ignore
         new_shape,
