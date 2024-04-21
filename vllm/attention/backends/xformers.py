@@ -322,6 +322,8 @@ class XFormersImpl(AttentionImpl):
                             window_size=self.sliding_window,
                             sink_size=self.sink_size,
                         )
+                    # match the shape of B, H, Q, K
+                    attn_bias = attn_bias[None, None, ...].expand(len(attn_metadata.prompt_lens), query.shape[1], query.shape[0], key.shape[0])
                 # print(f"attn_metadata.prompt_lens = {attn_metadata.prompt_lens}")
                 # attn_bias = BlockDiagonalCausalMask.from_seqlens(
                 #     attn_metadata.prompt_lens)
