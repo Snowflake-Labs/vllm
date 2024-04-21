@@ -312,24 +312,34 @@ class XFormersImpl(AttentionImpl):
         # FIXME(woosuk): This is a hack.
         if attn_metadata.attn_bias is None:
             if self.alibi_slopes is None:
-                print(f"attn_metadata.prompt_lens = {attn_metadata.prompt_lens}")
-                attn_bias = BlockDiagonalCausalMask.from_seqlens(
-                    attn_metadata.prompt_lens)
-                if self.sliding_window is not None:
-                    # FIXME [MP]: hack for sink, as dense is still ok in the prompt
-                    print(f"attn_bias.q_seqinfo = {attn_bias.q_seqinfo}")
-                    print(f"attn_bias.k_seqinfo = {attn_bias.k_seqinfo}")
-                    print(f"attn_bias._batch_sizes = {attn_bias._batch_sizes}")
-                    print(f"self.sliding_window = {self.sliding_window}")
-                    print(f"self.sink_size = {self.sink_size}")
-                    attn_bias = BlockDiagonalCausalLocalAttentionAndSinkMask(
-                        q_seqinfo=attn_bias.q_seqinfo,
-                        k_seqinfo=attn_bias.k_seqinfo,
-                        _batch_sizes=attn_bias._batch_sizes,
-                        _window_size=self.sliding_window,
-                        _sink_size=self.sink_size,
-                    )
-                    # attn_bias = attn_bias.make_local_attention(int(1e5))
+                if self.sink_size is not None:  # Create a custom tensor
+                    from vllm.attention.backends.causal_and_sink_attn import _materialize_causal_mask_with_sink
+
+                    attn_bias = _materialize_causal_mask_with_sink(
+                            (query.shape[0], key.shape[0]),
+                            dtype=key.dtype,
+                            device=key.device,
+                            window_size=20,
+                            sink_size=10
+                        )
+                # print(f"attn_metadata.prompt_lens = {attn_metadata.prompt_lens}")
+                # attn_bias = BlockDiagonalCausalMask.from_seqlens(
+                #     attn_metadata.prompt_lens)
+                # if self.sliding_window is not None:
+                #     # FIXME [MP]: hack for sink, as dense is still ok in the prompt
+                #     print(f"attn_bias.q_seqinfo = {attn_bias.q_seqinfo}")
+                #     print(f"attn_bias.k_seqinfo = {attn_bias.k_seqinfo}")
+                #     print(f"attn_bias._batch_sizes = {attn_bias._batch_sizes}")
+                #     print(f"self.sliding_window = {self.sliding_window}")
+                #     print(f"self.sink_size = {self.sink_size}")
+                #     attn_bias = BlockDiagonalCausalLocalAttentionAndSinkMask(
+                #         q_seqinfo=attn_bias.q_seqinfo,
+                #         k_seqinfo=attn_bias.k_seqinfo,
+                #         _batch_sizes=attn_bias._batch_sizes,
+                #         _window_size=self.sliding_window,
+                #         _sink_size=self.sink_size,
+                #     )
+                #     # attn_bias = attn_bias.make_local_attention(int(1e5))
                 attn_metadata.attn_bias = [attn_bias]
             else:
                 attn_metadata.attn_bias = _make_alibi_bias(
