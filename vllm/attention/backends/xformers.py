@@ -319,8 +319,8 @@ class XFormersImpl(AttentionImpl):
                             (query.shape[0], key.shape[0]),
                             dtype=key.dtype,
                             device=key.device,
-                            window_size=20,
-                            sink_size=10
+                            window_size=self.sliding_window,
+                            sink_size=self.sink_size,
                         )
                 # print(f"attn_metadata.prompt_lens = {attn_metadata.prompt_lens}")
                 # attn_bias = BlockDiagonalCausalMask.from_seqlens(
