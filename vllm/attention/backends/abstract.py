@@ -118,6 +118,7 @@ class AttentionImpl(ABC):
         value: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata[AttentionMetadataPerStage],
+        rotary_emb,
         kv_scale: float,
     ) -> torch.Tensor:
         raise NotImplementedError

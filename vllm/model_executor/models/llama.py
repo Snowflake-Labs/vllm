@@ -117,6 +117,7 @@ class LlamaAttention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
+        self.sink_size = sink_size
         # This will be overwritten by model initialization if we are using it.
         # N.B. currently we only support per tensor scalar scaling factors
         # & only applicable to ROCm (AMD GPU).
@@ -164,9 +165,17 @@ class LlamaAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # Rotate full query, and keys that are not in the sink
+        # if attn_metadata.is_prompt and self.sink_size is not None:
+        #     ss = self.sink_size
+        #     q[ss:], k[ss:] = self.rotary_emb(positions, q[ss:], k[ss:])
+        #     # cloned_k = k[:ss].clone()
+        #     # q[:ss], cloned_k = self.rotary_emb(positions, q[:ss], cloned_k)
+        # else:
+        # Ok, we just rotate normally, and then add some more spin to sink to keep them close
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata,
-                                self.kv_scale)
+                                self.kv_scale, self.rotary_emb)
         output, _ = self.o_proj(attn_output)
         return output
 

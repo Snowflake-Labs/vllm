@@ -60,6 +60,22 @@ class PagedAttention:
         return key_cache, value_cache
 
     @staticmethod
+    def merge_kv_cache(
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        num_kv_heads: int,
+        head_size: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Assuming key_cache and value_cache have been reshaped to original flattened forms if needed
+        x = 16 // key_cache.element_size()
+        num_blocks = key_cache.shape[0]
+
+        # Reshape to match the original kv_cache format before splitting
+        key_cache = key_cache.view(num_blocks, num_kv_heads * head_size // x * key_cache.shape[-2] * x)
+        value_cache = value_cache.view(num_blocks, num_kv_heads * head_size * value_cache.shape[-1])
+        return key_cache, value_cache
+
+    @staticmethod
     def write_to_paged_cache(
         key: torch.Tensor,
         value: torch.Tensor,

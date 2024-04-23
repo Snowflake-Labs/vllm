@@ -177,6 +177,7 @@ class XFormersImpl(AttentionImpl):
         value: torch.Tensor,
         kv_cache: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata[XFormersMetadata],
+        rotary_emb,
         kv_scale: float,
     ) -> torch.Tensor:
         """Forward pass with xFormers and PagedAttention.
@@ -230,6 +231,15 @@ class XFormersImpl(AttentionImpl):
                 # normal attention.
                 # block tables are empty if the prompt does not have a cached
                 # prefix.
+                # Rotate sink to the correct position
+                # if self.sink_size is not None:
+                #     ss = self.sink_size
+                #     positions = torch.arange(0, ss).to(key.device)  # for prompt run nothing changes, except cache will store not rotated repr
+                #     q_1, k_1 = rotary_emb(positions,
+                #                                       query.view(num_tokens, -1)[:ss],
+                #                                       key.view(num_tokens, -1)[:ss])
+                #     query[:ss] = q_1.view(-1, self.num_kv_heads, self.head_size)
+                #     key[:ss] = k_1.view(-1, self.num_kv_heads, self.head_size)
                 out = self._run_memory_efficient_xformers_forward(
                     query, key, value, prefill_meta)
                 assert out.shape == output[:num_prefill_tokens].shape
@@ -256,6 +266,39 @@ class XFormersImpl(AttentionImpl):
                 output[:num_prefill_tokens] = out
 
         if decode_meta := attn_metadata.decode_metadata:
+            # one single step, everything is in the cache
+            # take the blocks that relate to sink tokens, backup them
+            # rotate them, assigning positions at the end of the sliding window
+            # q_len is num_tokens
+            num_sinks_current = min(self.sink_size, attn_metadata.decode_metadata.context_lens[0])
+
+            sink_blocks = decode_meta.block_tables[0, :self.sink_size]   # FIXME: multibatch may hurt here
+            sink_key_cache = torch.index_select(key_cache, index=sink_blocks, dim=0)
+            sink_key_to_roll = sink_key_cache.view(self.sink_size, -1)
+
+            dummy_sink_value_cache = torch.index_select(key_cache, index=sink_blocks, dim=0)
+
+            dummy_query_to_roll = torch.zeros_like(sink_key_to_roll)
+            # we just evicted some tokens from cache, and we need to roll sink on their positions
+            # find the additional rotations to apply on the sink
+            rotate_positions = []
+            for batch_i_cl in attn_metadata.decode_metadata.context_lens:
+
+                positions_one_bs = torch.ones(1, num_sinks_current).to(key.device) * batch_i_cl
+                rotate_positions.append(positions_one_bs)
+            rotate_positions = torch.cat(rotate_positions, dim=1)
+            # rotate sink
+            _, k1 = rotary_emb(rotate_positions,
+                                  dummy_query_to_roll,
+                                  sink_key_to_roll)
+            k1 = k1.view(-1, self.num_kv_heads, self.head_size)
+            v1 = dummy_sink_value_cache.view(-1, self.num_kv_heads, self.head_size)
+            # write back to cache
+            PagedAttention.write_to_paged_cache(k1, v1, key_cache,
+                                                value_cache,
+                                                attn_metadata.slot_mapping,
+                                                attn_metadata.kv_cache_dtype,
+                                                kv_scale)
             output[num_prefill_tokens:] = PagedAttention.forward_decode(
                 decode_query,
                 key_cache,
