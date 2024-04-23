@@ -174,8 +174,8 @@ class LlamaAttention(nn.Module):
         # else:
         # Ok, we just rotate normally, and then add some more spin to sink to keep them close
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, kv_cache, attn_metadata,
-                                self.kv_scale, self.rotary_emb)
+        attn_output = self.attn(q, k, v, kv_cache, attn_metadata, self.rotary_emb,
+                                self.kv_scale)
         output, _ = self.o_proj(attn_output)
         return output
 
