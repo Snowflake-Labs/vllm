@@ -90,13 +90,10 @@ class DeepSpeedFPLinearMethod(LinearMethodBase):
         from deepspeed.ops.fp_quantizer import FP_Quantize
         self.quantizer = FP_Quantize(group_size=self.quant_config.group_size, )
 
-    def create_weights(self, 
-                       layer: torch.nn.Module,
+    def create_weights(self, layer: torch.nn.Module,
                        input_size_per_partition: int,
-                       output_partition_sizes: List[int], 
-                       input_size: int,
-                       output_size: int, 
-                       params_dtype: torch.dtype,
+                       output_partition_sizes: List[int], input_size: int,
+                       output_size: int, params_dtype: torch.dtype,
                        **extra_weight_attrs):
         del output_size
         output_size_per_partition = sum(output_partition_sizes)
