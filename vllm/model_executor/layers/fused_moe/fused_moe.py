@@ -358,6 +358,9 @@ def fused_experts(
     topk_ids: torch.Tensor,
     inplace: bool = False,
     override_config: Optional[Dict[str, Any]] = None,
+    use_fp8: bool = False,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
 ):
     # Check constraints.
     assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
@@ -463,8 +466,8 @@ def fused_moe(
     inplace: bool = False,
     override_config: Optional[Dict[str, Any]] = None,
     use_fp8: bool = False,
-        w1_scale: Optional[torch.Tensor] = None,
-        w2_scale: Optional[torch.Tensor] = None,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -504,4 +507,7 @@ def fused_moe(
                          topk_weights,
                          topk_ids,
                          inplace=inplace,
-                         override_config=override_config)
+                         override_config=override_config,
+                         use_fp8=use_fp8,
+                         w1_scale=w1_scale,
+                         w2_scale=w2_scale)
