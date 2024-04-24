@@ -496,7 +496,12 @@ def fused_moe(
     assert hidden_states.shape[0] == gating_output.shape[0], (
         "Number of tokens mismatch")
 
-    topk_weights, topk_ids = fused_topk(hidden_states, gating_output,
-                                        topk, renormalize)
-    return fused_experts(hidden_states, w1, w2, topk_weights, topk_ids,
-                         inplace=inplace, override_config=override_config)
+    topk_weights, topk_ids = fused_topk(hidden_states, gating_output, topk,
+                                        renormalize)
+    return fused_experts(hidden_states,
+                         w1,
+                         w2,
+                         topk_weights,
+                         topk_ids,
+                         inplace=inplace,
+                         override_config=override_config)
