@@ -269,6 +269,7 @@ class XFormersImpl(AttentionImpl):
                 output[:num_prefill_tokens] = out
 
         if decode_meta := attn_metadata.decode_metadata:
+            print(f"decode meta,  num_prefill_tokens={num_prefill_tokens}, num_decode_tokens= {num_decode_tokens}")
             if self.sink_size is not None and self.sink_size > 0:
                 self.uprotate_sink_positions(attn_metadata, decode_meta, key, key_cache, rotary_emb)
 
