@@ -235,17 +235,6 @@ class XFormersImpl(AttentionImpl):
             # Prompt run.
             if kv_cache is None or prefill_meta.block_tables.numel() == 0:
                 # normal attention.
-                # block tables are empty if the prompt does not have a cached
-                # prefix.
-                # Rotate sink to the correct position
-                # if self.sink_size is not None:
-                #     ss = self.sink_size
-                #     positions = torch.arange(0, ss).to(key.device)  # for prompt run nothing changes, except cache will store not rotated repr
-                #     q_1, k_1 = rotary_emb(positions,
-                #                                       query.view(num_tokens, -1)[:ss],
-                #                                       key.view(num_tokens, -1)[:ss])
-                #     query[:ss] = q_1.view(-1, self.num_kv_heads, self.head_size)
-                #     key[:ss] = k_1.view(-1, self.num_kv_heads, self.head_size)
                 out = self._run_memory_efficient_xformers_forward(
                     query, key, value, prefill_meta)
                 assert out.shape == output[:num_prefill_tokens].shape
@@ -299,11 +288,11 @@ class XFormersImpl(AttentionImpl):
             # take the blocks that relate to sink tokens
             # rotate them, assigning positions at the end of the sliding window
             # q_len is num_tokens
-            self._uprotate_sink_single_batch(batch_i, batch_i_cl, decode_meta, key, key_cache, rotary_emb,
+            self._uprotate_sink_single_batch(batch_i, batch_i_cl, decode_meta, attn_metadata, key, key_cache, rotary_emb,
                                              self.sink_size, self.cache_size)
 
     @staticmethod
-    def _uprotate_sink_single_batch(batch_i, batch_i_cl, decode_meta, key, key_cache, rotary_emb, sink_size,
+    def _uprotate_sink_single_batch(batch_i, batch_i_cl, decode_meta, attn_metadata, key, key_cache, rotary_emb, sink_size,
                                     cache_size):
         """supports  the case:
         [ ] AR decoding with 1 tokens to generate
