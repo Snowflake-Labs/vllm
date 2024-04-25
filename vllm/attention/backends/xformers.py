@@ -325,7 +325,7 @@ class XFormersImpl(AttentionImpl):
             # find the additional rotations to apply on the sink
             # either we fit in the cache or need to evict one token and uprotate sink on this position.
 
-            positions_one_bs = (torch.ones(1, num_sinks_current).to(key.device) * num_tokens_evicted_this_pass).to(int)
+            positions_one_bs = (torch.ones(1, num_sinks_current*sink_block_size).to(key.device) * num_tokens_evicted_this_pass).to(int)
 
             print(f"_uprotate_sink_single_batch, "
                   f"batch_i = {batch_i},  "
