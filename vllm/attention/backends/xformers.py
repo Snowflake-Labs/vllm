@@ -311,12 +311,14 @@ class XFormersImpl(AttentionImpl):
             [ ] overflowing the cache
         """
         num_decode_tokens_this_pass = 1     # AR generating
+        sink_block_size = 16
         assert batch_i_cl <= cache_size
         num_tokens_evicted_this_pass = int(batch_i_cl == cache_size)
         if num_tokens_evicted_this_pass:
-            num_sinks_current = min(sink_size, batch_i_cl)
+            num_sinks_current = min(sink_size, batch_i_cl) // sink_block_size
             sink_blocks = decode_meta.block_tables[batch_i, :num_sinks_current]
             sink_key_cache = torch.index_select(key_cache, index=sink_blocks, dim=0)
+            print(f"sink_key_cache.shape = {sink_key_cache.shape}")
             sink_key_to_roll = sink_key_cache.view(sink_size, -1)
             dummy_query_to_roll = torch.zeros_like(sink_key_to_roll).to(key.device)
             # we just evicted some tokens from cache, and we need to roll sink on their positions
