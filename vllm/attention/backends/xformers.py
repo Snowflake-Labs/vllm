@@ -291,8 +291,8 @@ class XFormersImpl(AttentionImpl):
             self._uprotate_sink_single_batch(batch_i, batch_i_cl, decode_meta, attn_metadata, key, key_cache, rotary_emb,
                                              self.sink_size, self.cache_size)
 
-    @staticmethod
-    def _uprotate_sink_single_batch(batch_i, batch_i_cl, decode_meta, attn_metadata, key, key_cache, rotary_emb, sink_size,
+    def _uprotate_sink_single_batch(self, batch_i, batch_i_cl, decode_meta, attn_metadata,
+                                    key, key_cache, rotary_emb, sink_size,
                                     cache_size):
         """supports  the case:
         [ ] AR decoding with 1 tokens to generate
@@ -304,10 +304,17 @@ class XFormersImpl(AttentionImpl):
         assert batch_i_cl <= cache_size
         num_tokens_evicted_this_pass = int(batch_i_cl == cache_size)
         if num_tokens_evicted_this_pass:
+            # take into account attn_metadata.slot_mapping?
             num_sinks_current = min(sink_size, batch_i_cl) // sink_block_size
             sink_blocks = decode_meta.block_tables[batch_i, :num_sinks_current]
             sink_key_cache = torch.index_select(key_cache, index=sink_blocks, dim=0)
-            print(f"sink_key_cache.shape = {sink_key_cache.shape}")
+            print(f" before sink_key_cache.shape = {sink_key_cache.shape}")
+            # reshape it to key-like structure
+            #  [num_blocks, num_heads, head_size/x, block_size, x]
+            # sink_key_cache.shape = torch.Size([1, 32, 16, 16, 8])
+            sink_key_cache = PagedAttention.merge_k_cache(sink_key_cache, self.num_kv_heads, self.head_size)
+            print(f"after sink_key_cache.shape =  {sink_key_cache.shape}")
+
             sink_key_to_roll = sink_key_cache.view(sink_size, -1)
             dummy_query_to_roll = torch.zeros_like(sink_key_to_roll).to(key.device)
             # we just evicted some tokens from cache, and we need to roll sink on their positions
