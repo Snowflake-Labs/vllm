@@ -214,6 +214,9 @@ class XFormersImpl(AttentionImpl):
 
         num_prefill_tokens = attn_metadata.num_prefill_tokens
         num_decode_tokens = attn_metadata.num_decode_tokens
+        print(f"num_prefill_tokens = {num_prefill_tokens}"
+              f"num_decode_tokens = {num_decode_tokens}")
+
         assert key.shape[0] == num_prefill_tokens + num_decode_tokens
         assert value.shape[0] == num_prefill_tokens + num_decode_tokens
 
@@ -302,26 +305,36 @@ class XFormersImpl(AttentionImpl):
     @staticmethod
     def _uprotate_sink_single_batch(batch_i, batch_i_cl, decode_meta, key, key_cache, rotary_emb, sink_size,
                                     cache_size):
-        num_sinks_current = min(sink_size, batch_i_cl)
-        sink_blocks = decode_meta.block_tables[batch_i, :num_sinks_current]
-        sink_key_cache = torch.index_select(key_cache, index=sink_blocks, dim=0)
-        sink_key_to_roll = sink_key_cache.view(sink_size, -1)
-        dummy_query_to_roll = torch.zeros_like(sink_key_to_roll).to(key.device)
-        # we just evicted some tokens from cache, and we need to roll sink on their positions
-        # find the additional rotations to apply on the sink
-        num_tokens_evicted_this_pass = max(batch_i_cl - cache_size, 0)  # clip at 0
-        positions_one_bs = (torch.ones(1, num_sinks_current).to(key.device) * num_tokens_evicted_this_pass).to(int)
+        """supports  the case:
+        [ ] AR decoding with 1 tokens to generate
+            [ ] within the cache
+            [ ] overflowing the cache
+        """
+        num_decode_tokens_this_pass = 1     # AR generating
+        assert batch_i_cl <= cache_size
+        num_tokens_evicted_this_pass = int(batch_i_cl == cache_size)
+        if num_tokens_evicted_this_pass:
+            num_sinks_current = min(sink_size, batch_i_cl)
+            sink_blocks = decode_meta.block_tables[batch_i, :num_sinks_current]
+            sink_key_cache = torch.index_select(key_cache, index=sink_blocks, dim=0)
+            sink_key_to_roll = sink_key_cache.view(sink_size, -1)
+            dummy_query_to_roll = torch.zeros_like(sink_key_to_roll).to(key.device)
+            # we just evicted some tokens from cache, and we need to roll sink on their positions
+            # find the additional rotations to apply on the sink
+            # either we fit in the cache or need to evict one token and uprotate sink on this position.
 
-        print(f"_uprotate_sink_single_batch, "
-              f"batch_i = {batch_i},  "
-              f"batch_i_cl = {batch_i_cl},  "
-              f"sink_blocks = {sink_blocks},  "
-              f"num_sinks_current = {num_sinks_current},  "
-              f"num_tokens_evicted_this_pass = {num_tokens_evicted_this_pass},  "
-              )
-        _, _ = rotary_emb(positions_one_bs,
-                          dummy_query_to_roll,
-                          sink_key_to_roll)
+            positions_one_bs = (torch.ones(1, num_sinks_current).to(key.device) * num_tokens_evicted_this_pass).to(int)
+
+            print(f"_uprotate_sink_single_batch, "
+                  f"batch_i = {batch_i},  "
+                  f"batch_i_cl = {batch_i_cl},  "
+                  f"sink_blocks = {sink_blocks},  "
+                  f"num_sinks_current = {num_sinks_current},  "
+                  f"num_tokens_evicted_this_pass = {num_tokens_evicted_this_pass},  "
+                  )
+            _, _ = rotary_emb(positions_one_bs,
+                              dummy_query_to_roll,
+                              sink_key_to_roll)
 
     def _run_memory_efficient_xformers_forward(
         self,
