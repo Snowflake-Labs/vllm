@@ -300,22 +300,25 @@ class XFormersImpl(AttentionImpl):
             [ ] overflowing the cache
         """
         num_decode_tokens_this_pass = 1     # AR generating
-        sink_block_size = 16
+        sink_block_size = key_cache.shape[-2]
         assert batch_i_cl <= cache_size
         num_tokens_evicted_this_pass = int(batch_i_cl == cache_size)
         if num_tokens_evicted_this_pass:
             # take into account attn_metadata.slot_mapping?
-            num_sinks_current = min(sink_size, batch_i_cl) // sink_block_size
+            num_sinks_current = min(sink_size, batch_i_cl) // sink_block_size       # this should be 1 anyway, more may nor be supported
             sink_blocks = decode_meta.block_tables[batch_i, :num_sinks_current]
             sink_key_cache = torch.index_select(key_cache, index=sink_blocks, dim=0)
             print(f" before sink_key_cache.shape = {sink_key_cache.shape}")
+            # sink_key_cache.shape = torch.Size([1, 32, 16, 16, 8])
             # reshape it to key-like structure
             #  [num_blocks, num_heads, head_size/x, block_size, x]
-            # sink_key_cache.shape = torch.Size([1, 32, 16, 16, 8])
-            sink_key_cache = PagedAttention.merge_k_cache(sink_key_cache, self.num_kv_heads, self.head_size)
-            print(f"after sink_key_cache.shape =  {sink_key_cache.shape}")
+            sink_key_cache_reshaped = sink_key_cache.permute(3, 0, 1, 2, 4).reshape(sink_block_size, self.num_kv_heads, self.head_size)
+            print(f"after sink_key_cache_reshaped.shape =  {sink_key_cache_reshaped.shape}")
 
-            sink_key_to_roll = sink_key_cache.view(sink_size, -1)
+            sink_key_to_roll = sink_key_cache_reshaped.view(sink_size, -1)
+
+            assert key_cache[0, 0, 0, 0, 0] == sink_key_to_roll[0, 0]
+            assert key_cache[0, 0, 0, 1, 0] == sink_key_to_roll[1, 0]
             dummy_query_to_roll = torch.zeros_like(sink_key_to_roll).to(key.device)
             # we just evicted some tokens from cache, and we need to roll sink on their positions
             # find the additional rotations to apply on the sink
