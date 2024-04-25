@@ -155,8 +155,11 @@ class XFormersImpl(AttentionImpl):
         self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
         self.sliding_window = sliding_window
         self.sink_size = sink_size
+        self.cache_size = self.sliding_window + self.sink_size
         print(f"self.sliding_window = {self.sliding_window}")
         print(f"self.sink_size = {self.sink_size}")
+        print(f"self.cache_size = {self.cache_size}")
+
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
         self.alibi_slopes = alibi_slopes
@@ -266,39 +269,9 @@ class XFormersImpl(AttentionImpl):
                 output[:num_prefill_tokens] = out
 
         if decode_meta := attn_metadata.decode_metadata:
-            # one single step, everything is in the cache
-            # take the blocks that relate to sink tokens, backup them
-            # rotate them, assigning positions at the end of the sliding window
-            # q_len is num_tokens
-            num_sinks_current = min(self.sink_size, attn_metadata.decode_metadata.context_lens[0])
+            if self.sink_size is not None and self.sink_size > 0:
+                self.uprotate_sink_positions(attn_metadata, decode_meta, key, key_cache, rotary_emb)
 
-            sink_blocks = decode_meta.block_tables[0, :self.sink_size]   # FIXME: multibatch may hurt here
-            sink_key_cache = torch.index_select(key_cache, index=sink_blocks, dim=0)
-            sink_key_to_roll = sink_key_cache.view(self.sink_size, -1)
-
-            dummy_sink_value_cache = torch.index_select(key_cache, index=sink_blocks, dim=0)
-
-            dummy_query_to_roll = torch.zeros_like(sink_key_to_roll)
-            # we just evicted some tokens from cache, and we need to roll sink on their positions
-            # find the additional rotations to apply on the sink
-            rotate_positions = []
-            for batch_i_cl in attn_metadata.decode_metadata.context_lens:
-
-                positions_one_bs = torch.ones(1, num_sinks_current).to(key.device) * batch_i_cl
-                rotate_positions.append(positions_one_bs)
-            rotate_positions = torch.cat(rotate_positions, dim=1)
-            # rotate sink
-            _, k1 = rotary_emb(rotate_positions,
-                                  dummy_query_to_roll,
-                                  sink_key_to_roll)
-            k1 = k1.view(-1, self.num_kv_heads, self.head_size)
-            v1 = dummy_sink_value_cache.view(-1, self.num_kv_heads, self.head_size)
-            # write back to cache
-            PagedAttention.write_to_paged_cache(k1, v1, key_cache,
-                                                value_cache,
-                                                attn_metadata.slot_mapping,
-                                                attn_metadata.kv_cache_dtype,
-                                                kv_scale)
             output[num_prefill_tokens:] = PagedAttention.forward_decode(
                 decode_query,
                 key_cache,
@@ -315,6 +288,39 @@ class XFormersImpl(AttentionImpl):
 
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)
+
+    def uprotate_sink_positions(self, attn_metadata, decode_meta, key, key_cache, rotary_emb):
+        for batch_i, batch_i_cl in enumerate(attn_metadata.decode_metadata.context_lens):
+            # one single step, everything is in the cache
+            # take the blocks that relate to sink tokens
+            # rotate them, assigning positions at the end of the sliding window
+            # q_len is num_tokens
+            self._uprotate_sink_single_batch(batch_i, batch_i_cl, decode_meta, key, key_cache, rotary_emb,
+                                             self.sink_size, self.cache_size)
+
+    @staticmethod
+    def _uprotate_sink_single_batch(batch_i, batch_i_cl, decode_meta, key, key_cache, rotary_emb, sink_size,
+                                    cache_size):
+        num_sinks_current = min(sink_size, batch_i_cl)
+        sink_blocks = decode_meta.block_tables[batch_i, :num_sinks_current]
+        sink_key_cache = torch.index_select(key_cache, index=sink_blocks, dim=0)
+        sink_key_to_roll = sink_key_cache.view(sink_size, -1)
+        dummy_query_to_roll = torch.zeros_like(sink_key_to_roll).to(key.device)
+        # we just evicted some tokens from cache, and we need to roll sink on their positions
+        # find the additional rotations to apply on the sink
+        num_tokens_evicted_this_pass = max(batch_i_cl - cache_size, 0)  # clip at 0
+        positions_one_bs = torch.ones(1, num_sinks_current).to(key.device) * num_tokens_evicted_this_pass
+
+        print(f"_uprotate_sink_single_batch, "
+              f"batch_i = {batch_i},  "
+              f"batch_i_cl = {batch_i_cl},  "
+              f"sink_blocks = {sink_blocks},  "
+              f"num_sinks_current = {num_sinks_current},  "
+              f"num_tokens_evicted_this_pass = {num_tokens_evicted_this_pass},  "
+              )
+        _, _ = rotary_emb(positions_one_bs,
+                          dummy_query_to_roll,
+                          sink_key_to_roll)
 
     def _run_memory_efficient_xformers_forward(
         self,
