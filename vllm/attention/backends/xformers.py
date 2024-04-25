@@ -309,7 +309,7 @@ class XFormersImpl(AttentionImpl):
         # we just evicted some tokens from cache, and we need to roll sink on their positions
         # find the additional rotations to apply on the sink
         num_tokens_evicted_this_pass = max(batch_i_cl - cache_size, 0)  # clip at 0
-        positions_one_bs = torch.ones(1, num_sinks_current).to(key.device) * num_tokens_evicted_this_pass
+        positions_one_bs = (torch.ones(1, num_sinks_current).to(key.device) * num_tokens_evicted_this_pass).to(int)
 
         print(f"_uprotate_sink_single_batch, "
               f"batch_i = {batch_i},  "
