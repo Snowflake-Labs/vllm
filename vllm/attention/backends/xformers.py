@@ -6,9 +6,7 @@ import torch
 from xformers import ops as xops
 from xformers.ops.fmha.attn_bias import (AttentionBias,
                                          BlockDiagonalCausalMask,
-                                         BlockDiagonalCausalLocalAttentionMask,
                                          LowerTriangularMaskWithTensorBias)
-from vllm.attention.backends.causal_and_sink_attn import BlockDiagonalCausalLocalAttentionAndSinkMask
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionMetadata,
                                               AttentionMetadataPerStage)
@@ -284,58 +282,40 @@ class XFormersImpl(AttentionImpl):
 
     def uprotate_sink_positions(self, attn_metadata, decode_meta, key, key_cache, rotary_emb):
         for batch_i, batch_i_cl in enumerate(attn_metadata.decode_metadata.context_lens):
-            # one single step, everything is in the cache
-            # take the blocks that relate to sink tokens
-            # rotate them, assigning positions at the end of the sliding window
-            # q_len is num_tokens
-            self._uprotate_sink_single_batch(batch_i, batch_i_cl, decode_meta, attn_metadata, key, key_cache, rotary_emb,
+            self._uprotate_sink_single_batch(batch_i, batch_i_cl, decode_meta, key, key_cache, rotary_emb,
                                              self.sink_size, self.cache_size)
 
-    def _uprotate_sink_single_batch(self, batch_i, batch_i_cl, decode_meta, attn_metadata,
+    def _uprotate_sink_single_batch(self, batch_i, batch_i_cl, decode_meta,
                                     key, key_cache, rotary_emb, sink_size,
                                     cache_size):
-        """supports  the case:
-        [ ] AR decoding with 1 tokens to generate
-            [ ] within the cache
-            [ ] overflowing the cache
         """
-        num_decode_tokens_this_pass = 1     # AR generating
+            We just evicted some tokens from cache, and we need to roll sink on their positions.
+            Fortunately, rotations are additive, because `rotate(rotate(key, 1), 1) = rotate(key, 2)`,
+            so we can rotate cached keys from the sink by one step each time a token gets evicted.
+            This ensures that the distance between sink and currently generated token is never exceeding cache size
+            (sum of sink and sliding window).
+        """
         sink_block_size = key_cache.shape[-2]
         assert batch_i_cl <= cache_size
         num_tokens_evicted_this_pass = int(batch_i_cl == cache_size)
         if num_tokens_evicted_this_pass:
-            # take into account attn_metadata.slot_mapping?
-            num_sinks_current = min(sink_size, batch_i_cl) // sink_block_size       # this should be 1 anyway, more may nor be supported
+            num_sinks_current = min(sink_size, batch_i_cl) // sink_block_size       # this should be 1 anyway, more may not be supported
             sink_blocks = decode_meta.block_tables[batch_i, :num_sinks_current]
             sink_key_cache = torch.index_select(key_cache, index=sink_blocks, dim=0)
-            print(f" before sink_key_cache.shape = {sink_key_cache.shape}")
-            # sink_key_cache.shape = torch.Size([1, 32, 16, 16, 8])
             # reshape it to key-like structure
             #  [num_blocks, num_heads, head_size/x, block_size, x]
             sink_key_cache_reshaped = sink_key_cache.permute(3, 0, 1, 2, 4).reshape(sink_block_size, self.num_kv_heads, self.head_size)
-            print(f"after sink_key_cache_reshaped.shape =  {sink_key_cache_reshaped.shape}")
-
             sink_key_to_roll = sink_key_cache_reshaped.view(sink_size, -1)
-
-            assert key_cache[0, 0, 0, 0, 0] == sink_key_to_roll[0, 0]
-            assert key_cache[0, 0, 0, 1, 0] == sink_key_to_roll[1, 0]
             dummy_query_to_roll = torch.zeros_like(sink_key_to_roll).to(key.device)
-            # we just evicted some tokens from cache, and we need to roll sink on their positions
-            # find the additional rotations to apply on the sink
-            # either we fit in the cache or need to evict one token and uprotate sink on this position.
-
             positions_one_bs = (torch.ones(1, num_sinks_current*sink_block_size).to(key.device) * num_tokens_evicted_this_pass).to(int)
-
-            print(f"_uprotate_sink_single_batch, "
-                  f"batch_i = {batch_i},  "
-                  f"batch_i_cl = {batch_i_cl},  "
-                  f"sink_blocks = {sink_blocks},  "
-                  f"num_sinks_current = {num_sinks_current},  "
-                  f"num_tokens_evicted_this_pass = {num_tokens_evicted_this_pass},  "
-                  )
-            _, _ = rotary_emb(positions_one_bs,
+            # rotate
+            _, sink_key_to_roll = rotary_emb(positions_one_bs,
                               dummy_query_to_roll,
                               sink_key_to_roll)
+            # rotations are not in place, so we need to save it back
+            x = 16 // key_cache.element_size()
+            key_cache[sink_blocks[0]] = sink_key_to_roll.view(sink_block_size, self.num_kv_heads,
+                                                              self.head_size // x,  x).permute(1, 2, 0, 3)
 
     def _run_memory_efficient_xformers_forward(
         self,
@@ -376,36 +356,11 @@ class XFormersImpl(AttentionImpl):
         # FIXME(woosuk): This is a hack.
         if attn_metadata.attn_bias is None:
             if self.alibi_slopes is None:
-                if self.sink_size is not None:  # Create a custom tensor
-                    from vllm.attention.backends.causal_and_sink_attn import _materialize_causal_mask_with_sink
-
-                    attn_bias = _materialize_causal_mask_with_sink(
-                            (query.shape[0], key.shape[0]),
-                            dtype=key.dtype,
-                            device=key.device,
-                            window_size=self.sliding_window,
-                            sink_size=self.sink_size,
-                        )
-                    # match the shape of B, H, Q, K
-                    attn_bias = attn_bias[None, None, ...].expand(1, query.shape[1], query.shape[0], key.shape[0])
-                # print(f"attn_metadata.prompt_lens = {attn_metadata.prompt_lens}")
-                # attn_bias = BlockDiagonalCausalMask.from_seqlens(
-                #     attn_metadata.prompt_lens)
-                # if self.sliding_window is not None:
-                #     # FIXME [MP]: hack for sink, as dense is still ok in the prompt
-                #     print(f"attn_bias.q_seqinfo = {attn_bias.q_seqinfo}")
-                #     print(f"attn_bias.k_seqinfo = {attn_bias.k_seqinfo}")
-                #     print(f"attn_bias._batch_sizes = {attn_bias._batch_sizes}")
-                #     print(f"self.sliding_window = {self.sliding_window}")
-                #     print(f"self.sink_size = {self.sink_size}")
-                #     attn_bias = BlockDiagonalCausalLocalAttentionAndSinkMask(
-                #         q_seqinfo=attn_bias.q_seqinfo,
-                #         k_seqinfo=attn_bias.k_seqinfo,
-                #         _batch_sizes=attn_bias._batch_sizes,
-                #         _window_size=self.sliding_window,
-                #         _sink_size=self.sink_size,
-                #     )
-                #     # attn_bias = attn_bias.make_local_attention(int(1e5))
+                attn_bias = BlockDiagonalCausalMask.from_seqlens(
+                    attn_metadata.prompt_lens)
+                if self.sliding_window is not None:
+                    attn_bias = attn_bias.make_local_attention(
+                        self.sliding_window)
                 attn_metadata.attn_bias = [attn_bias]
             else:
                 attn_metadata.attn_bias = _make_alibi_bias(

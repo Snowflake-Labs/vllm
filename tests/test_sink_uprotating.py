@@ -3,17 +3,22 @@ import pytest
 from unittest.mock import MagicMock
 
 
+CONTEXT_LEN_1 = list(range(1, 15))
 @pytest.fixture
-def setup_environment():
+def setup_environment(request):
     # Configure a mock environment for testing
+    MAX_BLOCK_PER_ONE_EL = 15
     batch_size = 2
-    num_blocks = 30
+    num_blocks = MAX_BLOCK_PER_ONE_EL * batch_size
     block_size = 5
     num_kv_heads = 3
     head_size = 8
     sliding_window = 4
     sink_size = 2
-    num_tokens = 20  # total tokens
+
+    context_len1 = request.param
+    context_len2 = 1 + (context_len1 + 10) % MAX_BLOCK_PER_ONE_EL       # THIS CANNOT BE 0
+
     hidden_block_size = block_size * num_kv_heads * head_size
     original_shape = (num_kv_heads, block_size, head_size)
 
@@ -21,7 +26,7 @@ def setup_environment():
     key_cache = torch.rand(num_blocks, num_kv_heads, block_size, head_size)
     decode_meta = MagicMock()  # Simulating the metadata
     decode_meta.block_tables = torch.arange(num_blocks).__reversed__().reshape(batch_size, -1)
-    decode_meta.context_lens = torch.randint(low=0, high=num_blocks, size=(batch_size, 1))
+    decode_meta.context_lens = torch.LongTensor((context_len1, context_len2))
 
     def _fake_rotate(x, pos):
         x.add_(pos[0, :, None].repeat(1, x.shape[-1]))
@@ -39,7 +44,7 @@ def setup_environment():
         'original_shape': original_shape,
     }
 
-
+@pytest.mark.parametrize("setup_environment", CONTEXT_LEN_1, indirect=True)
 def test_rotation_logic_multibatch(setup_environment):
     """testing up-rotation logic for the sink during multibatch setup"""
     env = setup_environment
