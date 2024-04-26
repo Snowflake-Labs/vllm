@@ -154,9 +154,6 @@ class XFormersImpl(AttentionImpl):
         self.sliding_window = sliding_window
         self.sink_size = sink_size
         self.cache_size = self.sliding_window + self.sink_size
-        print(f"self.sliding_window = {self.sliding_window}")
-        print(f"self.sink_size = {self.sink_size}")
-        print(f"self.cache_size = {self.cache_size}")
 
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
@@ -212,8 +209,6 @@ class XFormersImpl(AttentionImpl):
 
         num_prefill_tokens = attn_metadata.num_prefill_tokens
         num_decode_tokens = attn_metadata.num_decode_tokens
-        print(f"num_prefill_tokens = {num_prefill_tokens}"
-              f"num_decode_tokens = {num_decode_tokens}")
 
         assert key.shape[0] == num_prefill_tokens + num_decode_tokens
         assert value.shape[0] == num_prefill_tokens + num_decode_tokens
@@ -259,7 +254,6 @@ class XFormersImpl(AttentionImpl):
                 output[:num_prefill_tokens] = out
 
         if decode_meta := attn_metadata.decode_metadata:
-            print(f"decode meta,  num_prefill_tokens={num_prefill_tokens}, num_decode_tokens= {num_decode_tokens}")
             if self.sink_size is not None and self.sink_size > 0:
                 self.uprotate_sink_positions(attn_metadata, decode_meta, key, key_cache, rotary_emb)
 
