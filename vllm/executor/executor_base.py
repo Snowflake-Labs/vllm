@@ -1,3 +1,4 @@
+import asyncio
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -105,14 +106,31 @@ class ExecutorBase(ABC):
 
 class ExecutorAsyncBase(ExecutorBase):
 
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        cache_config: CacheConfig,
+        parallel_config: ParallelConfig,
+        scheduler_config: SchedulerConfig,
+        device_config: DeviceConfig,
+        load_config: LoadConfig,
+        lora_config: Optional[LoRAConfig],
+        vision_language_config: Optional[VisionLanguageConfig],
+        speculative_config: Optional[SpeculativeConfig],
+    ) -> None:
+        self.lock = asyncio.Lock()
+        super().__init__(model_config, cache_config, parallel_config,
+                         scheduler_config, device_config, load_config,
+                         lora_config, vision_language_config,
+                         speculative_config)
+
     @abstractmethod
     async def execute_model_async(
-        self,
-        seq_group_metadata_list: List[SequenceGroupMetadata],
-        blocks_to_swap_in: Dict[int, int],
-        blocks_to_swap_out: Dict[int, int],
-        blocks_to_copy: Dict[int, List[int]],
-    ) -> SamplerOutput:
+            self, seq_group_metadata_list: List[SequenceGroupMetadata],
+            blocks_to_swap_in: Dict[int, int], blocks_to_swap_out: Dict[int,
+                                                                        int],
+            blocks_to_copy: Dict[int, List[int]],
+            virtual_engine: int) -> SamplerOutput:
         """Executes one model step on the given sequences."""
         raise NotImplementedError
 

@@ -17,6 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only GPT-2 model compatible with HuggingFace weights."""
+import re
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -24,7 +25,13 @@ from torch import nn
 from transformers import GPT2Config
 
 from vllm.attention import Attention, AttentionMetadata
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (get_tensor_model_parallel_world_size,
+                              get_pipeline_model_parallel_world_size,
+                              get_pipeline_model_parallel_rank,
+                              is_pipeline_model_parallel_first_rank,
+                              is_pipeline_model_parallel_last_rank,
+                              send_next_rank,
+                              recv_prev_rank)
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                QKVParallelLinear,
@@ -35,7 +42,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding)
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.model_loader.weight_utils import (default_weight_loader, replace_pp_layer_name)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import SamplerOutput
 
@@ -171,12 +178,14 @@ class GPT2Model(nn.Module):
         assert not config.add_cross_attention
         assert not config.scale_attn_by_inverse_layer_idx
         assert not config.reorder_and_upcast_attn
+        assert (config.num_hidden_layers %
+                get_pipeline_model_parallel_world_size() == 0)
         self.embed_dim = config.hidden_size
         self.wte = VocabParallelEmbedding(config.vocab_size, self.embed_dim)
         self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
         self.h = nn.ModuleList([
             GPT2Block(config, quant_config)
-            for _ in range(config.num_hidden_layers)
+            for _ in range(config.num_hidden_layers // get_pipeline_model_parallel_world_size())
         ])
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
@@ -187,15 +196,22 @@ class GPT2Model(nn.Module):
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        inputs_embeds = self.wte(input_ids)
-        position_embeds = self.wpe(position_ids)
-        hidden_states = inputs_embeds + position_embeds
+        if is_pipeline_model_parallel_first_rank():
+            inputs_embeds = self.wte(input_ids)
+            position_embeds = self.wpe(position_ids)
+            hidden_states = inputs_embeds + position_embeds
+        else:
+            sizes = list(input_ids.shape) + [self.embed_dim]
+            hidden_states, = recv_prev_rank(1, sizes, self.wte.weight.dtype, self.wte.weight.device)
 
         for i in range(len(self.h)):
             layer = self.h[i]
             hidden_states = layer(hidden_states, kv_caches[i], attn_metadata)
 
-        hidden_states = self.ln_f(hidden_states)
+        if is_pipeline_model_parallel_last_rank():
+            hidden_states = self.ln_f(hidden_states)
+        else:
+            send_next_rank([hidden_states])
         return hidden_states
 
 
@@ -241,6 +257,11 @@ class GPT2LMHeadModel(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        pattern = r"(transformer\.h\.)(\d+)(\..*)"
+        local_replace = lambda match: replace_pp_layer_name(
+            match, self.config.num_hidden_layers,
+            get_pipeline_model_parallel_world_size(),
+            get_pipeline_model_parallel_rank())
         for name, loaded_weight in weights:
             if "lm_head.weight" in name:
                 # GPT-2 ties the weights of the embedding layer and the final
@@ -252,16 +273,20 @@ class GPT2LMHeadModel(nn.Module):
                 continue
             if not name.startswith("transformer."):
                 name = "transformer." + name
-            param = params_dict[name]
-            # The HF's GPT-2 implementation uses Conv1D instead of Linear.
-            # Because of this, we need to transpose the weights.
-            # Note(zhuohan): the logic below might break quantized models.
-            for conv1d_weight_name in ["c_attn", "c_proj", "c_fc"]:
-                if conv1d_weight_name not in name:
-                    continue
-                if not name.endswith(".weight"):
-                    continue
-                loaded_weight = loaded_weight.t()
-            weight_loader = getattr(param, "weight_loader",
-                                    default_weight_loader)
-            weight_loader(param, loaded_weight)
+            name = re.sub(pattern, local_replace, name)
+            try:
+                param = params_dict[name]
+                # The HF's GPT-2 implementation uses Conv1D instead of Linear.
+                # Because of this, we need to transpose the weights.
+                # Note(zhuohan): the logic below might break quantized models.
+                for conv1d_weight_name in ["c_attn", "c_proj", "c_fc"]:
+                    if conv1d_weight_name not in name:
+                        continue
+                    if not name.endswith(".weight"):
+                        continue
+                    loaded_weight = loaded_weight.t()
+                weight_loader = getattr(param, "weight_loader",
+                                        default_weight_loader)
+                weight_loader(param, loaded_weight)
+            except KeyError:
+                continue

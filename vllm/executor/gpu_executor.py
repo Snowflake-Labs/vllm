@@ -45,7 +45,6 @@ class GPUExecutor(ExecutorBase):
             distributed_init_method=distributed_init_method,
             lora_config=self.lora_config,
             vision_language_config=self.vision_language_config,
-            is_driver_worker=True,
         )
         self.driver_worker.init_device()
         self.driver_worker.load_model()
@@ -163,9 +162,11 @@ class GPUExecutorAsync(GPUExecutor, ExecutorAsyncBase):
         blocks_to_swap_in: Dict[int, int],
         blocks_to_swap_out: Dict[int, int],
         blocks_to_copy: Dict[int, List[int]],
+        virtual_engine: int = 0,
     ) -> SamplerOutput:
         output = await make_async(self.driver_worker.execute_model)(
             seq_group_metadata_list=seq_group_metadata_list,
+            virtual_engine=virtual_engine,
             blocks_to_swap_in=blocks_to_swap_in,
             blocks_to_swap_out=blocks_to_swap_out,
             blocks_to_copy=blocks_to_copy)

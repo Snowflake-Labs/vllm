@@ -5,13 +5,19 @@ from typing import Dict, List, NamedTuple, Optional, Set, Tuple
 
 import numpy as np
 import torch
+import torch.distributed
 import torch.nn as nn
 
 from vllm.attention import (AttentionMetadata, AttentionMetadataPerStage,
                             get_attn_backend)
 from vllm.config import (DeviceConfig, LoadConfig, LoRAConfig, ModelConfig,
                          ParallelConfig, SchedulerConfig, VisionLanguageConfig)
-from vllm.distributed import broadcast_tensor_dict, with_pynccl_for_all_reduce
+from vllm.distributed import (broadcast_tensor_dict,
+                              get_tensor_model_parallel_group,
+                              get_tensor_model_parallel_src_rank,
+                              is_pipeline_model_parallel_last_rank,
+                              is_tensor_model_parallel_first_rank,
+                              with_pynccl_for_all_reduce)
 from vllm.distributed.device_communicators import (custom_all_reduce,
                                                    pynccl_utils)
 from vllm.logger import init_logger
@@ -109,7 +115,6 @@ class ModelRunner:
         load_config: LoadConfig,
         lora_config: Optional[LoRAConfig],
         kv_cache_dtype: Optional[str] = "auto",
-        is_driver_worker: bool = False,
         vision_language_config: Optional[VisionLanguageConfig] = None,
     ):
         self.model_config = model_config
@@ -117,7 +122,6 @@ class ModelRunner:
         self.scheduler_config = scheduler_config
         self.lora_config = lora_config
         self.load_config = load_config
-        self.is_driver_worker = is_driver_worker
 
         # model_config can be None in tests/samplers/test_sampler.py.
         # FIXME(woosuk): This is a hack to make the tests work. Refactor this.
@@ -130,7 +134,9 @@ class ModelRunner:
         # Set after load_model.
         self.lora_manager: LRUCacheWorkerLoRAManager = None
 
-        self.graph_runners: Dict[int, CUDAGraphRunner] = {}
+        self.graph_runners: List[Dict[int, CUDAGraphRunner]] = [
+            {} for _ in range(self.parallel_config.pipeline_parallel_size)
+        ]
         self.graph_memory_pool: Optional[Tuple[
             int, int]] = None  # Set during graph capture.
 
@@ -551,7 +557,8 @@ class ModelRunner:
         seq_group_metadata_list: List[SequenceGroupMetadata],
     ) -> Tuple[torch.Tensor, torch.Tensor, AttentionMetadata, SamplingMetadata,
                Set[LoRARequest], LoRAMapping, torch.Tensor]:
-        if self.is_driver_worker:
+        if get_tensor_model_parallel_src_rank() == torch.distributed.get_rank(
+        ):
             prefill_reqs = []
             decode_reqs = []
             for seq_group_meta in seq_group_metadata_list:
@@ -650,7 +657,9 @@ class ModelRunner:
             else:
                 assert decode_attn_metadata is not None
                 metadata_dict.update(decode_attn_metadata.asdict_zerocopy())
-            broadcast_tensor_dict(metadata_dict, src=0)
+            broadcast_tensor_dict(metadata_dict,
+                                  src=get_tensor_model_parallel_src_rank(),
+                                  group=get_tensor_model_parallel_group())
 
             # Broadcast decode attn metadata for mixed batch type.
             # The additional broadcast costs 300us overhead on 4 A10 GPUs.
@@ -658,9 +667,13 @@ class ModelRunner:
             if batch_type == BatchType.MIXED:
                 assert decode_attn_metadata is not None
                 metadata_dict = decode_attn_metadata.asdict_zerocopy()
-                broadcast_tensor_dict(metadata_dict, src=0)
+                broadcast_tensor_dict(metadata_dict,
+                                      src=get_tensor_model_parallel_src_rank(),
+                                      group=get_tensor_model_parallel_group())
         else:
-            metadata_dict = broadcast_tensor_dict(src=0)
+            metadata_dict = broadcast_tensor_dict(
+                src=get_tensor_model_parallel_src_rank(),
+                group=get_tensor_model_parallel_group())
             input_tokens = metadata_dict.pop("input_tokens")
             input_positions = metadata_dict.pop("input_positions")
             slot_mapping = metadata_dict.pop("slot_mapping")
@@ -693,7 +706,9 @@ class ModelRunner:
             # if it is a mixed batch, decode attn_metadata is broadcasted
             # separately.
             if batch_type == BatchType.MIXED:
-                metadata_dict = broadcast_tensor_dict(src=0)
+                metadata_dict = broadcast_tensor_dict(
+                    src=get_tensor_model_parallel_src_rank(),
+                    group=get_tensor_model_parallel_group())
                 decode_attn_metadata = self.attn_backend.make_metadata(
                     **metadata_dict)
 
@@ -716,6 +731,7 @@ class ModelRunner:
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
         kv_caches: List[torch.Tensor],
+        virtual_engine: int = 0,
     ) -> Optional[SamplerOutput]:
         (input_tokens, input_positions, attn_metadata, sampling_metadata,
          lora_requests, lora_mapping, multi_modal_input
@@ -729,7 +745,8 @@ class ModelRunner:
         decode_meta = attn_metadata.decode_metadata
         if prefill_meta is None and decode_meta.use_cuda_graph:
             graph_batch_size = input_tokens.shape[0]
-            model_executable = self.graph_runners[graph_batch_size]
+            model_executable = self.graph_runners[virtual_engine][
+                graph_batch_size]
         else:
             model_executable = self.model
         execute_model_kwargs = {
@@ -746,7 +763,8 @@ class ModelRunner:
         logits = self.model.compute_logits(hidden_states, sampling_metadata)
 
         # Only perform sampling in the driver worker.
-        if not self.is_driver_worker:
+        if (not (is_pipeline_model_parallel_last_rank()
+                 and is_tensor_model_parallel_first_rank())):
             return None
 
         # Sample the next token.
@@ -851,7 +869,7 @@ class ModelRunner:
         return self.lora_manager.list_loras()
 
     @torch.inference_mode()
-    def capture_model(self, kv_caches: List[torch.Tensor]) -> None:
+    def capture_model(self, kv_caches: List[List[torch.Tensor]]) -> None:
         """Cuda graph capture a model.
 
         Note that CUDA graph's performance gain is negligible if number
@@ -904,48 +922,51 @@ class ModelRunner:
         with custom_all_reduce.capture():
             # NOTE: Capturing the largest batch size first may help reduce the
             # memory usage of CUDA graph.
-            for batch_size in reversed(batch_size_capture_list):
-                # Create dummy attn_metadata.
-                decode_metadata = self.attn_backend.make_metadata(
-                    is_prompt=False,
-                    prompt_lens=None,
-                    prompt_lens_tensor=None,
-                    max_subquery_len=None,
-                    max_context_len=self.max_context_len_to_capture,
-                    max_prompt_len=None,
-                    subquery_start_loc=None,
-                    seq_start_loc=None,
-                    context_lens=context_lens[:batch_size],
-                    block_tables=block_tables[:batch_size],
-                    use_cuda_graph=True,
-                )
-                attn_metadata = AttentionMetadata(
-                    num_prefills=0,
-                    num_prefill_tokens=0,
-                    num_decode_tokens=batch_size,
-                    slot_mapping=slot_mapping[:batch_size],
-                    prefill_metadata=None,
-                    decode_metadata=decode_metadata,
-                    kv_cache_dtype=self.kv_cache_dtype,
-                )
-
-                if self.lora_config:
-                    lora_mapping = LoRAMapping(
-                        [0] * batch_size,
-                        [0] * batch_size,
+            for virtual_engine in range(
+                    self.parallel_config.pipeline_parallel_size):
+                for batch_size in reversed(batch_size_capture_list):
+                    # Create dummy attn_metadata.
+                    decode_metadata = self.attn_backend.make_metadata(
+                        is_prompt=False,
+                        prompt_lens=None,
+                        prompt_lens_tensor=None,
+                        max_subquery_len=None,
+                        max_context_len=self.max_context_len_to_capture,
+                        max_prompt_len=None,
+                        subquery_start_loc=None,
+                        seq_start_loc=None,
+                        context_lens=context_lens[:batch_size],
+                        block_tables=block_tables[:batch_size],
+                        use_cuda_graph=True,
                     )
-                    self.set_active_loras(set(), lora_mapping)
+                    attn_metadata = AttentionMetadata(
+                        num_prefills=0,
+                        num_prefill_tokens=0,
+                        num_decode_tokens=batch_size,
+                        slot_mapping=slot_mapping[:batch_size],
+                        prefill_metadata=None,
+                        decode_metadata=decode_metadata,
+                        kv_cache_dtype=self.kv_cache_dtype,
+                    )
 
-                graph_runner = CUDAGraphRunner(self.model)
-                graph_runner.capture(
-                    input_tokens[:batch_size],
-                    input_positions[:batch_size],
-                    kv_caches,
-                    attn_metadata,
-                    memory_pool=self.graph_memory_pool,
-                )
-                self.graph_memory_pool = graph_runner.graph.pool()
-                self.graph_runners[batch_size] = graph_runner
+                    if self.lora_config:
+                        lora_mapping = LoRAMapping(
+                            [0] * batch_size,
+                            [0] * batch_size,
+                        )
+                        self.set_active_loras(set(), lora_mapping)
+
+                    graph_runner = CUDAGraphRunner(self.model)
+                    graph_runner.capture(
+                        input_tokens[:batch_size],
+                        input_positions[:batch_size],
+                        kv_caches[virtual_engine],
+                        attn_metadata,
+                        memory_pool=self.graph_memory_pool,
+                    )
+                    self.graph_memory_pool = graph_runner.graph.pool()
+                    self.graph_runners[virtual_engine][
+                        batch_size] = graph_runner
 
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time
@@ -959,7 +980,8 @@ class ModelRunner:
         # FIXME(woosuk): This is a bit hacky. Find a more robust solution.
         # TODO(youkaichao): when we get enough user feedback that pynccl is
         # more stable than cupy, we can remove this, e.g. in v0.4.1.
-        self.graph_runners.clear()
+        for graph_runners in self.graph_runners:
+            graph_runners.clear()
         self.pynccl_backend = None
 
     @property
@@ -1039,7 +1061,7 @@ class CUDAGraphRunner:
         attn_metadata: AttentionMetadata,
         **kwargs,
     ) -> torch.Tensor:
-        # KV caches are fixed tensors, so we don't need to copy them.
+        # KV caches are fixed tensors, so we don't need to copy them
         del kv_caches
 
         # Copy the input tensors to the input buffers.

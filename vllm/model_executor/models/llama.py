@@ -21,6 +21,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only LLaMA model compatible with HuggingFace weights."""
+import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
@@ -29,8 +30,13 @@ from transformers import LlamaConfig
 
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import LoRAConfig
-from vllm.distributed import (get_tensor_model_parallel_rank,
-                              get_tensor_model_parallel_world_size)
+from vllm.distributed import (get_pipeline_model_parallel_rank,
+                              get_pipeline_model_parallel_world_size,
+                              get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_world_size,
+                              is_pipeline_model_parallel_first_rank,
+                              is_pipeline_model_parallel_last_rank,
+                              recv_prev_rank, send_next_rank)
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
@@ -44,7 +50,7 @@ from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE, ParallelLMHead, VocabParallelEmbedding)
 from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader, kv_cache_scales_loader)
+    default_weight_loader, kv_cache_scales_loader, replace_pp_layer_name)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import SamplerOutput
 from vllm.utils import is_hip
@@ -264,9 +270,12 @@ class LlamaModel(nn.Module):
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
         )
+        assert (config.num_hidden_layers %
+                get_pipeline_model_parallel_world_size() == 0)
         self.layers = nn.ModuleList([
             LlamaDecoderLayer(config, quant_config)
-            for _ in range(config.num_hidden_layers)
+            for _ in range(config.num_hidden_layers //
+                           get_pipeline_model_parallel_world_size())
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -281,11 +290,21 @@ class LlamaModel(nn.Module):
         attn_metadata: AttentionMetadata,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if inputs_embeds is not None:
-            hidden_states = inputs_embeds
+        if is_pipeline_model_parallel_first_rank():
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.get_input_embeddings(input_ids)
+            residual = None
         else:
-            hidden_states = self.get_input_embeddings(input_ids)
-        residual = None
+            if inputs_embeds is not None:
+                sizes = list(inputs_embeds.size())
+            else:
+                sizes = list(input_ids.size()) + [self.config.hidden_size]
+            hidden_states, residual = recv_prev_rank(
+                2, torch.Size(sizes), self.embed_tokens.weight.dtype,
+                self.embed_tokens.weight.device)
+
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states, residual = layer(
@@ -295,7 +314,11 @@ class LlamaModel(nn.Module):
                 attn_metadata,
                 residual,
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
+
+        if is_pipeline_model_parallel_last_rank():
+            hidden_states, _ = self.norm(hidden_states, residual)
+        else:
+            send_next_rank([hidden_states, residual])
         return hidden_states
 
 
@@ -389,6 +412,11 @@ class LlamaForCausalLM(nn.Module):
             (".gate_up_proj", ".up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
+        pattern = r"(model\.layers\.)(\d+)(\..*)"
+        local_replace = lambda match: replace_pp_layer_name(
+            match, self.config.num_hidden_layers,
+            get_pipeline_model_parallel_world_size(),
+            get_pipeline_model_parallel_rank())
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -404,18 +432,26 @@ class LlamaForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                try:
+                    name = re.sub(pattern, local_replace, name)
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
+                except KeyError:
+                    pass
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
-                weight_loader(param, loaded_weight)
+                try:
+                    name = re.sub(pattern, local_replace, name)
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
+                    weight_loader(param, loaded_weight)
+                except KeyError:
+                    pass
 
     # If this function is called, it should always initialize KV cache scale
     # factors (or else raise an exception). Thus, handled exceptions should
@@ -423,8 +459,10 @@ class LlamaForCausalLM(nn.Module):
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
+        pp_rank = get_pipeline_model_parallel_rank()
+        pp_size = get_pipeline_model_parallel_world_size()
         for layer_idx, scaling_factor in kv_cache_scales_loader(
-                quantization_param_path, tp_rank, tp_size,
+                quantization_param_path, pp_rank, pp_size, tp_rank, tp_size,
                 self.config.num_hidden_layers,
                 self.config.__class__.model_type):
             layer_self_attn = self.model.layers[layer_idx].self_attn

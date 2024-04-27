@@ -275,6 +275,23 @@ def get_pipeline_model_parallel_prev_rank():
     return _PIPELINE_GLOBAL_RANKS[(rank_in_pipeline - 1) % world_size]
 
 
+def is_pipeline_model_parallel_first_rank() -> bool:
+    """Return True if the caller is the first rank in the pipeline"""
+    return get_pipeline_model_parallel_rank() == 0
+
+
+def is_pipeline_model_parallel_last_rank() -> bool:
+    """Return True if the caller is the last rank in the pipeline"""
+    return get_pipeline_model_parallel_rank(
+    ) == get_pipeline_model_parallel_world_size() - 1
+
+
+def is_tensor_model_parallel_first_rank() -> bool:
+    """Return True if the caller is the first rank in the tensor
+    parallel group"""
+    return get_tensor_model_parallel_rank() == 0
+
+
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
     global _TENSOR_MODEL_PARALLEL_GROUP

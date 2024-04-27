@@ -11,7 +11,10 @@ from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
                          VisionLanguageConfig)
 from vllm.distributed import (broadcast_tensor_dict,
                               ensure_model_parallel_initialized,
-                              init_distributed_environment)
+                              get_tensor_model_parallel_group,
+                              get_tensor_model_parallel_src_rank,
+                              init_distributed_environment,
+                              is_tensor_model_parallel_first_rank)
 from vllm.distributed.device_communicators import pynccl_utils
 from vllm.distributed.device_communicators.custom_all_reduce import (
     init_custom_ar)
@@ -77,13 +80,12 @@ class Worker(WorkerBase):
             load_config=load_config,
             lora_config=self.lora_config,
             kv_cache_dtype=self.cache_config.cache_dtype,
-            is_driver_worker=is_driver_worker,
             vision_language_config=vision_language_config,
         )
         # Uninitialized cache engine. Will be initialized by
         # initialize_cache.
-        self.cache_engine: CacheEngine
-        self.gpu_cache: List[torch.Tensor]
+        self.cache_engine: List[CacheEngine]
+        self.gpu_cache: List[List[torch.Tensor]]
 
     def init_device(self) -> None:
         if self.device_config.device.type == "cuda":
@@ -180,10 +182,16 @@ class Worker(WorkerBase):
 
     def _init_cache_engine(self):
         assert self.cache_config.num_gpu_blocks is not None
-        self.cache_engine = CacheEngine(self.cache_config, self.model_config,
-                                        self.parallel_config)
-        self.gpu_cache = self.cache_engine.gpu_cache
-        self.model_runner.set_block_size(self.cache_engine.block_size)
+        self.cache_engine = [
+            CacheEngine(self.cache_config, self.model_config,
+                        self.parallel_config)
+            for _ in range(self.parallel_config.pipeline_parallel_size)
+        ]
+        self.gpu_cache = [
+            self.cache_engine[ve].gpu_cache
+            for ve in range(self.parallel_config.pipeline_parallel_size)
+        ]
+        self.model_runner.set_block_size(self.cache_engine[0].block_size)
 
     def _warm_up_model(self) -> None:
         if not self.model_config.enforce_eager:
@@ -194,6 +202,7 @@ class Worker(WorkerBase):
 
     def cache_swap(
         self,
+        virtual_engine: int,
         blocks_to_swap_in: Dict[int, int],
         blocks_to_swap_out: Dict[int, int],
         blocks_to_copy: Dict[int, List[int]],
@@ -201,11 +210,11 @@ class Worker(WorkerBase):
         # Issue cache operations.
         # TODO(woosuk): Profile swapping overhead and optimize if needed.
         if blocks_to_swap_in:
-            self.cache_engine.swap_in(blocks_to_swap_in)
+            self.cache_engine[virtual_engine].swap_in(blocks_to_swap_in)
         if blocks_to_swap_out:
-            self.cache_engine.swap_out(blocks_to_swap_out)
+            self.cache_engine[virtual_engine].swap_out(blocks_to_swap_out)
         if blocks_to_copy:
-            self.cache_engine.copy(blocks_to_copy)
+            self.cache_engine[virtual_engine].copy(blocks_to_copy)
 
     @torch.inference_mode()
     def execute_model(
@@ -214,40 +223,51 @@ class Worker(WorkerBase):
         blocks_to_swap_in: Optional[Dict[int, int]] = None,
         blocks_to_swap_out: Optional[Dict[int, int]] = None,
         blocks_to_copy: Optional[Dict[int, List[int]]] = None,
+        virtual_engine: int = 0,
         num_lookahead_slots: int = 0,
     ) -> List[SamplerOutput]:
 
-        if self.is_driver_worker:
+        if is_tensor_model_parallel_first_rank():
             assert seq_group_metadata_list is not None
             num_seq_groups = len(seq_group_metadata_list)
             assert blocks_to_swap_in is not None
             assert blocks_to_swap_out is not None
             assert blocks_to_copy is not None
+            assert virtual_engine is not None
             data: Dict[str, Any] = {
                 "num_seq_groups": num_seq_groups,
+                "virtual_engine": virtual_engine,
                 "blocks_to_swap_in": blocks_to_swap_in,
                 "blocks_to_swap_out": blocks_to_swap_out,
                 "blocks_to_copy": blocks_to_copy,
             }
-            broadcast_tensor_dict(data, src=0)
+            broadcast_tensor_dict(data,
+                                  src=get_tensor_model_parallel_src_rank(),
+                                  group=get_tensor_model_parallel_group())
         else:
-            data = broadcast_tensor_dict(src=0)
+            data = broadcast_tensor_dict(
+                src=get_tensor_model_parallel_src_rank(),
+                group=get_tensor_model_parallel_group())
             num_seq_groups = data["num_seq_groups"]
+            virtual_engine = data["virtual_engine"]
             blocks_to_swap_in = data["blocks_to_swap_in"]
             blocks_to_swap_out = data["blocks_to_swap_out"]
             blocks_to_copy = data["blocks_to_copy"]
 
+        assert virtual_engine is not None
         assert blocks_to_swap_in is not None
         assert blocks_to_swap_out is not None
         assert blocks_to_copy is not None
-        self.cache_swap(blocks_to_swap_in, blocks_to_swap_out, blocks_to_copy)
+        self.cache_swap(virtual_engine, blocks_to_swap_in, blocks_to_swap_out,
+                        blocks_to_copy)
 
         # If there is no input, we don't need to execute the model.
         if num_seq_groups == 0:
             return []
 
-        output = self.model_runner.execute_model(seq_group_metadata_list,
-                                                 self.gpu_cache)
+        output = self.model_runner.execute_model(
+            seq_group_metadata_list, self.gpu_cache[virtual_engine],
+            virtual_engine)
 
         # Worker only supports single-step execution. Wrap the output in a list
         # to conform to interface.

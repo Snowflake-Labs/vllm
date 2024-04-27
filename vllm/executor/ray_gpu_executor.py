@@ -65,7 +65,8 @@ class RayGPUExecutor(DistributedGPUExecutor):
 
     def _init_workers_ray(self, placement_group: "PlacementGroup",
                           **ray_remote_kwargs):
-        if self.parallel_config.tensor_parallel_size == 1:
+        if (self.parallel_config.tensor_parallel_size == 1
+                and self.parallel_config.pipeline_parallel_size == 1):
             # For single GPU case, we use a ray worker with constrained memory.
             num_gpus = self.cache_config.gpu_memory_utilization
         else:
@@ -342,12 +343,22 @@ class RayGPUExecutorAsync(RayGPUExecutor, DistributedGPUExecutorAsync):
         if driver_kwargs is None:
             driver_kwargs = kwargs
 
-        coros.append(
-            self.driver_executor(method, *driver_args, **driver_kwargs))
+        # Lock may be provably unnecessary. Nevertheless, should be limited
+        # performance impact.
+        async with self.lock:
+            # Run the driver worker asynchronously.
+            coros.append(
+                self.driver_executor(method, *driver_args, **driver_kwargs))
 
-        # Run the ray workers asynchronously.
-        for worker in self.workers:
-            coros.append(worker.execute_method.remote(method, *args, **kwargs))
+            # Run the ray workers asynchronously.
+            for rank, worker in enumerate(self.workers, start=1):
+                if rank % self.parallel_config.tensor_parallel_size != 0:
+                    coros.append(
+                        worker.execute_method.remote(method, *args, **kwargs))
+                else:
+                    coros.append(
+                        worker.execute_method.remote(method, *driver_args,
+                                                     **driver_kwargs))
 
         all_outputs = await asyncio.gather(*coros)
         return all_outputs

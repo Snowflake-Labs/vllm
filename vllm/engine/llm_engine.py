@@ -101,7 +101,8 @@ class LLMEngine:
             "skip_tokenizer_init=%s, tokenizer_mode=%s, revision=%s, "
             "tokenizer_revision=%s, trust_remote_code=%s, dtype=%s, "
             "max_seq_len=%d, download_dir=%r, load_format=%s, "
-            "tensor_parallel_size=%d, disable_custom_all_reduce=%s"
+            "tensor_parallel_size=%d, pipeline_parallel_size=%d, "
+            "disable_custom_all_reduce=%s, "
             "quantization=%s, enforce_eager=%s, kv_cache_dtype=%s, "
             "quantization_param_path=%s, device_config=%s, "
             "decoding_config=%r, seed=%d)",
@@ -119,6 +120,7 @@ class LLMEngine:
             load_config.download_dir,
             load_config.load_format,
             parallel_config.tensor_parallel_size,
+            parallel_config.pipeline_parallel_size,
             parallel_config.disable_custom_all_reduce,
             model_config.quantization,
             model_config.enforce_eager,
@@ -211,7 +213,11 @@ class LLMEngine:
         # Create the scheduler.
         # NOTE: the cache_config here have been updated with the numbers of
         # GPU and CPU blocks, which are profiled in the distributed executor.
-        self.scheduler = Scheduler(scheduler_config, cache_config, lora_config)
+        self.scheduler = [
+            Scheduler(scheduler_config, cache_config, parallel_config,
+                      lora_config)
+            for _ in range(parallel_config.pipeline_parallel_size)
+        ]
 
         # Metric Logging.
         if self.log_stats:
@@ -442,7 +448,12 @@ class LLMEngine:
                                   arrival_time, lora_request, multi_modal_data)
 
         # Add the sequence group to the scheduler.
-        self.scheduler.add_seq_group(seq_group)
+        costs = [
+            scheduler.get_num_unfinished_seq_groups()
+            for scheduler in self.scheduler
+        ]
+        min_cost_scheduler = self.scheduler[costs.index(min(costs))]
+        min_cost_scheduler.add_seq_group(seq_group)
 
     def abort_request(self, request_id: Union[str, Iterable[str]]) -> None:
         """Aborts a request(s) with the given ID.
@@ -461,7 +472,8 @@ class LLMEngine:
             >>> # abort the request
             >>> engine.abort_request(request_id)
         """
-        self.scheduler.abort_seq_group(request_id)
+        for scheduler in self.scheduler:
+            scheduler.abort_seq_group(request_id)
 
     def get_model_config(self) -> ModelConfig:
         """Gets the model configuration."""
@@ -469,11 +481,13 @@ class LLMEngine:
 
     def get_num_unfinished_requests(self) -> int:
         """Gets the number of unfinished requests."""
-        return self.scheduler.get_num_unfinished_seq_groups()
+        return sum(scheduler.get_num_unfinished_seq_groups()
+                   for scheduler in self.scheduler)
 
     def has_unfinished_requests(self) -> bool:
         """Returns True if there are unfinished requests."""
-        return self.scheduler.has_unfinished_seqs()
+        return any(scheduler.has_unfinished_seqs()
+                   for scheduler in self.scheduler)
 
     def _process_model_outputs(
         self,
@@ -507,7 +521,8 @@ class LLMEngine:
                 self.output_processor.process_outputs(seq_group, outputs)
 
         # Free the finished sequence groups.
-        self.scheduler.free_finished_seq_groups()
+        for scheduler in self.scheduler:
+            scheduler.free_finished_seq_groups()
 
         # Create the outputs.
         request_outputs: List[RequestOutput] = []
@@ -572,7 +587,8 @@ class LLMEngine:
             >>>     if not (engine.has_unfinished_requests() or example_inputs):
             >>>         break
         """
-        seq_group_metadata_list, scheduler_outputs = self.scheduler.schedule()
+        seq_group_metadata_list, scheduler_outputs = self.scheduler[
+            0].schedule()
 
         if not scheduler_outputs.is_empty():
             output = self.model_executor.execute_model(
@@ -616,20 +632,25 @@ class LLMEngine:
 
         # KV Cache Usage in %.
         num_total_gpu = self.cache_config.num_gpu_blocks
-        num_free_gpu = self.scheduler.block_manager.get_num_free_gpu_blocks()
+        num_free_gpu = sum(scheduler.block_manager.get_num_free_gpu_blocks()
+                           for scheduler in self.scheduler)
         gpu_cache_usage = 1.0 - (num_free_gpu / num_total_gpu)
 
         num_total_cpu = self.cache_config.num_cpu_blocks
         cpu_cache_usage = 0.
         if num_total_cpu > 0:
-            num_free_cpu = self.scheduler.block_manager.get_num_free_cpu_blocks(
-            )
+            num_free_cpu = sum(
+                scheduler.block_manager.get_num_free_cpu_blocks()
+                for scheduler in self.scheduler)
             cpu_cache_usage = 1.0 - (num_free_cpu / num_total_cpu)
 
         # Scheduler State
-        num_running = len(self.scheduler.running)
-        num_swapped = len(self.scheduler.swapped)
-        num_waiting = len(self.scheduler.waiting)
+        num_running = sum(
+            len(scheduler.running) for scheduler in self.scheduler)
+        num_swapped = sum(
+            len(scheduler.swapped) for scheduler in self.scheduler)
+        num_waiting = sum(
+            len(scheduler.waiting) for scheduler in self.scheduler)
 
         # Iteration stats if we have scheduler output.
         num_prompt_tokens = 0
