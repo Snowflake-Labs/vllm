@@ -144,6 +144,7 @@ class Worker(WorkerBase):
             "Error in memory profiling. This happens when the GPU memory was "
             "not properly cleaned up before initializing the vLLM instance.")
 
+        # GB = 1024 * 1024 * 1024
         cache_block_size = self.get_cache_block_size_bytes()
         num_gpu_blocks = int(
             (total_gpu_memory * self.cache_config.gpu_memory_utilization -
@@ -152,6 +153,9 @@ class Worker(WorkerBase):
                              cache_block_size)
         num_gpu_blocks = max(num_gpu_blocks, 0)
         num_cpu_blocks = max(num_cpu_blocks, 0)
+        # print(f"======= free_gpu_memory: {free_gpu_memory / GB}, total_gpu_memory: {total_gpu_memory / GB}, "
+        #       f"======= init_gpu_memory: {self.init_gpu_memory / GB}, peak_memory: {peak_memory / GB}, "
+        #       f"======= #num_gpu_blocks: {num_gpu_blocks}, cache_block_size: {cache_block_size}")
         if self.model_runner.lora_manager:
             self.model_runner.remove_all_loras()
         gc.collect()

@@ -4,7 +4,6 @@ from typing import Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
-from transformers import ArcticConfig
 
 from vllm.attention import Attention, AttentionMetadata
 from vllm.distributed import (get_tensor_model_parallel_rank,
@@ -29,6 +28,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.transformers_utils.configs.arctic import ArcticConfig
 from vllm.sequence import SamplerOutput
 
 logger = init_logger(__name__)
