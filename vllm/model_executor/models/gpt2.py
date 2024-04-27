@@ -25,13 +25,12 @@ from torch import nn
 from transformers import GPT2Config
 
 from vllm.attention import Attention, AttentionMetadata
-from vllm.distributed import (get_tensor_model_parallel_world_size,
+from vllm.distributed import (get_pipeline_model_parallel_rank,
                               get_pipeline_model_parallel_world_size,
-                              get_pipeline_model_parallel_rank,
+                              get_tensor_model_parallel_world_size,
                               is_pipeline_model_parallel_first_rank,
                               is_pipeline_model_parallel_last_rank,
-                              send_next_rank,
-                              recv_prev_rank)
+                              recv_prev_rank, send_next_rank)
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                QKVParallelLinear,
@@ -42,7 +41,8 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding)
-from vllm.model_executor.model_loader.weight_utils import (default_weight_loader, replace_pp_layer_name)
+from vllm.model_executor.model_loader.weight_utils import (
+    default_weight_loader, replace_pp_layer_name)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import SamplerOutput
 
@@ -185,7 +185,8 @@ class GPT2Model(nn.Module):
         self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
         self.h = nn.ModuleList([
             GPT2Block(config, quant_config)
-            for _ in range(config.num_hidden_layers // get_pipeline_model_parallel_world_size())
+            for _ in range(config.num_hidden_layers //
+                           get_pipeline_model_parallel_world_size())
         ])
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
@@ -202,7 +203,8 @@ class GPT2Model(nn.Module):
             hidden_states = inputs_embeds + position_embeds
         else:
             sizes = list(input_ids.shape) + [self.embed_dim]
-            hidden_states, = recv_prev_rank(1, sizes, self.wte.weight.dtype, self.wte.weight.device)
+            hidden_states, = recv_prev_rank(1, sizes, self.wte.weight.dtype,
+                                            self.wte.weight.device)
 
         for i in range(len(self.h)):
             layer = self.h[i]
