@@ -3,7 +3,7 @@ from unittest.mock import MagicMock
 
 import pytest  # noqa
 
-from vllm.config import CacheConfig, SchedulerConfig
+from vllm.config import CacheConfig, ParallelConfig, SchedulerConfig
 from vllm.core.scheduler import Scheduler
 from vllm.sequence import Logprob, SequenceGroup
 
@@ -39,7 +39,9 @@ def test_simple():
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 8
     cache_config.num_gpu_blocks = 8
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    parallel_config = ParallelConfig(1, 1, False)
+    scheduler = Scheduler(scheduler_config, cache_config, parallel_config,
+                          None)
     running: List[SequenceGroup] = []
 
     # Add seq groups to scheduler.
@@ -81,7 +83,9 @@ def test_chunk():
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 8
     cache_config.num_gpu_blocks = 8
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    parallel_config = ParallelConfig(1, 1, False)
+    scheduler = Scheduler(scheduler_config, cache_config, parallel_config,
+                          None)
     running: List[SequenceGroup] = []
 
     # Add seq groups to scheduler.
@@ -124,7 +128,9 @@ def test_complex():
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 8
     cache_config.num_gpu_blocks = 8
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    parallel_config = ParallelConfig(1, 1, False)
+    scheduler = Scheduler(scheduler_config, cache_config, parallel_config,
+                          None)
     running: List[SequenceGroup] = []
 
     # Add seq groups to scheduler.
@@ -188,7 +194,9 @@ def test_maximal_decoding():
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 8
     cache_config.num_gpu_blocks = 8
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    parallel_config = ParallelConfig(1, 1, False)
+    scheduler = Scheduler(scheduler_config, cache_config, parallel_config,
+                          None)
     running: List[SequenceGroup] = []
 
     # Add seq groups to scheduler.
@@ -275,7 +283,9 @@ def test_prompt_limit():
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 8
     cache_config.num_gpu_blocks = 8
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    parallel_config = ParallelConfig(1, 1, False)
+    scheduler = Scheduler(scheduler_config, cache_config, parallel_config,
+                          None)
     running: List[SequenceGroup] = []
 
     _, seq_group = create_dummy_prompt("1", prompt_length=48)
@@ -304,7 +314,9 @@ def test_prompt_limit_exceed():
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 8
     cache_config.num_gpu_blocks = 8
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    parallel_config = ParallelConfig(1, 1, False)
+    scheduler = Scheduler(scheduler_config, cache_config, parallel_config,
+                          None)
     running: List[SequenceGroup] = []
 
     _, seq_group = create_dummy_prompt("2", prompt_length=48)
@@ -329,7 +341,9 @@ def test_swap():
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 8
     cache_config.num_gpu_blocks = 8
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    parallel_config = ParallelConfig(1, 1, False)
+    scheduler = Scheduler(scheduler_config, cache_config, parallel_config,
+                          None)
 
     _, seq_group = create_dummy_prompt("1", prompt_length=60, best_of=2)
     scheduler.add_seq_group(seq_group)
@@ -380,7 +394,9 @@ def test_running_prefill_prioritized_over_swap():
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 8
     cache_config.num_gpu_blocks = 8
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    parallel_config = ParallelConfig(1, 1, False)
+    scheduler = Scheduler(scheduler_config, cache_config, parallel_config,
+                          None)
 
     _, seq_group = create_dummy_prompt("1", prompt_length=60, best_of=2)
     scheduler.add_seq_group(seq_group)
@@ -528,7 +544,9 @@ def test_chunked_prefill_max_seqs():
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 8
     cache_config.num_gpu_blocks = 8
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    parallel_config = ParallelConfig(1, 1, False)
+    scheduler = Scheduler(scheduler_config, cache_config, parallel_config,
+                          None)
     running = []
 
     _, seq_group = create_dummy_prompt("1", prompt_length=65)
