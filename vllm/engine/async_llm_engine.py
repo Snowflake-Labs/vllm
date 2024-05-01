@@ -489,9 +489,7 @@ class AsyncLLMEngine:
             pipeline_parallel_size = 1  # type: ignore
         else:
             pipeline_parallel_size = self.engine.parallel_config.pipeline_parallel_size
-        has_requests_in_progress = [
-            False
-        ] * pipeline_parallel_size
+        has_requests_in_progress = [False] * pipeline_parallel_size
         while True:
             if not any(has_requests_in_progress):
                 logger.debug("Waiting for new requests...")
@@ -500,12 +498,10 @@ class AsyncLLMEngine:
                 requests_in_progress = [
                     asyncio.create_task(
                         asyncio.wait_for(self.engine_step(ve),
-                                         ENGINE_ITERATION_TIMEOUT_S)) for ve in
-                    range(pipeline_parallel_size)
+                                         ENGINE_ITERATION_TIMEOUT_S))
+                    for ve in range(pipeline_parallel_size)
                 ]
-                has_requests_in_progress = [
-                    True
-                ] * pipeline_parallel_size
+                has_requests_in_progress = [True] * pipeline_parallel_size
 
             # Abort if iteration takes too long due to unrecoverable errors
             # (eg. NCCL timeouts).
