@@ -9,11 +9,13 @@ import torch.nn.functional as F
 from transformers import PretrainedConfig
 
 from vllm.config import LoRAConfig
-from vllm.distributed import (
-    get_tensor_model_parallel_rank, get_tensor_model_parallel_src_rank,
-    get_tensor_model_parallel_world_size, split_tensor_along_last_dim,
-    tensor_model_parallel_all_gather, tensor_model_parallel_all_reduce,
-    tensor_model_parallel_gather)
+from vllm.distributed import (get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_src_rank,
+                              get_tensor_model_parallel_world_size,
+                              split_tensor_along_last_dim,
+                              tensor_model_parallel_all_gather,
+                              tensor_model_parallel_all_reduce,
+                              tensor_model_parallel_gather)
 from vllm.distributed.utils import divide
 from vllm.lora.punica import add_lora, add_lora_slice, bgmv
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,

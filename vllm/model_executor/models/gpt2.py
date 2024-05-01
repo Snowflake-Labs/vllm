@@ -17,7 +17,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only GPT-2 model compatible with HuggingFace weights."""
-import re
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -27,6 +26,7 @@ from transformers import GPT2Config
 from vllm.attention import Attention, AttentionMetadata
 from vllm.distributed import (get_pipeline_model_parallel_rank,
                               get_pipeline_model_parallel_world_size,
+                              get_pp_indices,
                               get_tensor_model_parallel_world_size,
                               is_pipeline_model_parallel_first_rank,
                               is_pipeline_model_parallel_last_rank,
@@ -41,8 +41,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding)
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader, replace_pp_layer_name)
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import SamplerOutput
 
@@ -183,11 +182,17 @@ class GPT2Model(nn.Module):
         self.embed_dim = config.hidden_size
         self.wte = VocabParallelEmbedding(config.vocab_size, self.embed_dim)
         self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
-        self.h = nn.ModuleList([
-            GPT2Block(config, quant_config)
-            for _ in range(config.num_hidden_layers //
-                           get_pipeline_model_parallel_world_size())
-        ])
+        self.start_layer, self.end_layer = get_pp_indices(
+            config.num_hidden_layers, get_pipeline_model_parallel_rank(),
+            get_pipeline_model_parallel_world_size())
+        self.h = nn.ModuleList(
+            [nn.Identity() for _ in range(self.start_layer)] + [
+                GPT2Block(config, quant_config)
+                for _ in range(self.start_layer, self.end_layer)
+            ] + [
+                nn.Identity()
+                for _ in range(self.end_layer, config.num_hidden_layers)
+            ])
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
     def forward(
@@ -206,9 +211,11 @@ class GPT2Model(nn.Module):
             hidden_states, = recv_prev_rank(1, sizes, self.wte.weight.dtype,
                                             self.wte.weight.device)
 
-        for i in range(len(self.h)):
+        for i in range(self.start_layer, self.end_layer):
             layer = self.h[i]
-            hidden_states = layer(hidden_states, kv_caches[i], attn_metadata)
+            hidden_states = layer(hidden_states,
+                                  kv_caches[i - self.start_layer],
+                                  attn_metadata)
 
         if is_pipeline_model_parallel_last_rank():
             hidden_states = self.ln_f(hidden_states)
@@ -259,11 +266,6 @@ class GPT2LMHeadModel(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
-        pattern = r"(transformer\.h\.)(\d+)(\..*)"
-        local_replace = lambda match: replace_pp_layer_name(
-            match, self.config.num_hidden_layers,
-            get_pipeline_model_parallel_world_size(),
-            get_pipeline_model_parallel_rank())
         for name, loaded_weight in weights:
             if "lm_head.weight" in name:
                 # GPT-2 ties the weights of the embedding layer and the final
@@ -275,7 +277,6 @@ class GPT2LMHeadModel(nn.Module):
                 continue
             if not name.startswith("transformer."):
                 name = "transformer." + name
-            name = re.sub(pattern, local_replace, name)
             try:
                 param = params_dict[name]
                 # The HF's GPT-2 implementation uses Conv1D instead of Linear.

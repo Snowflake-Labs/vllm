@@ -369,22 +369,3 @@ def initialize_dummy_weights(
     for param in model.state_dict().values():
         if torch.is_floating_point(param):
             param.data.uniform_(low, high)
-
-
-def replace_pp_layer_name(match, num_layers, pp_world_size, pp_rank):
-    """
-    This replaces the layer name in the checkpoint with the correct layer name 
-    for the current rank. E.G. for pipeline stage 1, for a model with 8 layers
-    and 2 PP stages we might need to load the checkpoint with layers 4-7, but
-    the models named parameters have layers 0-3 since we only have 4 layers
-    per stage. This function uses regex to subtract the correct number of
-    layers from the layer name. For example, with a name like
-    model.layers.5.linear.weight, this function will replace the 5 with 1 when
-    used with a pattern where the middle group will be the number of layers
-    and the first group is the prefix to the layer number.
-    """
-    original_number = int(match.group(2))
-    pipeline_layers_per_stage = num_layers // pp_world_size
-    subtract_from_layer = pp_rank * pipeline_layers_per_stage
-    replacement_number = original_number - subtract_from_layer
-    return f"{match.group(1)}{replacement_number}{match.group(3)}"

@@ -21,7 +21,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only LLaMA model compatible with HuggingFace weights."""
-import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
@@ -32,7 +31,7 @@ from vllm.attention import Attention, AttentionMetadata
 from vllm.config import LoRAConfig
 from vllm.distributed import (get_pipeline_model_parallel_rank,
                               get_pipeline_model_parallel_world_size,
-                              get_tensor_model_parallel_rank,
+                              get_pp_indices, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               is_pipeline_model_parallel_first_rank,
                               is_pipeline_model_parallel_last_rank,
@@ -50,7 +49,7 @@ from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE, ParallelLMHead, VocabParallelEmbedding)
 from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader, kv_cache_scales_loader, replace_pp_layer_name)
+    default_weight_loader, kv_cache_scales_loader)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import SamplerOutput
 from vllm.utils import is_hip
@@ -272,11 +271,17 @@ class LlamaModel(nn.Module):
         )
         assert (config.num_hidden_layers %
                 get_pipeline_model_parallel_world_size() == 0)
-        self.layers = nn.ModuleList([
-            LlamaDecoderLayer(config, quant_config)
-            for _ in range(config.num_hidden_layers //
-                           get_pipeline_model_parallel_world_size())
-        ])
+        self.start_layer, self.end_layer = get_pp_indices(
+            config.num_hidden_layers, get_pipeline_model_parallel_rank(),
+            get_pipeline_model_parallel_world_size())
+        self.layers = nn.ModuleList(
+            [nn.Identity() for _ in range(self.start_layer)] + [
+                LlamaDecoderLayer(config, quant_config)
+                for _ in range(self.start_layer, self.end_layer)
+            ] + [
+                nn.Identity()
+                for _ in range(self.end_layer, config.num_hidden_layers)
+            ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -305,12 +310,12 @@ class LlamaModel(nn.Module):
                 2, torch.Size(sizes), self.embed_tokens.weight.dtype,
                 self.embed_tokens.weight.device)
 
-        for i in range(len(self.layers)):
+        for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
-                kv_caches[i],
+                kv_caches[i - self.start_layer],
                 attn_metadata,
                 residual,
             )
@@ -412,11 +417,6 @@ class LlamaForCausalLM(nn.Module):
             (".gate_up_proj", ".up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
-        pattern = r"(model\.layers\.)(\d+)(\..*)"
-        local_replace = lambda match: replace_pp_layer_name(
-            match, self.config.num_hidden_layers,
-            get_pipeline_model_parallel_world_size(),
-            get_pipeline_model_parallel_rank())
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -433,7 +433,6 @@ class LlamaForCausalLM(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 try:
-                    name = re.sub(pattern, local_replace, name)
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(param, loaded_weight, shard_id)
@@ -445,7 +444,6 @@ class LlamaForCausalLM(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 try:
-                    name = re.sub(pattern, local_replace, name)
                     param = params_dict[name]
                     weight_loader = getattr(param, "weight_loader",
                                             default_weight_loader)
