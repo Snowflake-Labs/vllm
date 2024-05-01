@@ -37,11 +37,11 @@ def set_pynccl_stream(stream: torch.cuda.Stream):
         pass
 
 
-def init_process_group(group: Optional[ProcessGroup] = None) -> None:
+def init_process_group(group: Optional[ProcessGroup] = None, src_rank: int = 0) -> None:
     assert not is_initialized()
     global comm
     logger.info("vLLM is using nccl==%s", ncclGetVersion())
-    comm = NCCLCommunicator(group=group)
+    comm = NCCLCommunicator(group=group, src_rank=src_rank)
 
 
 def all_reduce(input_: torch.Tensor, op=ReduceOp.SUM) -> None:
