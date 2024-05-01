@@ -212,7 +212,6 @@ class NCCLCommunicator:
     def __init__(
         self,
         group: Optional[ProcessGroup] = None,
-        src_rank: int = 0,
         device: Optional[Union[int, str, torch.device]] = None,
     ):
         """
@@ -236,7 +235,7 @@ class NCCLCommunicator:
         else:
             self.unique_id = NcclUniqueId()
         tensor = torch.ByteTensor(list(self.unique_id.internal))
-        dist.broadcast(tensor, src=src_rank, group=group)
+        dist.broadcast(tensor, src=0, group=group)
         byte_list = tensor.tolist()
         for i, byte in enumerate(byte_list):
             self.unique_id.internal[i] = byte

@@ -14,8 +14,7 @@ from vllm.distributed import (broadcast_tensor_dict,
                               get_tensor_model_parallel_group,
                               get_tensor_model_parallel_src_rank,
                               init_distributed_environment,
-                              is_tensor_model_parallel_first_rank,
-                              get_cpu_tensor_model_parallel_group)
+                              is_tensor_model_parallel_first_rank)
 from vllm.distributed.device_communicators import pynccl_utils
 from vllm.distributed.device_communicators.custom_all_reduce import (
     init_custom_ar)
@@ -309,23 +308,22 @@ def init_worker_distributed_environment(
     init_distributed_environment(parallel_config.world_size, rank,
                                  distributed_init_method, local_rank)
 
-    ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
-                                      parallel_config.pipeline_parallel_size)
-
     if pynccl_utils.is_initialized():
-        pynccl_tensor_parallel_size = pynccl_utils.get_world_size()
-        if pynccl_tensor_parallel_size != parallel_config.tensor_parallel_size:
+        pynccl_world_size = pynccl_utils.get_world_size()
+        if pynccl_world_size != parallel_config.world_size:
             raise RuntimeError(
                 "pynccl is already initialized but the pynccl world "
                 "size does not match parallel_config.world_size "
-                f"({pynccl_tensor_parallel_size} vs. {parallel_config.tensor_parallel_size}).")
-    elif parallel_config.tensor_parallel_size > 1:
+                f"({pynccl_world_size} vs. {parallel_config.world_size}).")
+    elif parallel_config.world_size > 1:
         # NOTE(woosuk): We don't initialize pynccl process group when world size
         # is 1.
         # NOTE(kaichao): By default, pynccl will use information inside
         # `parallel_state` for initialization.
-        pynccl_utils.init_process_group(group=get_cpu_tensor_model_parallel_group(),
-                                        src_rank=get_tensor_model_parallel_src_rank())
+        pynccl_utils.init_process_group()
+
+    ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
+                                      parallel_config.pipeline_parallel_size)
 
     # Initialize a custom fast all-reduce implementation.
     if not parallel_config.disable_custom_all_reduce:
