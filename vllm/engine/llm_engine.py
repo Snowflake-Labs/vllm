@@ -491,7 +491,9 @@ class LLMEngine:
 
     def has_unfinished_requests_for_virtual_engine(
             self, virtual_engine: int) -> bool:
-        """Returns True if there are unfinished requests for the virtual engine."""
+        """
+        Returns True if there are unfinished requests for the virtual engine.
+        """
         return self.scheduler[virtual_engine].has_unfinished_seqs()
 
     def _process_model_outputs(

@@ -513,8 +513,9 @@ class AsyncLLMEngine:
                     result = task.result()
                     virtual_engine = requests_in_progress.index(task)
                     if self.engine_use_ray:
-                        has_unfinished_requests = await self.engine.has_unfinished_requests_for_virtual_engine.remote(
-                            virtual_engine)  # type: ignore
+                        has_unfinished_requests = \
+                            await self.engine.\
+                                  has_unfinished_requests_for_virtual_engine.remote(virtual_engine) # type: ignore
                     else:
                         has_unfinished_requests = self.engine.scheduler[
                             virtual_engine].has_unfinished_seqs()

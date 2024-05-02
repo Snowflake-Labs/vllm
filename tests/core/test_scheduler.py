@@ -5,7 +5,8 @@ from unittest.mock import MagicMock
 
 import pytest  # noqa
 
-from vllm.config import CacheConfig, LoRAConfig, ParallelConfig, SchedulerConfig
+from vllm.config import (CacheConfig, LoRAConfig, ParallelConfig,
+                         SchedulerConfig)
 from vllm.core.interfaces import AllocStatus
 from vllm.core.policy import PolicyFactory
 from vllm.core.scheduler import Scheduler, SchedulingBudget
