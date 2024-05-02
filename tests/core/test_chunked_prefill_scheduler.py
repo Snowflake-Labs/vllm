@@ -483,7 +483,9 @@ def test_chunked_prefill_preempt():
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 8
     cache_config.num_gpu_blocks = 8
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    parallel_config = ParallelConfig(1, 1, False)
+    scheduler = Scheduler(scheduler_config, cache_config, parallel_config,
+                          None)
 
     _, seq_group = create_dummy_prompt("1", prompt_length=60)
     scheduler.add_seq_group(seq_group)

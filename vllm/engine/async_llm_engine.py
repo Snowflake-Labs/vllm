@@ -512,8 +512,13 @@ class AsyncLLMEngine:
                 for task in done:
                     result = task.result()
                     virtual_engine = requests_in_progress.index(task)
-                    if result or self.engine.scheduler[
-                            virtual_engine].has_unfinished_seqs():
+                    if self.engine_use_ray:
+                        has_unfinished_requests = await self.engine.has_unfinished_requests_for_virtual_engine.remote(
+                            virtual_engine)  # type: ignore
+                    else:
+                        has_unfinished_requests = self.engine.scheduler[
+                            virtual_engine].has_unfinished_seqs()
+                    if result or has_unfinished_requests:
                         requests_in_progress[
                             virtual_engine] = asyncio.create_task(
                                 asyncio.wait_for(

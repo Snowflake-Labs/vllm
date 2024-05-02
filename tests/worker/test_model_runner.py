@@ -282,8 +282,7 @@ def test_hybrid_batches(batch_size, enforce_eager, monkeypatch):
                                scheduler_config=scheduler_config,
                                device_config=None,
                                load_config=None,
-                               lora_config=None,
-                               is_driver_worker=True)
+                               lora_config=None)
     model_runner.set_block_size(16)
 
     # Add prefill requests.

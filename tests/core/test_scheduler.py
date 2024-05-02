@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest  # noqa
 
-from vllm.config import CacheConfig, LoRAConfig, SchedulerConfig
+from vllm.config import CacheConfig, LoRAConfig, ParallelConfig, SchedulerConfig
 from vllm.core.interfaces import AllocStatus
 from vllm.core.policy import PolicyFactory
 from vllm.core.scheduler import Scheduler, SchedulingBudget
@@ -45,7 +45,9 @@ def test_scheduler_add_seq_group():
     cache_config = CacheConfig(block_size, 1.0, 1, cache_dtype="auto")
     cache_config.num_cpu_blocks = 4
     cache_config.num_gpu_blocks = 4
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    parallel_config = ParallelConfig(1, 1, False)
+    scheduler = Scheduler(scheduler_config, cache_config, parallel_config,
+                          None)
 
     # Add seq group to scheduler.
     num_seq_group = 4
@@ -61,7 +63,9 @@ def test_scheduler_abort_seq_group():
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 4
     cache_config.num_gpu_blocks = 4
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    parallel_config = ParallelConfig(1, 1, False)
+    scheduler = Scheduler(scheduler_config, cache_config, parallel_config,
+                          None)
 
     # Add multiple seq groups to scheduler.
     num_seq_group = 4
@@ -85,7 +89,9 @@ def test_scheduler_schedule_simple():
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 8
     cache_config.num_gpu_blocks = 8
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    parallel_config = ParallelConfig(1, 1, False)
+    scheduler = Scheduler(scheduler_config, cache_config, parallel_config,
+                          None)
     running: List[SequenceGroup] = []
 
     # Add seq groups to scheduler.
@@ -124,7 +130,9 @@ def test_scheduler_prefill_prioritized():
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 2
     cache_config.num_gpu_blocks = 2
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    parallel_config = ParallelConfig(1, 1, False)
+    scheduler = Scheduler(scheduler_config, cache_config, parallel_config,
+                          None)
 
     # Add seq groups to scheduler.
     _, seq_group_a = create_dummy_prompt("1", 1)
@@ -151,7 +159,9 @@ def test_scheduler_schedule_preempt_abort():
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 2
     cache_config.num_gpu_blocks = 2
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    parallel_config = ParallelConfig(1, 1, False)
+    scheduler = Scheduler(scheduler_config, cache_config, parallel_config,
+                          None)
 
     # Add seq groups to scheduler.
     seq_a, seq_group_a = create_dummy_prompt("1", block_size)
@@ -201,7 +211,9 @@ def test_scheduler_max_seqs():
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 8
     cache_config.num_gpu_blocks = 8
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    parallel_config = ParallelConfig(1, 1, False)
+    scheduler = Scheduler(scheduler_config, cache_config, parallel_config,
+                          None)
 
     all_seq_groups: List[SequenceGroup] = []
     # Add seq groups to scheduler.
@@ -239,7 +251,9 @@ def test_scheduler_delay_factor():
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 8
     cache_config.num_gpu_blocks = 8
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    parallel_config = ParallelConfig(1, 1, False)
+    scheduler = Scheduler(scheduler_config, cache_config, parallel_config,
+                          None)
 
     # schedule first prompt
     seq_group_meta, seq_group = create_dummy_prompt("0",
@@ -320,7 +334,9 @@ def initialize_scheduler(*,
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 8
     cache_config.num_gpu_blocks = 8
-    scheduler = Scheduler(scheduler_config, cache_config, lora_config)
+    parallel_config = ParallelConfig(1, 1, False)
+    scheduler = Scheduler(scheduler_config, cache_config, parallel_config,
+                          lora_config)
     return scheduler
 
 

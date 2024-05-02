@@ -489,6 +489,11 @@ class LLMEngine:
         return any(scheduler.has_unfinished_seqs()
                    for scheduler in self.scheduler)
 
+    def has_unfinished_requests_for_virtual_engine(
+            self, virtual_engine: int) -> bool:
+        """Returns True if there are unfinished requests for the virtual engine."""
+        return self.scheduler[virtual_engine].has_unfinished_seqs()
+
     def _process_model_outputs(
         self,
         output: List[SamplerOutput],
@@ -587,6 +592,10 @@ class LLMEngine:
             >>>     if not (engine.has_unfinished_requests() or example_inputs):
             >>>         break
         """
+        if self.parallel_config.pipeline_parallel_size > 1:
+            raise NotImplementedError(
+                "Pipeline parallelism is only supported through AsyncLLMEngine "
+                "as performance will be severely degraded otherwise.")
         seq_group_metadata_list, scheduler_outputs = self.scheduler[
             0].schedule()
 

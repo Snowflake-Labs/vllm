@@ -118,7 +118,6 @@ class ModelRunner:
         vision_language_config: Optional[VisionLanguageConfig] = None,
     ):
         self.model_config = model_config
-        self.parallel_config = parallel_config
         self.scheduler_config = scheduler_config
         self.lora_config = lora_config
         self.load_config = load_config
@@ -129,14 +128,14 @@ class ModelRunner:
                                if model_config is not None else None)
         self.device_config = (device_config
                               if device_config is not None else DeviceConfig())
+        self.parallel_config = (parallel_config if parallel_config is not None
+                                else ParallelConfig(1, 1, False))
         self.device = self.device_config.device
 
         # Set after load_model.
         self.lora_manager: LRUCacheWorkerLoRAManager = None
 
-        num_graph_runners = self.parallel_config.pipeline_parallel_size if \
-                            self.parallel_config.pipeline_parallel_size \
-                            is not None else 1
+        num_graph_runners = self.parallel_config.pipeline_parallel_size
         self.graph_runners: List[Dict[int, CUDAGraphRunner]] = [
             {} for _ in range(num_graph_runners)
         ]

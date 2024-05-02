@@ -24,13 +24,11 @@ from torch import nn
 from transformers import GPT2Config
 
 from vllm.attention import Attention, AttentionMetadata
-from vllm.distributed import (get_pipeline_model_parallel_rank,
-                              get_pipeline_model_parallel_world_size,
-                              get_pp_indices,
-                              get_tensor_model_parallel_world_size,
-                              is_pipeline_model_parallel_first_rank,
-                              is_pipeline_model_parallel_last_rank,
-                              recv_prev_rank, send_next_rank)
+from vllm.distributed import (
+    get_pipeline_model_parallel_rank, get_pipeline_model_parallel_world_size,
+    get_pp_indices, get_tensor_model_parallel_world_size,
+    is_pipeline_model_parallel_first_rank,
+    is_pipeline_model_parallel_last_rank, recv_prev_rank, send_next_rank)
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                QKVParallelLinear,
