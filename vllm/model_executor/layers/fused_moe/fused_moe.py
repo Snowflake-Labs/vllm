@@ -265,7 +265,7 @@ def fused_moe_kernel_fp8(
 
         # (TODO: Reza) check if using bf16 scales is possible. 
         # Or, we could even move the scale after MMA!
-        b = b * scale[None, :].to(compute_type)
+        b = (b * scale[None, :]).to(compute_type)
         accumulator += tl.dot(a, b)
 
         # Advance the ptrs to the next K block.
