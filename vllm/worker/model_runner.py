@@ -559,8 +559,7 @@ class ModelRunner:
         seq_group_metadata_list: List[SequenceGroupMetadata],
     ) -> Tuple[torch.Tensor, torch.Tensor, AttentionMetadata, SamplingMetadata,
                Set[LoRARequest], LoRAMapping, torch.Tensor]:
-        if get_tensor_model_parallel_src_rank() == torch.distributed.get_rank(
-        ):
+        if is_tensor_model_parallel_first_rank():
             prefill_reqs = []
             decode_reqs = []
             for seq_group_meta in seq_group_metadata_list:
