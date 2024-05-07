@@ -365,7 +365,8 @@ class StateDictLoader(BaseModelLoader):
             params = dict(model.named_parameters())
             for file in paths:
                 for key, val in load_file(file).items():
-                    params[key].copy_(val)
+                    with torch.no_grad():
+                        params[key].copy_(val)
                     params.pop(key)
             assert not params
         return model.eval()
