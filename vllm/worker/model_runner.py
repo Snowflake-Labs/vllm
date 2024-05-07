@@ -760,12 +760,14 @@ class ModelRunner:
             execute_model_kwargs.update({"image_input": multi_modal_input})
         hidden_states = model_executable(**execute_model_kwargs)
 
-        # Compute the logits.
-        logits = self.model.compute_logits(hidden_states, sampling_metadata)
+        # Compute the logits in the last pipeline stage.
+        if is_pipeline_model_parallel_last_rank():
+            logits = self.model.compute_logits(hidden_states, sampling_metadata)
+        else:
+            return None
 
-        # Only perform sampling in the driver worker.
-        if (not (is_pipeline_model_parallel_last_rank()
-                 and is_tensor_model_parallel_first_rank())):
+        # Only perform sampling in the first TP worker.
+        if not is_tensor_model_parallel_first_rank():
             return None
 
         # Sample the next token.
