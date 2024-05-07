@@ -30,6 +30,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.sequence import SamplerOutput
+import gc
 
 logger = init_logger(__name__)
 use_dummy = os.environ.get("USE_DUMMY", False)
@@ -150,25 +151,67 @@ class ArcticMoE(nn.Module):
             set_weight_attrs(self.w2s, {
                 "weight_loader": self.weight_loader,
             })
+        self.weight_load_completed_w1_w3 = 0
+        self.weight_load_completed = 0
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor,
                       weight_name: str, expert_id: int):
         tp_rank = get_tensor_model_parallel_rank()
-        if self.is_quant:
-            param_data = param.ds_dequantize()
-        else:
-            param_data = param.data
+        # if self.is_quant:
+        #     param_data = param.ds_dequantize()
+        # else:
+        #     param_data = param.data
+        
         shard_size = self.intermediate_size
         shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
         if weight_name.endswith("w1.weight"):
-            param_data[expert_id, 0:shard_size, :] = loaded_weight[shard, :]
+            # param_data[expert_id, 0:shard_size, :] = loaded_weight[shard, :]
+            assert hasattr(param, 'shadow_data'), \
+                f'cant find shadow data! the loading seems to be finished!! ({self.weight_load_completed_w1_w3})'
+            if param.shadow_data[expert_id] is None:
+                param.shadow_data[expert_id] = torch.zeros(
+                    (shard_size * 2, 
+                    loaded_weight.shape[1]), 
+                    dtype=loaded_weight.dtype, 
+                    device=loaded_weight.device)
+            param.shadow_data[expert_id][0:shard_size, :] = loaded_weight[shard, :]
+            self.weight_load_completed_w1_w3 += 1
         if weight_name.endswith("w3.weight"):
-            param_data[expert_id,
-                       shard_size:2 * shard_size, :] = loaded_weight[shard, :]
+            # param_data[expert_id,
+            #            shard_size:2 * shard_size, :] = loaded_weight[shard, :]
+            assert hasattr(param, 'shadow_data'), \
+                f'cant find shadow data! the loading seems to be finished!! ({self.weight_load_completed_w1_w3})'
+            if param.shadow_data[expert_id] is None:
+                param.shadow_data[expert_id] = torch.zeros(
+                    (shard_size * 2, 
+                    loaded_weight.shape[1]), 
+                    dtype=loaded_weight.dtype, 
+                    device=loaded_weight.device)
+            param.shadow_data[expert_id][shard_size:2 * shard_size, :] = loaded_weight[shard, :]
+            self.weight_load_completed_w1_w3 += 1
         if weight_name.endswith("w2.weight"):
-            param_data[expert_id, :, :] = loaded_weight[:, shard]
-        if self.is_quant:
-            param.ds_quantize_(param_data)
+            # param_data[expert_id, :, :] = loaded_weight[:, shard]
+            assert hasattr(param, 'shadow_data'), \
+                f'cant find shadow data! the loading seems to be finished!! ({self.weight_load_completed })'
+            param.shadow_data[expert_id] = loaded_weight[:, shard]
+            self.weight_load_completed += 1
+            
+
+        if self.is_quant and (self.weight_load_completed == self.num_experts or self.weight_load_completed_w1_w3 == self.num_experts * 2):
+            # print(f'****************** converting expert-data on {param.data.device} ********************')
+            new_data = torch.stack(param.shadow_data).to(param.data.device)
+            len_sd = len(param.shadow_data)
+            for i in range(len_sd):
+                sd = param.shadow_data.pop()
+                del sd
+            del param.shadow_data
+            self.weight_load_completed = 0 if self.weight_load_completed == self.num_experts else self.weight_load_completed
+            self.weight_load_completed_w1_w3 = 0 if self.weight_load_completed_w1_w3 == self.num_experts * 2 else self.weight_load_completed_w1_w3
+            param.ds_quantize_(new_data)
+            del new_data
+            new_data = None
+            gc.collect()
+            torch.cuda.empty_cache()
 
     def local_moe_fused(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape

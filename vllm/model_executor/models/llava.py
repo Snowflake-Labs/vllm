@@ -4,7 +4,7 @@ import torch
 from torch import nn
 # TODO(xwjiang): We should port CLIPVisionModel's code over to not depend on
 # transformers' impl.
-from transformers import CLIPVisionModel, LlavaConfig
+# from transformers import CLIPVisionModel, LlavaConfig
 
 from vllm.attention import AttentionMetadata
 from vllm.config import VisionLanguageConfig
