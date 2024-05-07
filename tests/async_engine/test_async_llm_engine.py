@@ -3,8 +3,8 @@ from dataclasses import dataclass
 
 import pytest
 
-from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.config import ParallelConfig
+from vllm.engine.async_llm_engine import AsyncLLMEngine
 
 
 @dataclass
@@ -52,9 +52,10 @@ class MockEngine:
 
     def has_unfinished_requests(self):
         return self.request_id is not None
-    
+
     def has_unfinished_requests_for_virtual_engine(self, virtual_engine):
         return self.request_id is not None
+
 
 class MockAsyncLLMEngine(AsyncLLMEngine):
 

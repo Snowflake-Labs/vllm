@@ -559,7 +559,8 @@ class ModelRunner:
         seq_group_metadata_list: List[SequenceGroupMetadata],
     ) -> Tuple[torch.Tensor, torch.Tensor, AttentionMetadata, SamplingMetadata,
                Set[LoRARequest], LoRAMapping, torch.Tensor]:
-        if self.parallel_config.world_size == 1 or is_tensor_model_parallel_first_rank():
+        if (self.parallel_config.world_size == 1
+                or is_tensor_model_parallel_first_rank()):
             prefill_reqs = []
             decode_reqs = []
             for seq_group_meta in seq_group_metadata_list:
@@ -762,7 +763,8 @@ class ModelRunner:
 
         # Compute the logits in the last pipeline stage.
         if is_pipeline_model_parallel_last_rank():
-            logits = self.model.compute_logits(hidden_states, sampling_metadata)
+            logits = self.model.compute_logits(hidden_states,
+                                               sampling_metadata)
         else:
             return None
 

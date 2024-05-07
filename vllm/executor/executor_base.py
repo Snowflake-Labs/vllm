@@ -119,7 +119,10 @@ class ExecutorAsyncBase(ExecutorBase):
         speculative_config: Optional[SpeculativeConfig],
     ) -> None:
         self.lock = asyncio.Lock()
-        self.pp_locks = [asyncio.Lock() for _ in range(parallel_config.pipeline_parallel_size)]
+        self.pp_locks = [
+            asyncio.Lock()
+            for _ in range(parallel_config.pipeline_parallel_size)
+        ]
         super().__init__(model_config, cache_config, parallel_config,
                          scheduler_config, device_config, load_config,
                          lora_config, vision_language_config,

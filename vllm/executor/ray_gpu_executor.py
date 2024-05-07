@@ -1,7 +1,6 @@
 import asyncio
 import os
 import pickle
-import time
 from collections import defaultdict
 from itertools import islice, repeat
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -348,16 +347,24 @@ class RayGPUExecutorAsync(RayGPUExecutor, DistributedGPUExecutorAsync):
             coros = []
             # Locks are necessary for correctness in the TP + PP case.
             async with self.pp_locks[pp_rank]:
-                for tp_rank in range(self.parallel_config.tensor_parallel_size):
-                    rank = (pp_rank * self.parallel_config.tensor_parallel_size) + tp_rank
+                for tp_rank in range(
+                        self.parallel_config.tensor_parallel_size):
+                    rank = (pp_rank * self.parallel_config.tensor_parallel_size
+                            ) + tp_rank
                     if rank == 0:
-                        coros.append(self.driver_executor(method, *driver_args, **driver_kwargs))
+                        coros.append(
+                            self.driver_executor(method, *driver_args,
+                                                 **driver_kwargs))
                     else:
                         worker = self.workers[rank - 1]
                         if tp_rank == 0:
-                            coros.append(worker.execute_method.remote(method, *driver_args, **driver_kwargs))
+                            coros.append(
+                                worker.execute_method.remote(
+                                    method, *driver_args, **driver_kwargs))
                         else:
-                            coros.append(worker.execute_method.remote(method, *args, **kwargs))
+                            coros.append(
+                                worker.execute_method.remote(
+                                    method, *args, **kwargs))
                 all_outputs = await asyncio.gather(*coros)
 
         return all_outputs
