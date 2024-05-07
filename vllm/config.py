@@ -203,11 +203,11 @@ class ModelConfig:
         total_num_hidden_layers = self.hf_text_config.num_hidden_layers
         pipeline_parallel_size = parallel_config.pipeline_parallel_size
         architectures = getattr(self.hf_config, "architectures", [])
-        if not all(arch in _PP_SUPPORTED_MODELS for arch in architectures):
+        if not all(arch in _PP_SUPPORTED_MODELS
+                   for arch in architectures) and pipeline_parallel_size > 1:
             raise NotImplementedError(
                 "Pipeline parallelism is only supported for the following "
-                f" architectures: {_PP_SUPPORTED_MODELS}."
-            )
+                f" architectures: {_PP_SUPPORTED_MODELS}.")
 
         if total_num_hidden_layers % pipeline_parallel_size != 0:
             raise ValueError(
