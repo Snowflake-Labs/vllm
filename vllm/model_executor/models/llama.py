@@ -269,8 +269,6 @@ class LlamaModel(nn.Module):
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
         )
-        assert (config.num_hidden_layers %
-                get_pipeline_model_parallel_world_size() == 0)
         self.start_layer, self.end_layer = get_pp_indices(
             config.num_hidden_layers, get_pipeline_model_parallel_rank(),
             get_pipeline_model_parallel_world_size())
