@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import pytest
 
 from vllm.engine.async_llm_engine import AsyncLLMEngine
+from vllm.config import ParallelConfig
 
 
 @dataclass
@@ -19,8 +20,11 @@ class MockEngine:
         self.add_request_calls = 0
         self.abort_request_calls = 0
         self.request_id = None
+        # Ugly, remove dependency when possible
+        self.parallel_config = ParallelConfig(1, 1, False)
 
-    async def step_async(self):
+    async def step_async(self, virtual_engine):
+        # PP size is 1, ignore virtual engine
         self.step_calls += 1
         return [RequestOutput(
             request_id=self.request_id)] if self.request_id else []
@@ -48,7 +52,9 @@ class MockEngine:
 
     def has_unfinished_requests(self):
         return self.request_id is not None
-
+    
+    def has_unfinished_requests_for_virtual_engine(self, virtual_engine):
+        return self.request_id is not None
 
 class MockAsyncLLMEngine(AsyncLLMEngine):
 

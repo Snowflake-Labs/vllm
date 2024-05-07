@@ -227,7 +227,7 @@ class Worker(WorkerBase):
         num_lookahead_slots: int = 0,
     ) -> List[SamplerOutput]:
 
-        if is_tensor_model_parallel_first_rank():
+        if self.parallel_config.tensor_parallel_size == 1 or is_tensor_model_parallel_first_rank():
             assert seq_group_metadata_list is not None
             num_seq_groups = len(seq_group_metadata_list)
             assert blocks_to_swap_in is not None
