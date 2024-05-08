@@ -517,8 +517,8 @@ class AsyncLLMEngine:
                             await self.engine.\
                                   has_unfinished_requests_for_virtual_engine.remote(virtual_engine) # type: ignore
                     else:
-                        has_unfinished_requests = self.engine.scheduler[
-                            virtual_engine].has_unfinished_seqs()
+                        has_unfinished_requests = \
+                            self.engine.has_unfinished_requests_for_virtual_engine(virtual_engine)
                     if result or has_unfinished_requests:
                         requests_in_progress[
                             virtual_engine] = asyncio.create_task(

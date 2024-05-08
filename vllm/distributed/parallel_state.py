@@ -292,6 +292,17 @@ def is_tensor_model_parallel_first_rank() -> bool:
     return get_tensor_model_parallel_rank() == 0
 
 
+def get_tp_src_rank_and_group():
+    parallelism_initialized = model_parallel_is_initialized()
+    if parallelism_initialized:
+        src_rank = get_tensor_model_parallel_src_rank()
+        tp_group = get_tensor_model_parallel_group()
+    else:
+        src_rank = 0
+        tp_group = None
+    return src_rank, tp_group
+
+
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
     global _TENSOR_MODEL_PARALLEL_GROUP

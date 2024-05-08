@@ -11,8 +11,7 @@ from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
                          VisionLanguageConfig)
 from vllm.distributed import (broadcast_tensor_dict,
                               ensure_model_parallel_initialized,
-                              get_tensor_model_parallel_group,
-                              get_tensor_model_parallel_src_rank,
+                              get_tp_src_rank_and_group,
                               init_distributed_environment,
                               is_tensor_model_parallel_first_rank)
 from vllm.distributed.device_communicators import pynccl_utils
@@ -226,9 +225,8 @@ class Worker(WorkerBase):
         virtual_engine: int = 0,
         num_lookahead_slots: int = 0,
     ) -> List[SamplerOutput]:
-
-        if (self.parallel_config.tensor_parallel_size == 1
-                or is_tensor_model_parallel_first_rank()):
+        src_rank, tp_group = get_tp_src_rank_and_group()
+        if (not tp_group or is_tensor_model_parallel_first_rank()):
             assert seq_group_metadata_list is not None
             num_seq_groups = len(seq_group_metadata_list)
             assert blocks_to_swap_in is not None
@@ -242,13 +240,9 @@ class Worker(WorkerBase):
                 "blocks_to_swap_out": blocks_to_swap_out,
                 "blocks_to_copy": blocks_to_copy,
             }
-            broadcast_tensor_dict(data,
-                                  src=get_tensor_model_parallel_src_rank(),
-                                  group=get_tensor_model_parallel_group())
+            broadcast_tensor_dict(data, src=src_rank, group=tp_group)
         else:
-            data = broadcast_tensor_dict(
-                src=get_tensor_model_parallel_src_rank(),
-                group=get_tensor_model_parallel_group())
+            data = broadcast_tensor_dict(src=src_rank, group=tp_group)
             num_seq_groups = data["num_seq_groups"]
             virtual_engine = data["virtual_engine"]
             blocks_to_swap_in = data["blocks_to_swap_in"]
