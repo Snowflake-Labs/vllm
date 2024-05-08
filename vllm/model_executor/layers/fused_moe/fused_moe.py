@@ -179,6 +179,13 @@ def fused_moe_kernel_fp8(
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
+    _mantisa_bits: tl.constexpr,
+    q_exponent_bits: tl.constexpr,
+    q_mantisa_bits: tl.constexpr,
+    _exponent_bits: tl.constexpr,
+    _sign_mask: tl.constexpr,
+    _exponent_mask: tl.constexpr,
+    _mantisa_mask: tl.constexpr
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -239,7 +246,7 @@ def fused_moe_kernel_fp8(
                       offs_k[None, :] * stride_ak)
 
     off_experts = tl.load(expert_ids_ptr + pid_m) * stride_be
-    b_ptrs = b_ptr + off_experts + (offs_k[:, None] * stride_bk + offs_bn[None, :])
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :])
     b_scale_offset = off_experts + offs_bn_base
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
@@ -249,28 +256,33 @@ def fused_moe_kernel_fp8(
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # Load the next block of A and B, generate a mask by checking the
-        # K dimension.
         b_group_id = (b_scale_offset + k * BLOCK_SIZE_K) // quantization_group_size
+        b = tl.load(b_ptrs + b_group_id * (quantization_group_size + 4),
+                    mask=offs_k[:, None] < K - k * BLOCK_SIZE_K,
+                    other=0.0)
         # reading the scales in FP32-format from the shard fp8-tensor pointer, 
         # so we divide the group-size by 4 to acount for that
         scale = tl.load(scale_ptr + (b_group_id + 1) * (quantization_group_size // 4))
+
         a = tl.load(a_ptrs,
                     mask=token_mask[:, None] &
                     (offs_k[None, :] < K - k * BLOCK_SIZE_K),
                     other=0.0)
-        b = tl.load(b_ptrs + b_group_id * (quantization_group_size + 4),
-                    mask=offs_k[:, None] < K - k * BLOCK_SIZE_K,
-                    other=0.0).to(compute_type)
+        # Advance the ptrs to the next K block.
+        a_ptrs += BLOCK_SIZE_K * stride_ak
 
-        # (TODO: Reza) check if using bf16 scales is possible. 
-        # Or, we could even move the scale after MMA!
+        # Dequantize weight (fp8 -> bf16)
+        sign = ((b & _sign_mask) >> (_mantisa_bits + _exponent_bits)).to(tl.uint16)
+        dst_exponent = ((b & _exponent_mask) >> _mantisa_bits).to(tl.uint16)
+        dst_mantisa = (b & _mantisa_mask).to(tl.uint16)
+        dst_exponent = (dst_exponent - ((1 << (_exponent_bits - 1)) - 1)) + (1 << (q_exponent_bits - 1)) - 1
+        b = ((sign << (q_exponent_bits + q_mantisa_bits)) | (dst_exponent << q_mantisa_bits) |
+                 (dst_mantisa << (q_mantisa_bits - _mantisa_bits))).to(tl.uint16)
+        b = b.to(tl.bfloat16, bitcast=True)
+
         b = (b * scale[None, :]).to(compute_type)
         accumulator += tl.dot(a, b)
 
-        # Advance the ptrs to the next K block.
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
 
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(topk_weights_ptr + offs_token,
@@ -397,6 +409,15 @@ def invoke_fused_moe_kernel_fp8(A: torch.Tensor, B: torch.Tensor, C: torch.Tenso
     grid = lambda META: (triton.cdiv(sorted_token_ids.shape[0], META[
         'BLOCK_SIZE_M']) * triton.cdiv(B.shape[1], META['BLOCK_SIZE_N']), )
         
+    
+    _mantisa_bits = 3
+    q_exponent_bits = 8
+    q_mantisa_bits = 7
+    _exponent_bits = 4
+    _sign_mask = 1 << (_mantisa_bits + _exponent_bits)
+    _mantisa_mask = (1 << _mantisa_bits) - 1
+    _exponent_mask = ((1 << _exponent_bits) - 1) << _mantisa_bits
+
     fused_moe_kernel_fp8[grid](
         A,
         B,
@@ -421,6 +442,13 @@ def invoke_fused_moe_kernel_fp8(A: torch.Tensor, B: torch.Tensor, C: torch.Tenso
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         top_k=top_k,
         compute_type=tl.bfloat16 if A.dtype == torch.bfloat16 else tl.float16,
+        _mantisa_bits=_mantisa_bits,
+        q_exponent_bits=q_exponent_bits,
+        q_mantisa_bits=q_mantisa_bits,
+        _exponent_bits=_exponent_bits,
+        _sign_mask=_sign_mask,
+        _mantisa_mask=_mantisa_mask,
+        _exponent_mask=_exponent_mask,
         **config,
     )
 
@@ -565,7 +593,7 @@ def fused_experts(
                                       dtype=hidden_states.dtype)
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids, config['BLOCK_SIZE_M'], E)
-    if w1.dtype == torch.float8_e4m3fn:
+    if w1.dtype == torch.float8_e4m3fn or w1.dtype == torch.int8:
         invoke_fused_moe_kernel_fp8(hidden_states, w1, intermediate_cache1, w1_q_scales,
                             topk_weights, topk_ids, sorted_token_ids,
                             expert_ids, num_tokens_post_padded, False,
@@ -576,7 +604,7 @@ def fused_experts(
                             expert_ids, num_tokens_post_padded, False,
                             topk_ids.shape[1], config)
     ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
-    if w2.dtype == torch.float8_e4m3fn:
+    if w2.dtype == torch.float8_e4m3fn or w2.dtype == torch.int8:
         invoke_fused_moe_kernel_fp8(intermediate_cache2, w2, intermediate_cache3, w2_q_scales,
                             topk_weights, topk_ids, sorted_token_ids,
                             expert_ids, num_tokens_post_padded, False,

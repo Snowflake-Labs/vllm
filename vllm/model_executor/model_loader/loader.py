@@ -252,7 +252,7 @@ class DummyModelLoader(BaseModelLoader):
                                           lora_config, vision_language_config)
             # NOTE(woosuk): For accurate performance evaluation, we assign
             # random values to the weights.
-            initialize_dummy_weights(model)
+            #initialize_dummy_weights(model)
         return model.eval()
 
 
