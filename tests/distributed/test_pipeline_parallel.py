@@ -1,28 +1,23 @@
-import json
 import os
-import re
 import subprocess
 import sys
 import time
 
-import jsonschema
 import openai  # use the official client for correctness check
 import pytest
 # using Ray for overall ease of process management, parallel requests,
 # and debugging.
 import ray
 import requests
-# downloading lora to test lora requests
-from huggingface_hub import snapshot_download
-from openai import BadRequestError
 
-from vllm.transformers_utils.tokenizer import get_tokenizer
+# downloading lora to test lora requests
 
 MAX_SERVER_START_WAIT_S = 600  # wait for server to start for 60 seconds
 # any model with a chat template should work here
 MODEL_NAME = "meta-llama/Meta-Llama-3-8B"
 
 pytestmark = pytest.mark.asyncio
+
 
 @ray.remote(num_gpus=1)
 class ServerRunner:
@@ -61,6 +56,7 @@ class ServerRunner:
     def __del__(self):
         if hasattr(self, "proc"):
             self.proc.terminate()
+
 
 @pytest.fixture(scope="session")
 def server():
