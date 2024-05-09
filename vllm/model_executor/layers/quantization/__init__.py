@@ -4,6 +4,8 @@ from vllm.model_executor.layers.quantization.aqlm import AQLMConfig
 from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
+from vllm.model_executor.layers.quantization.deepspeedfp import (
+    DeepSpeedFPConfig)
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.gptq import GPTQConfig
 from vllm.model_executor.layers.quantization.marlin import MarlinConfig
@@ -16,6 +18,7 @@ QUANTIZATION_METHODS = {
     "gptq": GPTQConfig,
     "squeezellm": SqueezeLLMConfig,
     "marlin": MarlinConfig,
+    "deepspeedfp": DeepSpeedFPConfig
 }
 
 
