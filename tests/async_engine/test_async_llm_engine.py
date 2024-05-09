@@ -41,6 +41,7 @@ class MockEngine:
     def add_request(self, **kwargs):
         del kwargs  # Unused
         self.add_request_calls += 1
+        print(f'Request calls: {self.add_request_calls}')
 
     async def add_request_async(self, **kwargs):
         self.add_request_calls += 1
@@ -77,6 +78,7 @@ async def test_new_requests_event():
 
     await engine.add_request("2", "", None)
     engine.engine.generate("2")
+    await asyncio.sleep(0)
     await asyncio.sleep(0)
     await asyncio.sleep(0)
     assert engine.engine.add_request_calls == 2
