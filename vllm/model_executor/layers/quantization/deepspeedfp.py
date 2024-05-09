@@ -148,31 +148,37 @@ class DeepSpeedFPParameter(nn.Parameter):
                 quant_config: DeepSpeedFPConfig):
         from deepspeed.ops.fp_quantizer import FP_Quantize
         data = torch.empty((
-            orig_shape.numel() // quant_config.group_size,
-            quant_config.group_size * quant_config.weight_bits // 8 + 4,
-        ),
-                           dtype=torch.int8)
+            0,
+            0,
+        ), dtype=torch.float8_e4m3fn)
         self = torch.Tensor._make_subclass(cls, data, data.requires_grad)
         self.orig_shape = orig_shape
         self.quant_config = quant_config
         self.fp_quantizer = FP_Quantize(group_size=quant_config.group_size)
         self.fp_quantizer.orig_shape = orig_shape
         self.fp_quantizer.orig_dtype = params_dtype
+        # self.data_reshaped = self.fp_quantizer.get_reshaped_data(self.data, list(self.orig_shape))
+        self.shadow_data = [None]*orig_shape[0]
         return self
 
     def ds_quantize_(self, tensor: torch.Tensor):
-        assert tensor.device.type == "cuda" and tensor.dtype != torch.int8
-        return self.data.copy_(
-            self.fp_quantizer.quantize(
-                tensor.data,
-                q_bits=self.quant_config.weight_bits,
-            ))
+        assert tensor.device.type == "cuda" and tensor.dtype != torch.int8, \
+            f"tensor type: {tensor.dtype}, device: {tensor.device.type}!!"
+        q_data = self.fp_quantizer.quantize(
+            tensor.data,
+            q_bits=self.quant_config.weight_bits,
+        )
+        self.data = q_data
+        return self.data
 
+    def quantization_scales(self):
+        return self.fp_quantizer.get_scales()
+      
     def ds_dequantize(self, fp_out=None) -> torch.Tensor:
         """
         Return a tensor containing the dequantized weights of this parameter.
         """
-        assert self.data.device.type == "cuda" and self.data.dtype == torch.int8
+        assert self.data.device.type == "cuda" and (self.data.dtype == torch.int8 or self.data.dtype == torch.float8_e4m3fn)
         return self.fp_quantizer.dequantize(
             self.data, fp_out=fp_out, q_bits=self.quant_config.weight_bits)
 
@@ -181,7 +187,7 @@ class DeepSpeedFPParameter(nn.Parameter):
         Return a tensor where only the weights at `indices` are dequantized
         (to save HBM -> SRAM bandwidth).
         """
-        assert self.data.device.type == "cuda" and self.data.dtype == torch.int8
+        assert self.data.device.type == "cuda" and (self.data.dtype == torch.int8 or self.data.dtype == torch.float8_e4m3fn)
         return self.fp_quantizer.selective_dequantize(
             self.data,
             indices,
