@@ -262,7 +262,7 @@ def fused_moe_kernel_fp8(
                     other=0.0)
         # reading the scales in FP32-format from the shard fp8-tensor pointer, 
         # so we divide the group-size by 4 to acount for that
-        scale = tl.load(scale_ptr + (b_group_id + 1) * (quantization_group_size // 4))
+        scale = tl.load(scale_ptr + (quantization_group_size // 4) + b_group_id[None, :] * (quantization_group_size // 4 + 1))
 
         a = tl.load(a_ptrs,
                     mask=token_mask[:, None] &
@@ -279,8 +279,7 @@ def fused_moe_kernel_fp8(
         b = ((sign << (q_exponent_bits + q_mantisa_bits)) | (dst_exponent << q_mantisa_bits) |
                  (dst_mantisa << (q_mantisa_bits - _mantisa_bits))).to(tl.uint16)
         b = b.to(tl.bfloat16, bitcast=True)
-
-        b = (b * scale[None, :]).to(compute_type)
+        b = b * scale.to(compute_type)
         accumulator += tl.dot(a, b)
 
 
