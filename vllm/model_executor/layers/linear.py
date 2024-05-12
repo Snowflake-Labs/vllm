@@ -115,7 +115,7 @@ class ReplicatedLinear(torch.nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
-        if linear_method is None:
+        if True: #linear_method is None:
             linear_method = UnquantizedLinearMethod()
         self.linear_method = linear_method
         self.linear_method.create_weights(self, self.input_size,
@@ -178,7 +178,7 @@ class ColumnParallelLinear(torch.nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
-        if linear_method is None:
+        if True: #linear_method is None:
             linear_method = UnquantizedLinearMethod()
         self.linear_method = linear_method
         self.linear_method.create_weights(self,
@@ -523,7 +523,7 @@ class RowParallelLinear(torch.nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.input_size_per_partition = divide(input_size, self.tp_size)
         self.skip_bias_add = skip_bias_add
-        if linear_method is None:
+        if True: #linear_method is None:
             linear_method = UnquantizedLinearMethod()
         self.linear_method = linear_method
         self.linear_method.create_weights(self,

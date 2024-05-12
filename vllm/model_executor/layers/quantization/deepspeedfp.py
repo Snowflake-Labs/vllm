@@ -10,7 +10,7 @@ from vllm.model_executor.layers.linear import (LinearMethodBase,
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
 
-
+fp_out = {}
 class DeepSpeedFPConfig(QuantizationConfig):
     """Config for DeepSpeed FP quantizer. It supports fp6 and fp8."""
 
@@ -146,6 +146,10 @@ class DeepSpeedFPParameter(nn.Parameter):
         self.fp_quantizer = FP_Quantize(group_size=quant_config.group_size)
         self.fp_quantizer.orig_shape = orig_shape
         self.fp_quantizer.orig_dtype = params_dtype
+        global fp_out
+        if not orig_shape in fp_out:
+            fp_out[orig_shape] = torch.empty(orig_shape, dtype=torch.bfloat16,
+                             device=self.data.device)
         return self
 
     def ds_quantize_(self, tensor: torch.Tensor):
@@ -157,21 +161,21 @@ class DeepSpeedFPParameter(nn.Parameter):
             )
         )
 
-    def ds_dequantize(self, fp_out=None) -> torch.Tensor:
+    def ds_dequantize(self) -> torch.Tensor:
         """
         Return a tensor containing the dequantized weights of this parameter.
         """
         assert self.data.device.type == "cuda" and self.data.dtype == torch.int8
         return self.fp_quantizer.dequantize(
-            self.data, fp_out=fp_out,
+            self.data, fp_out=fp_out[self.orig_shape],
             q_bits=self.quant_config.weight_bits)
 
-    def ds_selective_dequantize(self, indices, fp_out=None) -> torch.Tensor:
+    def ds_selective_dequantize(self, indices) -> torch.Tensor:
         """
         Return a tensor where only the weights at `indices` are dequantized
         (to save HBM -> SRAM bandwidth).
         """
         assert self.data.device.type == "cuda" and self.data.dtype == torch.int8
         return self.fp_quantizer.selective_dequantize(
-            self.data, indices, fp_out=fp_out,
+            self.data, indices, fp_out=fp_out[self.orig_shape][:indices.shape[0], ...],
             q_bits=self.quant_config.weight_bits)
