@@ -11,10 +11,12 @@ prompts = [
 sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
 
 # Create an LLM.
-arctic_model_path = "/checkpoint/arctic"
+arctic_model_path = "/data-fast/checkpoint/"
 llm = LLM(model=arctic_model_path,
           quantization="deepspeedfp",
-          tensor_parallel_size=8)
+          trust_remote_code=True, 
+          tensor_parallel_size=8,
+          gpu_memory_utilization=0.92,)
 # Generate texts from the prompts. The output is a list of RequestOutput objects
 # that contain the prompt, generated text, and other information.
 

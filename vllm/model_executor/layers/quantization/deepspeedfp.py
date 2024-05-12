@@ -139,7 +139,7 @@ class DeepSpeedFPParameter(nn.Parameter):
         data = torch.empty((
             0, #orig_shape.numel() // quant_config.group_size,
             0, #quant_config.group_size * quant_config.weight_bits // 8 + 4,
-        ), dtype=torch.float8_e4m3fn)
+        ), dtype=torch.uint8)
         self = torch.Tensor._make_subclass(cls, data, data.requires_grad)
         self.orig_shape = orig_shape
         self.quant_config = quant_config
@@ -153,9 +153,10 @@ class DeepSpeedFPParameter(nn.Parameter):
     def ds_quantize_(self, tensor: torch.Tensor):
         assert tensor.device.type == "cuda" and tensor.dtype != torch.int8, \
             f"tensor type: {tensor.dtype}, device: {tensor.device.type}!!"
-        q_data = self.fp_quantizer.quantize(
+        q_data, _ = self.fp_quantizer.quantize(
             tensor.data,
             q_bits=self.quant_config.weight_bits,
+            return_meta_tensor=True
         )
         self.data = q_data
         return self.data
@@ -167,7 +168,7 @@ class DeepSpeedFPParameter(nn.Parameter):
         """
         Return a tensor containing the dequantized weights of this parameter.
         """
-        assert self.data.device.type == "cuda" and (self.data.dtype == torch.int8 or self.data.dtype == torch.float8_e4m3fn)
+        assert self.data.device.type == "cuda" and (self.data.dtype == torch.uint8 or self.data.dtype == torch.int8 or self.data.dtype == torch.float8_e4m3fn)
         return self.fp_quantizer.dequantize(
             self.data, fp_out=fp_out,
             q_bits=self.quant_config.weight_bits)
@@ -177,7 +178,7 @@ class DeepSpeedFPParameter(nn.Parameter):
         Return a tensor where only the weights at `indices` are dequantized
         (to save HBM -> SRAM bandwidth).
         """
-        assert self.data.device.type == "cuda" and (self.data.dtype == torch.int8 or self.data.dtype == torch.float8_e4m3fn)
+        assert self.data.device.type == "cuda" and (self.data.dtype == torch.uint8 or self.data.dtype == torch.int8 or self.data.dtype == torch.float8_e4m3fn)
         return self.fp_quantizer.selective_dequantize(
             self.data, indices, fp_out=fp_out,
             q_bits=self.quant_config.weight_bits)

@@ -12,7 +12,7 @@ from vllm.distributed import (get_tensor_model_parallel_rank,
                               tensor_model_parallel_all_reduce)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.fused_moe import fused_experts, fused_topk
+from vllm.model_executor.layers.fused_moe import fused_experts, fused_topk, invoke_dequantization
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (LinearMethodBase,
                                                MergedColumnParallelLinear,
@@ -31,12 +31,17 @@ from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.sequence import SamplerOutput
 import gc
+import time
+import math
 
 logger = init_logger(__name__)
 use_dummy = os.environ.get("USE_DUMMY", False)
 use_dummy = bool(use_dummy)
 
-
+def _sleep_infinity():
+    while(1):
+        time.sleep(1)
+        
 class ArcticMLP(nn.Module):
 
     def __init__(self,
@@ -95,7 +100,7 @@ class ArcticMoE(nn.Module):
         self.layer_id = layer_id
         self.top_k = config.num_experts_per_tok
         self.intermediate_size = config.intermediate_size // self.tp_size
-        self.enable_dequantization_fusion = True
+        self.enable_dequantization_fusion = False
         self.is_moe_layer = (layer_id + 1) % config.moe_layer_frequency == 0
         self.is_quant = isinstance(linear_method, DeepSpeedFPLinearMethod)
         self.reduce_results = reduce_results
@@ -157,48 +162,45 @@ class ArcticMoE(nn.Module):
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor,
                       weight_name: str, expert_id: int):
         tp_rank = get_tensor_model_parallel_rank()
-        # if self.is_quant:
-        #     param_data = param.ds_dequantize()
-        # else:
-        #     param_data = param.data
         
         shard_size = self.intermediate_size
         shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
         if weight_name.endswith("w1.weight"):
-            # param_data[expert_id, 0:shard_size, :] = loaded_weight[shard, :]
             assert hasattr(param, 'shadow_data'), \
                 f'cant find shadow data! the loading seems to be finished!! ({self.weight_load_completed_w1_w3})'
             if param.shadow_data[expert_id] is None:
                 param.shadow_data[expert_id] = torch.zeros(
-                    (shard_size * 2, 
+                    (shard_size * 2,
                     loaded_weight.shape[1]), 
                     dtype=loaded_weight.dtype, 
                     device=loaded_weight.device)
             param.shadow_data[expert_id][0:shard_size, :] = loaded_weight[shard, :]
             self.weight_load_completed_w1_w3 += 1
         if weight_name.endswith("w3.weight"):
-            # param_data[expert_id,
-            #            shard_size:2 * shard_size, :] = loaded_weight[shard, :]
             assert hasattr(param, 'shadow_data'), \
                 f'cant find shadow data! the loading seems to be finished!! ({self.weight_load_completed_w1_w3})'
             if param.shadow_data[expert_id] is None:
                 param.shadow_data[expert_id] = torch.zeros(
-                    (shard_size * 2, 
+                    (shard_size * 2,
                     loaded_weight.shape[1]), 
                     dtype=loaded_weight.dtype, 
                     device=loaded_weight.device)
-            param.shadow_data[expert_id][shard_size:2 * shard_size, :] = loaded_weight[shard, :]
+            dst_shape = param.shadow_data[expert_id].shape[0] // 2
+            param.shadow_data[expert_id][dst_shape:dst_shape + shard_size, :] = loaded_weight[shard, :]
             self.weight_load_completed_w1_w3 += 1
         if weight_name.endswith("w2.weight"):
-            # param_data[expert_id, :, :] = loaded_weight[:, shard]
             assert hasattr(param, 'shadow_data'), \
                 f'cant find shadow data! the loading seems to be finished!! ({self.weight_load_completed })'
-            param.shadow_data[expert_id] = loaded_weight[:, shard]
+            param.shadow_data[expert_id] = torch.zeros(
+                    (loaded_weight.shape[0],
+                    shard_size),
+                    dtype=loaded_weight.dtype, 
+                    device=loaded_weight.device)
+            param.shadow_data[expert_id][:, :shard_size] = loaded_weight[:, shard]
             self.weight_load_completed += 1
             
 
         if self.is_quant and (self.weight_load_completed == self.num_experts or self.weight_load_completed_w1_w3 == self.num_experts * 2):
-            # print(f'****************** converting expert-data on {param.data.device} ********************')
             new_data = torch.stack(param.shadow_data).to(param.data.device)
             len_sd = len(param.shadow_data)
             for i in range(len_sd):
@@ -207,7 +209,11 @@ class ArcticMoE(nn.Module):
             del param.shadow_data
             self.weight_load_completed = 0 if self.weight_load_completed == self.num_experts else self.weight_load_completed
             self.weight_load_completed_w1_w3 = 0 if self.weight_load_completed_w1_w3 == self.num_experts * 2 else self.weight_load_completed_w1_w3
-            param.ds_quantize_(new_data)
+            param.fp_quantizer.group_size = max([
+                2**i for i in range(4, int(math.log2(param.quant_config.group_size)+1)) \
+                if new_data.shape[-1] % (2**i) == 0 
+            ])
+            param_q = param.ds_quantize_(new_data)
             del new_data
             new_data = None
             gc.collect()
@@ -224,7 +230,7 @@ class ArcticMoE(nn.Module):
                                             self.top_k,
                                             renormalize=do_normalize)
         # topk_ids: (num_tokens, k)
-        if False: #self.is_quant:
+        if self.is_quant and (not self.enable_dequantization_fusion):
             if 2 * num_tokens <= self.num_experts:
                 # If much fewer tokens than experts, use selective dequantize.
                 ws_dequantized = self.ws.ds_selective_dequantize(
@@ -240,23 +246,20 @@ class ArcticMoE(nn.Module):
             else:
                 ws_dequantized = self.ws.ds_dequantize()
                 w2s_dequantized = self.w2s.ds_dequantize()
-        final_hidden_states = fused_experts(
-            hidden_states,
-            ws_dequantized if (self.is_quant and not self.enable_dequantization_fusion) else self.ws.data,
-            w2s_dequantized if (self.is_quant and not self.enable_dequantization_fusion) else self.w2s.data,
-            topk_weights,
-            topk_ids,
-            inplace=True,
-            w1_q_scales=self.ws.quantization_scales() if self.enable_dequantization_fusion else None,
-            w2_q_scales=self.w2s.quantization_scales() if self.enable_dequantization_fusion else None,
-            quantization_group_size=self.ws.quant_config.group_size if self.is_quant else 1)
-        # final_hidden_states = fused_experts(
-        #     hidden_states,
-        #     ws_dequantized if self.is_quant else self.ws,
-        #     w2s_dequantized if self.is_quant else self.w2s,
-        #     topk_weights,
-        #     topk_ids,
-        #     inplace=True)
+                
+        final_hidden_states = \
+            fused_experts(
+                hidden_states,
+                ws_dequantized if (self.is_quant and not self.enable_dequantization_fusion) else self.ws.data,
+                w2s_dequantized if (self.is_quant and not self.enable_dequantization_fusion) else self.w2s.data,
+                topk_weights,
+                topk_ids,
+                inplace=True,
+                w1_q_scales=self.ws.quantization_scales() if self.enable_dequantization_fusion else None,
+                w2_q_scales=self.w2s.quantization_scales() if self.enable_dequantization_fusion else None,
+                quantization_group_size=self.ws.fp_quantizer.group_size if self.is_quant else 1,
+                quantization_group_size2=self.w2s.fp_quantizer.group_size if self.is_quant else 1)
+            
         if self.reduce_results and self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(
                 final_hidden_states)

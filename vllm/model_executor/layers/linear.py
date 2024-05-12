@@ -115,7 +115,7 @@ class ReplicatedLinear(torch.nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
-        if linear_method is None:
+        if True: #linear_method is None:
             linear_method = UnquantizedLinearMethod()
         self.linear_method = linear_method
         self.linear_method.create_weights(self, self.input_size,

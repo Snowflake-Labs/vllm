@@ -14,6 +14,11 @@ from vllm.utils import is_hip
 
 logger = init_logger(__name__)
 
+import time
+
+def _sleep_infinity():
+    while(1):
+        time.sleep(1)
 
 @triton.jit
 def fused_moe_kernel(
@@ -150,6 +155,67 @@ def fused_moe_kernel(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
+'''
+prompt: 'Hello, my name is', Generated text: ' Daphne, and I’m going to be taking over the post of'                                                                                                           
+Prompt: 'The president of the United States is', Generated text: ' a member of an exclusive club, one with a secret grip on the nation'                                                                       Prompt: 'The capital of France is', Generated text: '?\n605 A. Hope on board the location of the new movie'                                                                                                   
+Prompt: 'The future of AI is', Generated text: " always 'in-bracing'. It is a term that refers to the"      
+'''
+
+@triton.jit
+def dequantization(
+    b_ptr,
+    scale_ptr,
+    b_dq_ptr,
+    stride_be,
+    stride_bk,
+    stride_bn,
+    N,
+    K,
+    _mantisa_bits: tl.constexpr,
+    q_exponent_bits: tl.constexpr,
+    q_mantisa_bits: tl.constexpr,
+    _exponent_bits: tl.constexpr,
+    _sign_mask: tl.constexpr,
+    _exponent_mask: tl.constexpr,
+    _mantisa_mask: tl.constexpr,
+    quantization_group_size: tl.constexpr,
+    quantization_group_size_q: tl.constexpr,
+    quantization_group_size_f: tl.constexpr,
+    quantization_group_size_f_scale: tl.constexpr,
+):
+    BLOCK_SIZE_N: tl.constexpr = 64
+    BLOCK_SIZE_K: tl.constexpr = 32
+    pid = tl.program_id(axis=0)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    pid_n = (pid % num_pid_n)
+
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    off_experts = 0
+    
+    b_ptrs_offset = off_experts * stride_be + offs_bn[None, :] * (stride_bn // quantization_group_size)
+    b_dq_ptrs = b_dq_ptr + off_experts * stride_be + (offs_k[:, None] * stride_bk +
+                                                offs_bn[None, :] * stride_bn)
+                                                
+    _exp_bias = (1 << (q_exponent_bits - 1)) - (1 << (_exponent_bits - 1))
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        b = tl.load(b_ptr + (((k * BLOCK_SIZE_K) // quantization_group_size) + b_ptrs_offset) * quantization_group_size_q + ((offs_k * stride_bk + k * BLOCK_SIZE_K) % quantization_group_size)[:, None],
+                    mask=offs_k[:, None] < K - k * BLOCK_SIZE_K,
+                    other=0.0)
+        scale = tl.load(scale_ptr + (((k * BLOCK_SIZE_K) // quantization_group_size) + b_ptrs_offset) * quantization_group_size_f_scale + quantization_group_size_f)
+        # Dequantize weight (fp8 -> bf16)
+        dst_exponent = ((b & _exponent_mask) >> _mantisa_bits).to(tl.uint16)
+        sign = ((b & _sign_mask) >> (_mantisa_bits + _exponent_bits)).to(tl.uint16)
+        dst_mantisa = (b & _mantisa_mask).to(tl.uint16)
+        b = ((sign << (q_exponent_bits + q_mantisa_bits)) | dst_mantisa << (q_mantisa_bits - _mantisa_bits))
+        dst_exponent = (dst_exponent + _exp_bias)
+        b = (b | (dst_exponent << q_mantisa_bits)).to(tl.uint16)
+        b = (b.to(tl.bfloat16, bitcast=True) * scale).to(tl.bfloat16)
+
+        tl.store(b_dq_ptrs, b, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K)
+        # b_ptrs += BLOCK_SIZE_K * stride_bk
+        b_dq_ptrs += BLOCK_SIZE_K * stride_bk
+
 @triton.jit
 def fused_moe_kernel_fp8(
     a_ptr,
@@ -171,7 +237,6 @@ def fused_moe_kernel_fp8(
     stride_bn,
     stride_cm,
     stride_cn,
-    quantization_group_size,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -185,7 +250,11 @@ def fused_moe_kernel_fp8(
     _exponent_bits: tl.constexpr,
     _sign_mask: tl.constexpr,
     _exponent_mask: tl.constexpr,
-    _mantisa_mask: tl.constexpr
+    _mantisa_mask: tl.constexpr,
+    quantization_group_size: tl.constexpr,
+    quantization_group_size_q: tl.constexpr,
+    quantization_group_size_f: tl.constexpr,
+    quantization_group_size_f_scale: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -239,15 +308,15 @@ def fused_moe_kernel_fp8(
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
     token_mask = offs_token < num_valid_tokens
 
-    offs_bn_base = ((pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N) * stride_bn
-    offs_bn = offs_bn_base % quantization_group_size
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am +
                       offs_k[None, :] * stride_ak)
 
-    off_experts = tl.load(expert_ids_ptr + pid_m) * stride_be
-    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :])
-    b_scale_offset = off_experts + offs_bn_base
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    off_experts = tl.load(expert_ids_ptr + pid_m)
+    b_ptrs_offset = off_experts * (stride_be // quantization_group_size) + offs_bn[None, :] * (stride_bn // quantization_group_size)
+    # b_ptrs = b_ptr + b_ptrs_offset * quantization_group_size_q
+    b_ptrs = b_ptr + off_experts * stride_be + offs_bn[None, :] * stride_bn + offs_k[:, None] * stride_bk
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
     # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
@@ -255,31 +324,28 @@ def fused_moe_kernel_fp8(
     # `accumulator` will be converted back to fp16 after the loop.
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
+    _exp_bias = (1 << (q_exponent_bits - 1)) - (1 << (_exponent_bits - 1))
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        b_group_id = (b_scale_offset + k * BLOCK_SIZE_K) // quantization_group_size
-        b = tl.load(b_ptrs + b_group_id * (quantization_group_size + 4),
+        b = tl.load(b_ptrs,
                     mask=offs_k[:, None] < K - k * BLOCK_SIZE_K,
                     other=0.0)
-        # reading the scales in FP32-format from the shard fp8-tensor pointer, 
-        # so we divide the group-size by 4 to acount for that
-        scale = tl.load(scale_ptr + (quantization_group_size // 4) + b_group_id[None, :] * (quantization_group_size // 4 + 1))
-
+        scale = tl.load(scale_ptr + b_ptrs_offset + ((k * BLOCK_SIZE_K) // quantization_group_size))
         a = tl.load(a_ptrs,
                     mask=token_mask[:, None] &
                     (offs_k[None, :] < K - k * BLOCK_SIZE_K),
                     other=0.0)
-        # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
 
         # Dequantize weight (fp8 -> bf16)
-        sign = ((b & _sign_mask) >> (_mantisa_bits + _exponent_bits)).to(tl.uint16)
         dst_exponent = ((b & _exponent_mask) >> _mantisa_bits).to(tl.uint16)
+        sign = ((b & _sign_mask) >> (_mantisa_bits + _exponent_bits)).to(tl.uint16)
         dst_mantisa = (b & _mantisa_mask).to(tl.uint16)
-        dst_exponent = (dst_exponent - ((1 << (_exponent_bits - 1)) - 1)) + (1 << (q_exponent_bits - 1)) - 1
-        b = ((sign << (q_exponent_bits + q_mantisa_bits)) | (dst_exponent << q_mantisa_bits) |
-                 (dst_mantisa << (q_mantisa_bits - _mantisa_bits))).to(tl.uint16)
-        b = b.to(tl.bfloat16, bitcast=True)
-        b = b * scale.to(compute_type)
+        b = ((sign << (q_exponent_bits + q_mantisa_bits)) | dst_mantisa << (q_mantisa_bits - _mantisa_bits))
+        dst_exponent = (dst_exponent + _exp_bias)
+        b = (b | (dst_exponent << q_mantisa_bits)).to(tl.uint16)
+        b = (b.to(tl.bfloat16, bitcast=True) * scale).to(tl.bfloat16)
+
         accumulator += tl.dot(a, b)
 
 
@@ -393,6 +459,42 @@ def invoke_fused_moe_kernel(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
         **config,
     )
 
+def invoke_dequantization(B: torch.Tensor, scale: torch.Tensor, quantization_group_size: int):
+
+    grid = (1 * triton.cdiv(B.shape[1] * B.shape[0], 64), )
+        
+    
+    _mantisa_bits = 3
+    _exponent_bits = 4
+    q_exponent_bits = 8
+    q_mantisa_bits = 7
+    _sign_mask = 1 << (_mantisa_bits + _exponent_bits)
+    _mantisa_mask = (1 << _mantisa_bits) - 1
+    _exponent_mask = ((1 << _exponent_bits) - 1) << _mantisa_bits
+    B_dq = torch.empty(B.shape, dtype=torch.bfloat16, device=B.device)
+    dequantization[grid](
+        B,
+        scale,
+        B_dq,
+        B.stride(0),
+        B.stride(2),
+        B.stride(1),
+        B.shape[1] * B.shape[0],
+        B.shape[2],
+        _mantisa_bits=_mantisa_bits,
+        q_exponent_bits=q_exponent_bits,
+        q_mantisa_bits=q_mantisa_bits,
+        _exponent_bits=_exponent_bits,
+        _sign_mask=_sign_mask,
+        _exponent_mask=_exponent_mask,
+        _mantisa_mask=_mantisa_mask,
+        quantization_group_size=quantization_group_size,
+        quantization_group_size_q=quantization_group_size+4,
+        quantization_group_size_f=quantization_group_size//4,
+        quantization_group_size_f_scale=quantization_group_size//4+1,
+    )
+    return B_dq
+    #print(f'weight-deq: {B_dq}')
 
 def invoke_fused_moe_kernel_fp8(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, q_scales: torch.Tensor,
                             topk_weights: torch.Tensor, topk_ids: torch.Tensor,
@@ -410,13 +512,12 @@ def invoke_fused_moe_kernel_fp8(A: torch.Tensor, B: torch.Tensor, C: torch.Tenso
         
     
     _mantisa_bits = 3
+    _exponent_bits = 4
     q_exponent_bits = 8
     q_mantisa_bits = 7
-    _exponent_bits = 4
     _sign_mask = 1 << (_mantisa_bits + _exponent_bits)
     _mantisa_mask = (1 << _mantisa_bits) - 1
     _exponent_mask = ((1 << _exponent_bits) - 1) << _mantisa_bits
-
     fused_moe_kernel_fp8[grid](
         A,
         B,
@@ -437,7 +538,6 @@ def invoke_fused_moe_kernel_fp8(A: torch.Tensor, B: torch.Tensor, C: torch.Tenso
         B.stride(1),
         C.stride(1),
         C.stride(2),
-        quantization_group_size,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         top_k=top_k,
         compute_type=tl.bfloat16 if A.dtype == torch.bfloat16 else tl.float16,
@@ -448,6 +548,10 @@ def invoke_fused_moe_kernel_fp8(A: torch.Tensor, B: torch.Tensor, C: torch.Tenso
         _sign_mask=_sign_mask,
         _mantisa_mask=_mantisa_mask,
         _exponent_mask=_exponent_mask,
+        quantization_group_size=quantization_group_size,
+        quantization_group_size_q=quantization_group_size + 4,
+        quantization_group_size_f=quantization_group_size // 4,
+        quantization_group_size_f_scale=quantization_group_size // 4 + 1,
         **config,
     )
 
@@ -539,7 +643,8 @@ def fused_experts(
     override_config: Optional[Dict[str, Any]] = None,
     w1_q_scales: Optional[Dict[torch.Tensor, Any]] = None,
     w2_q_scales: Optional[Dict[torch.Tensor, Any]] = None,
-    quantization_group_size: Optional[int] = 256
+    quantization_group_size: Optional[int] = 256,
+    quantization_group_size2: Optional[int] = 256
 ):
     # Check constraints.
     assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
@@ -553,34 +658,34 @@ def fused_experts(
 
     M, _ = hidden_states.shape
     E, N, _ = w1.shape
-
-    if override_config:
-        config = override_config
-    else:
-        # First try to load optimal config from the file
-        configs = get_moe_configs(E, w2.shape[2])
-
-        if configs:
-            # If an optimal configuration map has been found, look up the
-            # optimal config
-            config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
-        else:
-            # Else use the default config
-            config = {
+    config = {
                 'BLOCK_SIZE_M': 64,
                 'BLOCK_SIZE_N': 64,
-                'BLOCK_SIZE_K': 32,
+                'BLOCK_SIZE_K': min(32, quantization_group_size),
                 'GROUP_SIZE_M': 8
             }
+    if M <= E:
+        config = {
+            'BLOCK_SIZE_M': 16,
+            'BLOCK_SIZE_N': 32,
+            'BLOCK_SIZE_K': min(64, quantization_group_size),
+            'GROUP_SIZE_M': 1
+        }
 
-            if M <= E:
-                config = {
-                    'BLOCK_SIZE_M': 16,
-                    'BLOCK_SIZE_N': 32,
-                    'BLOCK_SIZE_K': 64,
-                    'GROUP_SIZE_M': 1
-                }
-
+    config1 = {
+                'BLOCK_SIZE_M': 64,
+                'BLOCK_SIZE_N': 64,
+                'BLOCK_SIZE_K': min(32, quantization_group_size2),
+                'GROUP_SIZE_M': 8
+            }    
+    if M <= E:
+        config1 = {
+            'BLOCK_SIZE_M': 16,
+            'BLOCK_SIZE_N': 32,
+            'BLOCK_SIZE_K': min(64, quantization_group_size2),
+            'GROUP_SIZE_M': 1
+        }
+        
     intermediate_cache1 = torch.empty((M, topk_ids.shape[1], N),
                                       device=hidden_states.device,
                                       dtype=hidden_states.dtype)
@@ -592,7 +697,7 @@ def fused_experts(
                                       dtype=hidden_states.dtype)
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids, config['BLOCK_SIZE_M'], E)
-    if w1.dtype == torch.float8_e4m3fn or w1.dtype == torch.int8:
+    if w1.dtype == torch.float8_e4m3fn or w1.dtype == torch.int8 or w1.dtype == torch.uint8:
         invoke_fused_moe_kernel_fp8(hidden_states, w1, intermediate_cache1, w1_q_scales,
                             topk_weights, topk_ids, sorted_token_ids,
                             expert_ids, num_tokens_post_padded, False,
@@ -603,11 +708,11 @@ def fused_experts(
                             expert_ids, num_tokens_post_padded, False,
                             topk_ids.shape[1], config)
     ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
-    if w2.dtype == torch.float8_e4m3fn or w2.dtype == torch.int8:
+    if w2.dtype == torch.float8_e4m3fn or w2.dtype == torch.int8 or w2.dtype == torch.uint8:
         invoke_fused_moe_kernel_fp8(intermediate_cache2, w2, intermediate_cache3, w2_q_scales,
                             topk_weights, topk_ids, sorted_token_ids,
-                            expert_ids, num_tokens_post_padded, False,
-                            topk_ids.shape[1], quantization_group_size, config)
+                            expert_ids, num_tokens_post_padded, True,
+                            1, quantization_group_size2, config1)
     else:
         invoke_fused_moe_kernel(intermediate_cache2, w2, intermediate_cache3,
                             topk_weights, topk_ids, sorted_token_ids,
