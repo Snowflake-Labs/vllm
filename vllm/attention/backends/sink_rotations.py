@@ -41,7 +41,7 @@ class SinkAttentionRotaryImpl:
             key_cache[sink_blocks] = prefix_sinks_pre_roll
 
     def process_decode_metadata(self, attn_metadata: AttentionMetadata, key_cache: torch.Tensor, rotary_emb: Callable) -> BackedUpSink:
-        decode_meta: AttentionMetadataPerStage = attn_metadata.decode_meta
+        decode_meta: AttentionMetadataPerStage = attn_metadata.decode_metadata
         backed_up_sink = BackedUpSink()
 
         if self.sink_size > 0:
