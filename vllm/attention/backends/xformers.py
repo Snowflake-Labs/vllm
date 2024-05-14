@@ -10,6 +10,7 @@ from xformers.ops.fmha.attn_bias import (AttentionBias,
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionMetadata,
                                               AttentionMetadataPerStage)
+from vllm.attention.backends.sink_rotations import SinkAttentionRotaryImpl
 from vllm.attention.ops.paged_attn import (PagedAttention,
                                            PagedAttentionMetadata)
 from vllm.logger import init_logger
@@ -254,8 +255,10 @@ class XFormersImpl(AttentionImpl):
                 output[:num_prefill_tokens] = out
 
         if decode_meta := attn_metadata.decode_metadata:
-            if self.sink_size is not None and self.sink_size > 0:
-                prefix_sinks_pre_roll, sink_blocks_idx = self.uprotate_sink_positions(attn_metadata, decode_meta, key, key_cache, rotary_emb)
+            do_backup = self.sink_size is not None and self.sink_size > 0
+            if do_backup:
+                sink_attn_obj = SinkAttentionRotaryImpl(self.sink_size, self.sliding_window, self.num_kv_heads, self.head_size)
+                backed_up_sink = sink_attn_obj.process_decode_metadata(attn_metadata, key_cache, rotary_emb)
 
             output[num_prefill_tokens:] = PagedAttention.forward_decode(
                 decode_query,
@@ -271,8 +274,8 @@ class XFormersImpl(AttentionImpl):
                 kv_scale,
             )
 
-            if self.sink_size is not None and self.sink_size > 0:
-                self.restore_backup(attn_metadata, decode_meta, key, key_cache, prefix_sinks_pre_roll)
+            if do_backup:
+                sink_attn_obj.restore_cache_from_backup(key_cache, backed_up_sink)
 
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)
@@ -286,8 +289,8 @@ class XFormersImpl(AttentionImpl):
         all_prefix_sinks_pre_roll = []
         all_sink_blocks = []
         for batch_i, batch_i_cl in enumerate(attn_metadata.decode_metadata.context_lens):
-            prefix_sinks_pre_roll, sink_blocks = (self._uprotate_sink_single_batch(batch_i, batch_i_cl, decode_meta, key, key_cache, rotary_emb,
-                                             self.sink_size, self.cache_size))
+            prefix_sinks_pre_roll, sink_blocks = self._uprotate_sink_single_batch(batch_i, batch_i_cl, decode_meta, key, key_cache, rotary_emb,
+                                             self.sink_size, self.cache_size)
             if prefix_sinks_pre_roll:
                 all_prefix_sinks_pre_roll.append(prefix_sinks_pre_roll)
                 all_sink_blocks.append(sink_blocks)
