@@ -255,7 +255,7 @@ class XFormersImpl(AttentionImpl):
 
         if decode_meta := attn_metadata.decode_metadata:
             if self.sink_size is not None and self.sink_size > 0:
-                self.uprotate_sink_positions(attn_metadata, decode_meta, key, key_cache, rotary_emb)
+                prefix_sinks_pre_roll, sink_blocks_idx = self.uprotate_sink_positions(attn_metadata, decode_meta, key, key_cache, rotary_emb)
 
             output[num_prefill_tokens:] = PagedAttention.forward_decode(
                 decode_query,
@@ -271,15 +271,66 @@ class XFormersImpl(AttentionImpl):
                 kv_scale,
             )
 
+            if self.sink_size is not None and self.sink_size > 0:
+                self.restore_backup(attn_metadata, decode_meta, key, key_cache, prefix_sinks_pre_roll)
+
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)
 
-    def uprotate_sink_positions(self, attn_metadata, decode_meta, key, key_cache, rotary_emb):
+    def restore_backup(self, attn_metadata, decode_meta, key, key_cache, all_prefix_sinks_pre_roll, all_sink_blocks):
+        for prefix_sinks_pre_roll, sink_blocks in zip(all_prefix_sinks_pre_roll, all_sink_blocks):
+            key_cache[sink_blocks] = prefix_sinks_pre_roll
+
+    def uprotate_sink_positions(self, attn_metadata, decode_meta, key, key_cache, rotary_emb) -> \
+            Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        all_prefix_sinks_pre_roll = []
+        all_sink_blocks = []
         for batch_i, batch_i_cl in enumerate(attn_metadata.decode_metadata.context_lens):
-            self._uprotate_sink_single_batch(batch_i, batch_i_cl, decode_meta, key, key_cache, rotary_emb,
-                                             self.sink_size, self.cache_size)
+            prefix_sinks_pre_roll, sink_blocks = (self._uprotate_sink_single_batch(batch_i, batch_i_cl, decode_meta, key, key_cache, rotary_emb,
+                                             self.sink_size, self.cache_size))
+            if prefix_sinks_pre_roll:
+                all_prefix_sinks_pre_roll.append(prefix_sinks_pre_roll)
+                all_sink_blocks.append(sink_blocks)
+        return all_prefix_sinks_pre_roll, all_sink_blocks
 
     def _uprotate_sink_single_batch(self, batch_i, batch_i_cl, decode_meta,
+                                    key, key_cache, rotary_emb, sink_size,
+                                    cache_size) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """supports  the case:
+        [ ] AR decoding with 1 tokens to generate
+            [ ] within the cache
+            [ ] overflowing the cache
+        # return something easy to put back to the cache
+        """
+        sink_block_size = key_cache.shape[-2]
+        if batch_i_cl > cache_size:
+            if torch.distributed.get_rank() == 0:
+                import pdb; pdb.set_trace()
+        num_total_tokens_evicted = batch_i_cl - (sink_size + cache_size)    # fixme this number is clipped at 1
+
+        if num_total_tokens_evicted > 0:
+            num_sinks_current = min(sink_size, batch_i_cl) // sink_block_size   # this should be 1 anyway, more may not be supported
+            sink_blocks = decode_meta.block_tables[batch_i, :num_sinks_current]
+            # get the cache for key where the prefix is
+            sink_key_cache = torch.index_select(key_cache, index=sink_blocks, dim=0)
+            backed_up_sink_key_cache = sink_key_cache.clone()
+            # reshape it to key-like structure :  [num_blocks, num_heads, head_size/x, block_size, x]
+            sink_key_cache_reshaped = sink_key_cache.permute(3, 0, 1, 2, 4).reshape(sink_block_size, self.num_kv_heads, self.head_size)
+            sink_to_roll = sink_key_cache_reshaped.view(sink_size, -1)
+            dummy_query_to_roll = torch.zeros_like(sink_to_roll).to(key.device)
+            # we just evicted some tokens from cache, and we need to roll sink on their positions
+            # find the additional rotations to apply on the sink
+            # either we fit in the cache or need to evict one token and uprotate sink on this position.
+
+            positions_one_bs = (torch.ones(1, num_sinks_current*sink_block_size).to(key.device) * num_total_tokens_evicted).to(int)
+
+            _, sink_key_rotated = rotary_emb(positions_one_bs,
+                            dummy_query_to_roll,
+                            sink_to_roll)
+            key_cache[sink_blocks[0]] = sink_key_rotated.view(16, 32, 16, 8).permute(1, 2, 0, 3)    # fixme, this block sizes are to be parametrized
+            return backed_up_sink_key_cache, sink_blocks
+
+    def _uprotate_sink_single_batch_old(self, batch_i, batch_i_cl, decode_meta,
                                     key, key_cache, rotary_emb, sink_size,
                                     cache_size):
         """
@@ -354,7 +405,7 @@ class XFormersImpl(AttentionImpl):
                     attn_metadata.prompt_lens)
                 if self.sliding_window is not None:
                     attn_bias = attn_bias.make_local_attention(
-                        self.sliding_window)
+                        self.sliding_window + self.sink_size)
                 attn_metadata.attn_bias = [attn_bias]
             else:
                 attn_metadata.attn_bias = _make_alibi_bias(
@@ -433,3 +484,6 @@ def _make_alibi_bias(
         attn_biases.append(LowerTriangularMaskWithTensorBias(bias))
 
     return attn_biases
+
+
+
