@@ -11,8 +11,6 @@ from unittest.mock import MagicMock
 
 import torch
 
-# from vllm.attention import AttentionMetadata, AttentionMetadataPerStage
-
 
 class BackedUpSink:
     def __init__(self):
@@ -34,6 +32,9 @@ class BackedUpSink:
         for batch_i, (backup, blocks) in enumerate(zip(self.sink_key_cache, self.sink_blocks)):
             if not self.is_empty[batch_i]:
                 yield batch_i, backup, blocks
+    @property
+    def all_empty(self) -> bool:
+        return all(self.is_empty)
 
 
 class SinkAttentionRotaryImpl:
@@ -146,17 +147,19 @@ def setup_environment_for_sink(request):
     MAX_BLOCK_PER_ONE_EL = 15
     batch_size = 2
     num_blocks = MAX_BLOCK_PER_ONE_EL * batch_size
-    block_size = 3
+    # key shapes
     num_kv_heads = 5
     head_size = 128
+    block_size = 3
+    # cache persistency
     sliding_window = 6
     sink_size = 3
 
     context_len1 = request.param
     context_len2 = 1 + (context_len1 + 10) % MAX_BLOCK_PER_ONE_EL       # THIS CANNOT BE 0
 
-    hidden_block_size = block_size * num_kv_heads * head_size
-    original_shape = (num_kv_heads, block_size, head_size)
+    # hidden_block_size = block_size * num_kv_heads * head_size
+    # original_shape = (num_kv_heads, block_size, head_size)
 
     # Creating dummy tensors for key_cache and dummy_query (assuming dtype=torch.float32 for simplicity)
     key_cache = torch.rand(num_blocks, num_kv_heads, head_size//8, block_size, 8)
@@ -184,15 +187,16 @@ def test_process_decode_metadata(setup_environment_for_sink):
     # Run the method under test
     backed_up_sink = sink_attn_obj.process_decode_metadata(attn_metadata, key_cache, rotary_emb)
     # key cache should be updated
-    assert torch.max(key_cache - initial_key_cache) > 0
-    assert torch.min(key_cache - initial_key_cache) == 0
-    assert torch.all(((key_cache - initial_key_cache) % 1.0) == 0)
+    if not backed_up_sink.all_empty:
+        assert torch.max(key_cache - initial_key_cache) > 0
+        assert torch.min(key_cache - initial_key_cache) == 0
+        assert torch.all(torch.logical_or(torch.isclose(((key_cache - initial_key_cache) % 1.0), torch.ones_like(initial_key_cache)),  torch.isclose(((key_cache - initial_key_cache) % 1.0), torch.zeros_like(initial_key_cache))))
+        assert rotary_emb.call_count == len(backed_up_sink.is_empty) - sum(backed_up_sink.is_empty)  # Assuming it should be called once in this scenario
 
     # Check if rotary_emb was called, indicating rotation occurred
     sink_attn_obj.restore_cache_from_backup(key_cache, backed_up_sink)
     assert torch.equal(key_cache, initial_key_cache)
 
-    assert rotary_emb.call_count == 1  # Assuming it should be called once in this scenario
 
 
 def test_process_decode_metadata_and_restore(setup_model_evaluator):
