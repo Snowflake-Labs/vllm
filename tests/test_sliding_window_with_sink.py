@@ -1,17 +1,17 @@
-import torch
 import torch.distributed
-from vllm.attention.backends.abstract import AttentionMetadata, AttentionMetadataPerStage
 import pytest
 import torch
 from unittest.mock import MagicMock
-from typing import Callable, Tuple
 
-# TODO:
-# add restoring cache from bckp
-# add reshpes as special functions
-# add parametrization of shapes
-# add typing
-# pass correct context length
+# from vllm.attention.backends.sink_rotations import SinkAttentionRotaryImpl
+
+
+from typing import Callable
+from unittest.mock import MagicMock
+
+import torch
+
+# from vllm.attention import AttentionMetadata, AttentionMetadataPerStage
 
 
 class BackedUpSink:
@@ -48,8 +48,8 @@ class SinkAttentionRotaryImpl:
         for _, prefix_sinks_pre_roll, sink_blocks in backed_up_sink:
             key_cache[sink_blocks] = prefix_sinks_pre_roll
 
-    def process_decode_metadata(self, attn_metadata: AttentionMetadata, key_cache: torch.Tensor, rotary_emb: Callable) -> BackedUpSink:
-        decode_meta: AttentionMetadataPerStage = attn_metadata.decode_meta
+    def process_decode_metadata(self, attn_metadata, key_cache: torch.Tensor, rotary_emb: Callable) -> BackedUpSink:
+        decode_meta = attn_metadata.decode_metadata
         backed_up_sink = BackedUpSink()
 
         if self.sink_size > 0:
@@ -57,7 +57,7 @@ class SinkAttentionRotaryImpl:
             self._rotate_sinks(decode_meta, key_cache, rotary_emb, backed_up_sink)
         return backed_up_sink
 
-    def _prepare_sink_rotation(self, decode_meta: AttentionMetadataPerStage, key_cache: torch.Tensor, backed_up_sink: BackedUpSink):
+    def _prepare_sink_rotation(self, decode_meta, key_cache: torch.Tensor, backed_up_sink: BackedUpSink):
         """Prepare and return backup of sink positions for potential restoration."""
         for batch_i, batch_context_len in enumerate(decode_meta.context_lens):
             num_total_tokens_evicted = batch_context_len - self.cache_size
@@ -66,7 +66,7 @@ class SinkAttentionRotaryImpl:
             else:
                 backed_up_sink.append_empty()
 
-    def _backup_sink(self, batch_i: int, batch_context_len: int, decode_meta: AttentionMetadataPerStage,
+    def _backup_sink(self, batch_i: int, batch_context_len: int, decode_meta,
                     key_cache: torch.Tensor, backed_up_sink: BackedUpSink) -> None:
         num_sinks_current = min(self.sink_size, batch_context_len) // key_cache.shape[-2]
         sink_blocks = decode_meta.block_tables[batch_i, :num_sinks_current]
@@ -79,7 +79,7 @@ class SinkAttentionRotaryImpl:
         for batch_i, backup, blocks in backed_up_sink:
             self._rotate_sink_positions(backup, blocks, decode_meta, key_cache, rotary_emb, batch_i)
 
-    def _rotate_sink_positions(self, backup: torch.Tensor, blocks: torch.Tensor, decode_meta: AttentionMetadataPerStage,
+    def _rotate_sink_positions(self, backup: torch.Tensor, blocks: torch.Tensor, decode_meta,
                               key_cache: torch.Tensor, rotary_emb: MagicMock, batch_i: int) -> None:
         # get rotations angles
         num_total_tokens_evicted = self._calculate_evictions(decode_meta, batch_i)
@@ -93,14 +93,21 @@ class SinkAttentionRotaryImpl:
         # Restore rotated sinks into the original position in the cache
         key_cache[blocks[0]] = rotated_sinks.view(rotated_sinks.shape[0],   # fixme: only the first block
                                                   self.num_kv_heads,
-                                                  self.head_size).permute(1, 0, 2)
+                                                  self.head_size//8, 8).permute(1, 2, 0, 3)
 
     def _format_key_cache_to_rotation(self, x):
-        return x.permute(0, 2, 1, 3).reshape(self.sink_size, -1)
+        # in: bs,  num_kv_heads, self.head_size/8, 16, 8
+        return x.permute(3, 0, 1, 2, 4).reshape(self.sink_size, -1)
 
     def _calculate_evictions(self, decode_meta: MagicMock, batch_i: int):
         return max(decode_meta.context_lens[batch_i] - self.cache_size, 0)
 
+# TODO:
+# add restoring cache from bckp
+# add reshpes as special functions
+# add parametrization of shapes
+# add typing
+# pass correct context length
 
 
 # @pytest.fixture
@@ -141,7 +148,7 @@ def setup_environment_for_sink(request):
     num_blocks = MAX_BLOCK_PER_ONE_EL * batch_size
     block_size = 3
     num_kv_heads = 5
-    head_size = 8
+    head_size = 128
     sliding_window = 6
     sink_size = 3
 
@@ -152,12 +159,12 @@ def setup_environment_for_sink(request):
     original_shape = (num_kv_heads, block_size, head_size)
 
     # Creating dummy tensors for key_cache and dummy_query (assuming dtype=torch.float32 for simplicity)
-    key_cache = torch.rand(num_blocks, num_kv_heads, block_size, head_size)
+    key_cache = torch.rand(num_blocks, num_kv_heads, head_size//8, block_size, 8)
     decode_meta = MagicMock()  # Simulating the metadata
     decode_meta.block_tables = torch.arange(num_blocks).__reversed__().reshape(batch_size, -1)
     decode_meta.context_lens = torch.LongTensor((context_len1, context_len2))
     attn_metadata = MagicMock()
-    attn_metadata.decode_meta = decode_meta
+    attn_metadata.decode_metadata = decode_meta
     sink_attn_obj = SinkAttentionRotaryImpl(sink_size, sliding_window, num_kv_heads, head_size)
 
     def _fake_rotate(x, pos):
