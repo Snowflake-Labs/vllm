@@ -316,8 +316,6 @@ class ArcticDecoderLayer(nn.Module):
         self.self_attn = ArcticAttention(config,
                                          layer_idx,
                                          linear_method=linear_method,
-                                         sliding_window=sliding_window,
-                                         sink_size=sink_size,
                                          )
         self.block_sparse_moe = ArcticMoE(
             config,
