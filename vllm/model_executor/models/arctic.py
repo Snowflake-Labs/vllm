@@ -100,7 +100,7 @@ class ArcticMoE(nn.Module):
         self.layer_id = layer_id
         self.top_k = config.num_experts_per_tok
         self.intermediate_size = config.intermediate_size // self.tp_size
-        self.enable_dequantization_fusion = False
+        self.enable_dequantization_fusion = True
         self.is_moe_layer = (layer_id + 1) % config.moe_layer_frequency == 0
         self.is_quant = isinstance(linear_method, DeepSpeedFPLinearMethod)
         self.reduce_results = reduce_results
@@ -214,6 +214,7 @@ class ArcticMoE(nn.Module):
                 if new_data.shape[-1] % (2**i) == 0 
             ])
             param_q = param.ds_quantize_(new_data)
+            
             del new_data
             new_data = None
             gc.collect()
@@ -442,6 +443,7 @@ class ArcticModel(nn.Module):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
+
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states = layer(positions, hidden_states, kv_caches[i],

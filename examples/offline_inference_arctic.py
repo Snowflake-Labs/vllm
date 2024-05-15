@@ -16,7 +16,9 @@ llm = LLM(model=arctic_model_path,
           quantization="deepspeedfp",
           trust_remote_code=True, 
           tensor_parallel_size=8,
-          gpu_memory_utilization=0.92,)
+          gpu_memory_utilization=0.92,
+        #   load_format="dummy",
+        )
 # Generate texts from the prompts. The output is a list of RequestOutput objects
 # that contain the prompt, generated text, and other information.
 

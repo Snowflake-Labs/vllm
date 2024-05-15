@@ -253,10 +253,13 @@ class Scheduler:
         if self.scheduler_config.chunked_prefill_enabled:
             self.prompt_limit = self.scheduler_config.max_model_len
         else:
-            self.prompt_limit = min(
-                self.scheduler_config.max_model_len,
-                self.scheduler_config.max_num_batched_tokens)
-
+            self.prompt_limit = self.scheduler_config.max_num_batched_tokens
+            #min(
+            #    self.scheduler_config.max_model_len,
+            #    self.scheduler_config.max_num_batched_tokens)
+        #print(self.prompt_limit)
+        #exit()
+        self.prompt_limit = 10000
         BlockSpaceManagerImpl = BlockSpaceManager.get_block_space_manager_class(
             version="v2" if self.scheduler_config.
             use_v2_block_manager else "v1")

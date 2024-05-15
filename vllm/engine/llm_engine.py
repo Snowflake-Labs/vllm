@@ -395,7 +395,7 @@ class LLMEngine:
         # Create the sequence group.
         seq_group = SequenceGroup(request_id, [seq], sampling_params,
                                   arrival_time, lora_request, multi_modal_data)
-
+                                  
         # Add the sequence group to the scheduler.
         self.scheduler.add_seq_group(seq_group)
 

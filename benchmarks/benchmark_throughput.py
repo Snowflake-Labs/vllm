@@ -98,6 +98,7 @@ def run_vllm(
         download_dir=download_dir,
         enable_chunked_prefill=enable_chunked_prefill,
         max_num_batched_tokens=max_num_batched_tokens,
+        load_format="dummy",
     )
 
     # Add the requests to the engine.
@@ -211,9 +212,10 @@ def main(args: argparse.Namespace):
         args.tokenizer, trust_remote_code=args.trust_remote_code)
     if args.dataset is None:
         # Synthesize a prompt with the given input length.
-        prompt = "hi" * (args.input_len - 1)
-        requests = [(prompt, args.input_len, args.output_len)
-                    for _ in range(args.num_prompts)]
+        # args.num_prompts = 
+        prompts = ["hi" * (inp_len - 1) for inp_len in args.input_len]
+        requests = [(prompt, inp_len, args.output_len)
+                    for prompt,inp_len in zip(prompts, args.input_len)]
     else:
         requests = sample_requests(args.dataset, args.num_prompts, tokenizer,
                                    args.output_len)
@@ -243,6 +245,10 @@ def main(args: argparse.Namespace):
     print(f"Throughput: {len(requests) / elapsed_time:.2f} requests/s, "
           f"{total_num_tokens / elapsed_time:.2f} tokens/s")
 
+def list_of_ints(arg):
+    return list(map(int, arg.split(',')))
+
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark the throughput.")
@@ -255,7 +261,7 @@ if __name__ == "__main__":
                         default=None,
                         help="Path to the dataset.")
     parser.add_argument("--input-len",
-                        type=int,
+                        type=list_of_ints,
                         default=None,
                         help="Input prompt length for each request")
     parser.add_argument("--output-len",
@@ -267,7 +273,6 @@ if __name__ == "__main__":
     parser.add_argument("--tokenizer", type=str, default=None)
     parser.add_argument('--quantization',
                         '-q',
-                        choices=['awq', 'gptq', 'squeezellm', None],
                         default=None)
     parser.add_argument("--tensor-parallel-size", "-tp", type=int, default=1)
     parser.add_argument("--n",
@@ -321,6 +326,12 @@ if __name__ == "__main__":
         'FP8_E5M2 (without scaling) is only supported on cuda version greater '
         'than 11.8. On ROCm (AMD GPU), FP8_E4M3 is instead supported for '
         'common inference criteria.')
+    parser.add_argument(
+        "--load-format",
+        type=str,
+        default="auto",
+        help=
+        "")
     parser.add_argument(
         '--quantization-param-path',
         type=str,

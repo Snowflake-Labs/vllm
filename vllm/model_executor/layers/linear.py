@@ -216,6 +216,7 @@ class ColumnParallelLinear(torch.nn.Module):
 
         # Matrix multiply.
         output_parallel = self.linear_method.apply_weights(self, input_, bias)
+        # output_parallel = torch.empty(input_.shape[:-1] + (self.weight.shape[0],), dtype=input_.dtype, device=input_.device)
         if self.gather_output:
             # All-gather across the partitions.
             output = tensor_model_parallel_all_gather(output_parallel)
@@ -259,6 +260,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         self.output_sizes = output_sizes
         tp_size = get_tensor_model_parallel_world_size()
         assert all(output_size % tp_size == 0 for output_size in output_sizes)
+        
         super().__init__(input_size, sum(output_sizes), bias, gather_output,
                          skip_bias_add, params_dtype, linear_method)
 
@@ -523,7 +525,7 @@ class RowParallelLinear(torch.nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.input_size_per_partition = divide(input_size, self.tp_size)
         self.skip_bias_add = skip_bias_add
-        if True: #linear_method is None:
+        if linear_method is None:
             linear_method = UnquantizedLinearMethod()
         self.linear_method = linear_method
         self.linear_method.create_weights(self,
@@ -573,6 +575,7 @@ class RowParallelLinear(torch.nn.Module):
         # Matrix multiply.
         output_parallel = self.linear_method.apply_weights(
             self, input_parallel)
+        # output_parallel = torch.empty(input_parallel.shape[:-1] + (self.weight.shape[0],), dtype=input_parallel.dtype, device=input_parallel.device)
         if self.reduce_results and self.tp_size > 1:
             output_ = tensor_model_parallel_all_reduce(output_parallel)
         else:

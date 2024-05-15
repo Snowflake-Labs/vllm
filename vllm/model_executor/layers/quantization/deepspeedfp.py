@@ -9,7 +9,8 @@ from vllm.model_executor.layers.linear import (LinearMethodBase,
                                                set_weight_attrs)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
-
+import gc
+from vllm.model_executor.layers.fused_moe import invoke_fused_fp8_kernel
 
 class DeepSpeedFPConfig(QuantizationConfig):
     """Config for DeepSpeed FP quantizer. It supports fp6 and fp8."""
@@ -108,10 +109,9 @@ class DeepSpeedFPLinearMethod(LinearMethodBase):
             # Calls the original weight loader (if any), quantizes the result,
             # and then loads the quantized parameter.
             if weight_loader is not None:
-                orig_param_data = param.data
-                param.data = param.ds_dequantize()
                 weight_loader(param, loaded_weight, *args, **kwargs)
-                param.data, loaded_weight = orig_param_data, param.data
+                loaded_weight = param.data
+            
             param.ds_quantize_(loaded_weight.cuda())
 
         extra_weight_attrs["weight_loader"] = quant_weight_loader
@@ -121,9 +121,13 @@ class DeepSpeedFPLinearMethod(LinearMethodBase):
                       layer: torch.nn.Module,
                       x: torch.Tensor,
                       bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-        weight = layer.weight
-        y = weight.ds_dequantize()
-        return F.linear(x, y, bias)
+        # weight = layer.weight
+        # y = weight.ds_dequantize()
+        # return F.linear(x, y, bias)
+        return invoke_fused_fp8_kernel(x, 
+                            layer.weight, 
+                            layer.weight.quantization_scales(),
+                            layer.weight.fp_quantizer.group_size)
 
 
 class DeepSpeedFPParameter(nn.Parameter):
@@ -136,16 +140,23 @@ class DeepSpeedFPParameter(nn.Parameter):
     def __new__(cls, orig_shape: torch.Size, params_dtype: torch.dtype,
                 quant_config: DeepSpeedFPConfig):
         from deepspeed.ops.fp_quantizer import FP_Quantize
-        data = torch.empty((
-            0, #orig_shape.numel() // quant_config.group_size,
-            0, #quant_config.group_size * quant_config.weight_bits // 8 + 4,
-        ), dtype=torch.uint8)
+        # data = torch.empty(orig_shape, dtype=params_dtype)
+        if len(orig_shape) == 2:
+            data = torch.empty(orig_shape, dtype=params_dtype)
+        else:
+            data = torch.empty(0, dtype=torch.uint8)
         self = torch.Tensor._make_subclass(cls, data, data.requires_grad)
         self.orig_shape = orig_shape
         self.quant_config = quant_config
         self.fp_quantizer = FP_Quantize(group_size=quant_config.group_size)
         self.fp_quantizer.orig_shape = orig_shape
         self.fp_quantizer.orig_dtype = params_dtype
+        # new_data = self.data
+        # self.ds_quantize_(new_data)
+        # del new_data
+        # new_data = None
+        # gc.collect()
+        # torch.cuda.empty_cache()
         # self.data_reshaped = self.fp_quantizer.get_reshaped_data(self.data, list(self.orig_shape))
         self.shadow_data = [None]*orig_shape[0]
         return self
