@@ -7,6 +7,7 @@ import torch.nn as nn
 from vllm.attention.backends.abstract import (AttentionMetadata,
                                               AttentionMetadataPerStage)
 from vllm.attention.selector import get_attn_backend
+from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 
 
 class Attention(nn.Module):
@@ -29,12 +30,13 @@ class Attention(nn.Module):
         num_kv_heads: Optional[int] = None,
         alibi_slopes: Optional[List[float]] = None,
         sliding_window: Optional[int] = None,
+        sink_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.backend = get_attn_backend(torch.get_default_dtype())
         impl_cls = self.backend.get_impl_cls()
         self.impl = impl_cls(num_heads, head_size, scale, num_kv_heads,
-                             alibi_slopes, sliding_window)
+                             alibi_slopes, sliding_window, sink_size)
 
     def forward(
         self,
@@ -43,7 +45,8 @@ class Attention(nn.Module):
         value: torch.Tensor,
         kv_cache: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata[AttentionMetadataPerStage],
+        rotary_emb: RotaryEmbedding,
         kv_scale: float = 1.0,
     ) -> torch.Tensor:
-        return self.impl.forward(query, key, value, kv_cache, attn_metadata,
+        return self.impl.forward(query, key, value, kv_cache, attn_metadata, rotary_emb,
                                  kv_scale)

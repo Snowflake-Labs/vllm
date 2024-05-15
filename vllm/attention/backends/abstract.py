@@ -106,6 +106,7 @@ class AttentionImpl(ABC):
         num_kv_heads: Optional[int] = None,
         alibi_slopes: Optional[List[float]] = None,
         sliding_window: Optional[int] = None,
+        sink_size: Optional[int] = None,
     ) -> None:
         raise NotImplementedError
 
@@ -117,6 +118,7 @@ class AttentionImpl(ABC):
         value: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata[AttentionMetadataPerStage],
+        rotary_emb,
         kv_scale: float,
     ) -> torch.Tensor:
         raise NotImplementedError

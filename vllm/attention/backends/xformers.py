@@ -7,10 +7,10 @@ from xformers import ops as xops
 from xformers.ops.fmha.attn_bias import (AttentionBias,
                                          BlockDiagonalCausalMask,
                                          LowerTriangularMaskWithTensorBias)
-
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionMetadata,
                                               AttentionMetadataPerStage)
+from vllm.attention.backends.sink_rotations import SinkAttentionRotaryImpl
 from vllm.attention.ops.paged_attn import (PagedAttention,
                                            PagedAttentionMetadata)
 from vllm.logger import init_logger
@@ -146,12 +146,16 @@ class XFormersImpl(AttentionImpl):
         num_kv_heads: Optional[int] = None,
         alibi_slopes: Optional[List[float]] = None,
         sliding_window: Optional[int] = None,
+        sink_size: Optional[int] = None,
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
         self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
         self.sliding_window = sliding_window
+        self.sink_size = sink_size
+        self.cache_size = self.sliding_window + self.sink_size
+
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
         self.alibi_slopes = alibi_slopes
@@ -172,6 +176,7 @@ class XFormersImpl(AttentionImpl):
         value: torch.Tensor,
         kv_cache: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata[XFormersMetadata],
+        rotary_emb,
         kv_scale: float,
     ) -> torch.Tensor:
         """Forward pass with xFormers and PagedAttention.
@@ -205,6 +210,7 @@ class XFormersImpl(AttentionImpl):
 
         num_prefill_tokens = attn_metadata.num_prefill_tokens
         num_decode_tokens = attn_metadata.num_decode_tokens
+
         assert key.shape[0] == num_prefill_tokens + num_decode_tokens
         assert value.shape[0] == num_prefill_tokens + num_decode_tokens
 
@@ -223,8 +229,6 @@ class XFormersImpl(AttentionImpl):
             # Prompt run.
             if kv_cache is None or prefill_meta.block_tables.numel() == 0:
                 # normal attention.
-                # block tables are empty if the prompt does not have a cached
-                # prefix.
                 out = self._run_memory_efficient_xformers_forward(
                     query, key, value, prefill_meta)
                 assert out.shape == output[:num_prefill_tokens].shape
@@ -251,6 +255,11 @@ class XFormersImpl(AttentionImpl):
                 output[:num_prefill_tokens] = out
 
         if decode_meta := attn_metadata.decode_metadata:
+            do_backup = self.sink_size is not None and self.sink_size > 0
+            if do_backup:
+                sink_attn_obj = SinkAttentionRotaryImpl(self.sink_size, self.sliding_window, self.num_kv_heads, self.head_size)
+                backed_up_sink = sink_attn_obj.process_decode_metadata(attn_metadata, key_cache, rotary_emb)
+
             output[num_prefill_tokens:] = PagedAttention.forward_decode(
                 decode_query,
                 key_cache,
@@ -265,8 +274,96 @@ class XFormersImpl(AttentionImpl):
                 kv_scale,
             )
 
+            if do_backup:
+                sink_attn_obj.restore_cache_from_backup(key_cache, backed_up_sink)
+
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)
+
+    def restore_backup(self, attn_metadata, decode_meta, key, key_cache, all_prefix_sinks_pre_roll, all_sink_blocks):
+        for prefix_sinks_pre_roll, sink_blocks in zip(all_prefix_sinks_pre_roll, all_sink_blocks):
+            key_cache[sink_blocks] = prefix_sinks_pre_roll
+
+    def uprotate_sink_positions(self, attn_metadata, decode_meta, key, key_cache, rotary_emb) -> \
+            Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        all_prefix_sinks_pre_roll = []
+        all_sink_blocks = []
+        for batch_i, batch_i_cl in enumerate(attn_metadata.decode_metadata.context_lens):
+            prefix_sinks_pre_roll, sink_blocks = self._uprotate_sink_single_batch(batch_i, batch_i_cl, decode_meta, key, key_cache, rotary_emb,
+                                             self.sink_size, self.cache_size)
+            if prefix_sinks_pre_roll:
+                all_prefix_sinks_pre_roll.append(prefix_sinks_pre_roll)
+                all_sink_blocks.append(sink_blocks)
+        return all_prefix_sinks_pre_roll, all_sink_blocks
+
+    def _uprotate_sink_single_batch(self, batch_i, batch_i_cl, decode_meta,
+                                    key, key_cache, rotary_emb, sink_size,
+                                    cache_size) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """supports  the case:
+        [ ] AR decoding with 1 tokens to generate
+            [ ] within the cache
+            [ ] overflowing the cache
+        # return something easy to put back to the cache
+        """
+        sink_block_size = key_cache.shape[-2]
+        if batch_i_cl > cache_size:
+            if torch.distributed.get_rank() == 0:
+                import pdb; pdb.set_trace()
+        num_total_tokens_evicted = batch_i_cl - (sink_size + cache_size)    # fixme this number is clipped at 1
+
+        if num_total_tokens_evicted > 0:
+            num_sinks_current = min(sink_size, batch_i_cl) // sink_block_size   # this should be 1 anyway, more may not be supported
+            sink_blocks = decode_meta.block_tables[batch_i, :num_sinks_current]
+            # get the cache for key where the prefix is
+            sink_key_cache = torch.index_select(key_cache, index=sink_blocks, dim=0)
+            backed_up_sink_key_cache = sink_key_cache.clone()
+            # reshape it to key-like structure :  [num_blocks, num_heads, head_size/x, block_size, x]
+            sink_key_cache_reshaped = sink_key_cache.permute(3, 0, 1, 2, 4).reshape(sink_block_size, self.num_kv_heads, self.head_size)
+            sink_to_roll = sink_key_cache_reshaped.view(sink_size, -1)
+            dummy_query_to_roll = torch.zeros_like(sink_to_roll).to(key.device)
+            # we just evicted some tokens from cache, and we need to roll sink on their positions
+            # find the additional rotations to apply on the sink
+            # either we fit in the cache or need to evict one token and uprotate sink on this position.
+
+            positions_one_bs = (torch.ones(1, num_sinks_current*sink_block_size).to(key.device) * num_total_tokens_evicted).to(int)
+
+            _, sink_key_rotated = rotary_emb(positions_one_bs,
+                            dummy_query_to_roll,
+                            sink_to_roll)
+            key_cache[sink_blocks[0]] = sink_key_rotated.view(16, 32, 16, 8).permute(1, 2, 0, 3)    # fixme, this block sizes are to be parametrized
+            return backed_up_sink_key_cache, sink_blocks
+
+    def _uprotate_sink_single_batch_old(self, batch_i, batch_i_cl, decode_meta,
+                                    key, key_cache, rotary_emb, sink_size,
+                                    cache_size):
+        """
+            We just evicted some tokens from cache, and we need to roll sink on their positions.
+            Fortunately, rotations are additive, because `rotate(rotate(key, 1), 1) = rotate(key, 2)`,
+            so we can rotate cached keys from the sink by one step each time a token gets evicted.
+            This ensures that the distance between sink and currently generated token is never exceeding cache size
+            (sum of sink and sliding window).
+        """
+        sink_block_size = key_cache.shape[-2]
+        assert batch_i_cl <= cache_size
+        num_tokens_evicted_this_pass = int(batch_i_cl == cache_size)
+        if num_tokens_evicted_this_pass:
+            num_sinks_current = min(sink_size, batch_i_cl) // sink_block_size       # this should be 1 anyway, more may not be supported
+            sink_blocks = decode_meta.block_tables[batch_i, :num_sinks_current]
+            sink_key_cache = torch.index_select(key_cache, index=sink_blocks, dim=0)
+            # reshape it to key-like structure
+            #  [num_blocks, num_heads, head_size/x, block_size, x]
+            sink_key_cache_reshaped = sink_key_cache.permute(3, 0, 1, 2, 4).reshape(sink_block_size, self.num_kv_heads, self.head_size)
+            sink_key_to_roll = sink_key_cache_reshaped.view(sink_size, -1)
+            dummy_query_to_roll = torch.zeros_like(sink_key_to_roll).to(key.device)
+            positions_one_bs = (torch.ones(1, num_sinks_current*sink_block_size).to(key.device) * num_tokens_evicted_this_pass).to(int)
+            # rotate
+            _, sink_key_to_roll = rotary_emb(positions_one_bs,
+                              dummy_query_to_roll,
+                              sink_key_to_roll)
+            # rotations are not in place, so we need to save it back
+            x = 16 // key_cache.element_size()
+            key_cache[sink_blocks[0]] = sink_key_to_roll.view(sink_block_size, self.num_kv_heads,
+                                                              self.head_size // x,  x).permute(1, 2, 0, 3)
 
     def _run_memory_efficient_xformers_forward(
         self,
@@ -311,7 +408,7 @@ class XFormersImpl(AttentionImpl):
                     attn_metadata.prompt_lens)
                 if self.sliding_window is not None:
                     attn_bias = attn_bias.make_local_attention(
-                        self.sliding_window)
+                        self.sliding_window + self.sink_size)
                 attn_metadata.attn_bias = [attn_bias]
             else:
                 attn_metadata.attn_bias = _make_alibi_bias(
@@ -390,3 +487,6 @@ def _make_alibi_bias(
         attn_biases.append(LowerTriangularMaskWithTensorBias(bias))
 
     return attn_biases
+
+
+
