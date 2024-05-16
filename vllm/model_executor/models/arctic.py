@@ -5,9 +5,16 @@ import torch
 from torch import nn
 
 from vllm.attention import Attention, AttentionMetadata
-from vllm.config import CacheConfig
-from vllm.distributed import (get_tensor_model_parallel_rank,
+from vllm.distributed import (get_pipeline_model_parallel_rank,
+                              get_pipeline_model_parallel_next_rank,
+                              get_pipeline_model_parallel_prev_rank,
+                              get_pipeline_model_parallel_world_size,
+                              get_pp_indices, get_tensor_model_parallel_rank,
+                              get_pp_indices_arctic,
                               get_tensor_model_parallel_world_size,
+                              is_pipeline_model_parallel_first_rank,
+                              is_pipeline_model_parallel_last_rank,
+                              recv_prev_rank, send_next_rank,
                               tensor_model_parallel_all_reduce)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -32,7 +39,24 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.sequence import SamplerOutput
 from vllm.transformers_utils.configs.arctic import ArcticConfig
 
+import logging
 logger = init_logger(__name__)
+logger.setLevel(logging.DEBUG)
+
+import time
+def _sleep_infinity():
+    while(1):
+        time.sleep(1)
+
+GB = 1024 * 1024 * 1024
+
+
+def report_memory(label):
+    free_gpu_memory, total_gpu_memory = torch.cuda.mem_get_info()
+    memory_allocated = torch.cuda.memory_allocated()
+    max_memory_allocated = torch.cuda.max_memory_allocated()
+    print(f"Rank {torch.distributed.get_rank()}, {label}, free gpu memory: {free_gpu_memory / GB}, total gpu memory: {total_gpu_memory / GB}, "
+          f"memory allocated: {memory_allocated / GB} , max_memory_allocated: {max_memory_allocated / GB}...")
 
 
 class ArcticMLP(nn.Module):
@@ -189,7 +213,6 @@ class ArcticMoE(nn.Module):
             else:
                 ws_dequantized = self.ws.ds_dequantize()
                 w2s_dequantized = self.w2s.ds_dequantize()
-
         final_hidden_states = fused_experts(
             hidden_states,
             ws_dequantized if self.is_quant else self.ws,
@@ -200,6 +223,7 @@ class ArcticMoE(nn.Module):
         if self.reduce_results and self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(
                 final_hidden_states)
+        torch.cuda.empty_cache()
         return final_hidden_states.view(num_tokens, hidden_size)
 
     def forward(self, hidden_states: torch.Tensor):
@@ -365,19 +389,30 @@ class ArcticModel(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
+        self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
             org_num_embeddings=self.vocab_size)
-        self.layers = nn.ModuleList([
-            ArcticDecoderLayer(config,
-                               layer_idx,
-                               cache_config,
-                               quant_config=quant_config)
-            for layer_idx in range(config.num_hidden_layers)
-        ])
+
+        # Construct stages
+        self.start_layer, self.end_layer = get_pp_indices_arctic(
+            config.num_hidden_layers, get_pipeline_model_parallel_rank(),
+            get_pipeline_model_parallel_world_size())
+        logger.debug(f"PP rank {get_pipeline_model_parallel_rank()}, start layer: {self.start_layer}, end layer: {self.end_layer}")
+        layers_1 = [nn.Identity() for _ in range(self.start_layer)]
+        # from vllm.model_executor.models.mixtral import MixtralDecoderLayer
+        # layers_2 = [MixtralDecoderLayer(config, None) for _ in range(self.start_layer, self.end_layer)]
+
+        if self.end_layer < config.num_hidden_layers:
+            layers_2 = [ArcticDecoderLayer(config, layer_idx, quant_config=quant_config) for layer_idx in range(self.start_layer, self.end_layer)]
+            layers_3 = [nn.Identity() for _ in range(self.end_layer, config.num_hidden_layers)]
+        else:
+            layers_2 = [ArcticDecoderLayer(config, layer_idx, quant_config=quant_config) for layer_idx in range(self.start_layer, config.num_hidden_layers)]
+            layers_3 = [nn.Identity() for _ in range(config.num_hidden_layers, self.end_layer)]
+        self.layers = nn.ModuleList(layers_1 + layers_2 + layers_3)
         self._attn_implementation = config._attn_implementation
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -388,12 +423,33 @@ class ArcticModel(nn.Module):
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
-        for i in range(len(self.layers)):
+
+        logger.debug(f"PP rank {get_pipeline_model_parallel_rank()}: input_ids: {input_ids}, shape {list(input_ids.size())}")
+        if is_pipeline_model_parallel_first_rank():
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            sizes = list(input_ids.size()) + [self.config.hidden_size]
+            hidden_states = recv_prev_rank(1, sizes, self.embed_tokens.weight.dtype,
+                                           self.embed_tokens.weight.device)
+            if isinstance(hidden_states, tuple):
+                hidden_states = hidden_states[0]
+            logger.debug(f"PP rank {get_pipeline_model_parallel_rank()}: recv done from {get_pipeline_model_parallel_prev_rank()}, "
+                         f"shape: {hidden_states.shape}, device: {hidden_states.device}, for request with {input_ids.size()} tokens...")
+
+        for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
-            hidden_states = layer(positions, hidden_states, kv_caches[i],
-                                  attn_metadata)
-        hidden_states = self.norm(hidden_states)
+            logger.debug(f"PP rank {get_pipeline_model_parallel_rank()}: layer {i} to start, kv size: {len(kv_caches)}, "
+                         f"postions: {positions.device if positions is not None else None}, hidden_states: {hidden_states.device}, kv cache devices: {[str(kv.device) if kv is not None else None for kv in kv_caches]}, "
+                        )
+            hidden_states = layer(positions, hidden_states, kv_caches[i - self.start_layer], attn_metadata)
+            logger.debug(f"PP rank {get_pipeline_model_parallel_rank()}: layer {i} to finish...")
+
+        if is_pipeline_model_parallel_last_rank():
+            hidden_states = self.norm(hidden_states)
+        else:
+            send_next_rank([hidden_states])
+            logger.debug(f"PP rank {get_pipeline_model_parallel_rank()}, send done to {get_pipeline_model_parallel_next_rank()}, "
+                         f"shape: {hidden_states.shape}, device: {hidden_states.device}, for request with {input_ids.size()} tokens...")
         return hidden_states
 
 
@@ -495,18 +551,24 @@ class ArcticForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                try:
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
+                except KeyError:
+                    pass
                 break
             else:
                 for param_name, weight_name, shard_id in mlp_params_mapping:
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(param, loaded_weight, shard_id)
+                    try:
+                        param = params_dict[name]
+                        weight_loader = param.weight_loader
+                        weight_loader(param, loaded_weight, shard_id)
+                    except KeyError:
+                        pass
                     break
                 else:
                     for param_name, weight_name, shard_id \
@@ -514,18 +576,23 @@ class ArcticForCausalLM(nn.Module):
                         if weight_name not in name:
                             continue
                         name = name.replace(weight_name, param_name)
-                        param = params_dict[name]
-                        weight_loader = param.weight_loader
-                        weight_loader(param,
-                                      loaded_weight,
-                                      weight_name,
-                                      expert_id=shard_id)
+                        try:
+                            param = params_dict[name]
+                            weight_loader = param.weight_loader
+                            weight_loader(param,
+                                        loaded_weight,
+                                        weight_name,
+                                        expert_id=shard_id)
+                        except KeyError:
+                            pass
                         break
                     else:
                         if name.endswith(".bias") and name not in params_dict:
                             continue
-                        param = params_dict[name]
-
-                        weight_loader = getattr(param, "weight_loader",
-                                                default_weight_loader)
-                        weight_loader(param, loaded_weight)
+                        try:
+                            param = params_dict[name]
+                            weight_loader = getattr(param, "weight_loader",
+                                                    default_weight_loader)
+                            weight_loader(param, loaded_weight)
+                        except KeyError:
+                            pass

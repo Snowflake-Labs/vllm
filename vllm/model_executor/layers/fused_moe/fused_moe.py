@@ -15,6 +15,11 @@ from vllm.utils import is_hip
 logger = init_logger(__name__)
 
 
+import time
+def _sleep_infinity():
+    while(1):
+        time.sleep(1)
+
 @triton.jit
 def fused_moe_kernel(
     # Pointers to matrices
@@ -111,6 +116,7 @@ def fused_moe_kernel(
                       offs_k[None, :] * stride_ak)
 
     off_experts = tl.load(expert_ids_ptr + pid_m)
+    # off_experts = 0
     b_ptrs = b_ptr + off_experts * stride_be + (offs_k[:, None] * stride_bk +
                                                 offs_bn[None, :] * stride_bn)
 
@@ -271,7 +277,6 @@ def invoke_fused_moe_kernel(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
         **config,
     )
 
-
 def get_config_file_name(E: int, N: int, dtype: Optional[str]) -> str:
     device_name = torch.cuda.get_device_name().replace(" ", "_")
     dtype_selector = "" if not dtype else f",dtype={dtype}"
@@ -396,7 +401,6 @@ def fused_experts(hidden_states: torch.Tensor,
                 'BLOCK_SIZE_K': 32,
                 'GROUP_SIZE_M': 8
             }
-
             if M <= E:
                 config = {
                     'BLOCK_SIZE_M': 16,
@@ -415,11 +419,16 @@ def fused_experts(hidden_states: torch.Tensor,
                                       device=hidden_states.device,
                                       dtype=hidden_states.dtype)
 
+
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids, config['BLOCK_SIZE_M'], E)
     compute_type = (tl.bfloat16
                     if hidden_states.dtype == torch.bfloat16 else tl.float16)
 
+    # if torch.distributed.get_rank() == 0:
+    #     import pdb; pdb.set_trace()
+    # else:
+    #     _sleep_infinity()
     invoke_fused_moe_kernel(hidden_states,
                             w1,
                             intermediate_cache1,
@@ -435,7 +444,8 @@ def fused_experts(hidden_states: torch.Tensor,
                             config,
                             compute_type=compute_type,
                             use_fp8=use_fp8)
-
+    # if torch.distributed.get_rank() == 0:
+    #     import pdb; pdb.set_trace()
     ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
 
     invoke_fused_moe_kernel(intermediate_cache2,
@@ -453,7 +463,6 @@ def fused_experts(hidden_states: torch.Tensor,
                             config,
                             compute_type=compute_type,
                             use_fp8=use_fp8)
-
     if inplace:
         return torch.sum(intermediate_cache3.view(*intermediate_cache3.shape),
                          dim=1,
