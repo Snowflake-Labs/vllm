@@ -36,6 +36,7 @@ _PP_SUPPORTED_MODELS = [
     "MistralForCausalLM",
     "Phi3ForCausalLM",
     "GPT2LMHeadModel",
+    "ArcticForCausalLM"
 ]
 
 
@@ -209,7 +210,7 @@ class ModelConfig:
                 "Pipeline parallelism is only supported for the following "
                 f" architectures: {_PP_SUPPORTED_MODELS}.")
 
-        if total_num_hidden_layers % pipeline_parallel_size != 0:
+        if total_num_hidden_layers % pipeline_parallel_size != 0 and "ArcticForCausalLM" not in architectures:
             raise ValueError(
                 f"Total number of hidden layers ({total_num_hidden_layers}) "
                 "must be divisible by pipeline parallel size "

@@ -217,7 +217,6 @@ def broadcast_tensor_dict(
 def send_next_rank(tensors: List[torch.Tensor]) -> None:
     """Send the tensors to the next pipeline model parallel rank."""
     combined_tensor = torch.cat(tensors, dim=0)
-    torch.cat(tensors, dim=0)
     torch.distributed.send(combined_tensor,
                            get_pipeline_model_parallel_next_rank(),
                            get_pipeline_model_parallel_group())

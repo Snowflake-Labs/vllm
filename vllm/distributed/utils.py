@@ -140,3 +140,13 @@ def get_pp_indices(num_hidden_layers: int, pp_rank: int,
     end_layer = start_layer + layers_per_partition
 
     return (start_layer, end_layer)
+
+
+def get_pp_indices_arctic(num_hidden_layers: int, pp_rank: int, pp_size: int) -> Tuple[int, int]:
+    if num_hidden_layers % pp_size == 0: 
+        return get_pp_indices(num_hidden_layers, pp_rank, pp_size)
+
+    num_pad_layers = pp_size - num_hidden_layers % pp_size
+    n_layers = num_pad_layers + num_hidden_layers
+    assert n_layers % pp_size == 0
+    return get_pp_indices(n_layers, pp_rank, pp_size)
