@@ -24,7 +24,6 @@ class _Backend(enum.Enum):
 @lru_cache(maxsize=None)
 def get_attn_backend(dtype: torch.dtype) -> Type[AttentionBackend]:
     backend = _which_attn_to_use(dtype)
-    backend = _Backend.XFORMERS
     if backend == _Backend.FLASH_ATTN:
         logger.info("Using FlashAttention backend.")
         from vllm.attention.backends.flash_attn import (  # noqa: F401

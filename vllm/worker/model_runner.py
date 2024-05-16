@@ -326,7 +326,7 @@ class ModelRunner:
             # For example, if the prompt len is 10, sliding window is 8, and
             # block size is 4, the first two tokens are masked and the slot
             # mapping will be [-1, -1, 2, 3, 4, 5, 6, 7, 0, 1].
-            # FIXME [MP] : this is untrue in vllm^
+            # FIXME [MP] : this is untrue in vllm^ (see last two numbers)
             # FIXME: mapping will be [-1, -1, 2, 3, 4, 5, 6, 7, 8, 9].
             start_idx = 0
             if self.sliding_window is not None:

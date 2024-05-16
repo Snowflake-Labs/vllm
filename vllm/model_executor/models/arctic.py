@@ -310,13 +310,10 @@ class ArcticDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         is_moe_layer = (layer_idx + 1) % config.moe_layer_frequency == 0
-        sliding_window = getattr(config, "sliding_window", None)
-        sink_size = getattr(config, "sink_size", None)
         self.use_residual = config.use_residual and is_moe_layer
         self.self_attn = ArcticAttention(config,
                                          layer_idx,
-                                         linear_method=linear_method,
-                                         )
+                                         linear_method=linear_method)
         self.block_sparse_moe = ArcticMoE(
             config,
             layer_id=layer_idx,

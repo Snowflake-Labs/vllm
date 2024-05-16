@@ -389,10 +389,10 @@ class BlockSpaceManagerV1(BlockSpaceManager):
         logical_blocks = seq.logical_token_blocks
         block_table = self.block_tables[seq.seq_id]
         # If we need to allocate a new physical block
-
         if len(block_table) < len(logical_blocks):
             # Currently this code only supports adding one physical block
             assert len(block_table) == len(logical_blocks) - 1
+
             if len(block_table) >= (self.sw_incr + self.sink_incr):
                 # reuse a block
                 new_idx = self.sink_incr + ((len(block_table) - self.sink_incr) % self.block_sliding_window)
