@@ -102,6 +102,7 @@ class XFormersMetadata(AttentionMetadataPerStage, PagedAttentionMetadata):
     # Cuda-graph is currently enabled for decoding only.
     # TODO(woosuk): Move `use_cuda_graph` out since it's unrelated to attention.
     use_cuda_graph: bool
+    total_sequence_length_w_sink: Optional[List[int]]
 
     def __post_init__(self):
         # Set during the execution of the first attention op.
@@ -227,8 +228,11 @@ class XFormersImpl(AttentionImpl):
 
         if prefill_meta := attn_metadata.prefill_metadata:
             # Prompt run.
+            attn_metadata.decode_metadata.total_sequence_length_w_sink = attn_metadata.decode_metadata.context_lens     # fixme is it always all of them either in prefill or decode?
             if kv_cache is None or prefill_meta.block_tables.numel() == 0:
                 # normal attention.
+                # block tables are empty if the prompt does not have a cached
+                # prefix.
                 out = self._run_memory_efficient_xformers_forward(
                     query, key, value, prefill_meta)
                 assert out.shape == output[:num_prefill_tokens].shape
@@ -255,6 +259,9 @@ class XFormersImpl(AttentionImpl):
                 output[:num_prefill_tokens] = out
 
         if decode_meta := attn_metadata.decode_metadata:
+            # increment total seq len
+            for i in range(len(attn_metadata.decode_metadata.total_sequence_length_w_sink)):
+                attn_metadata.decode_metadata.total_sequence_length_w_sink[i] += 1
             do_backup = self.sink_size is not None and self.sink_size > 0
             if do_backup:
                 sink_attn_obj = SinkAttentionRotaryImpl(self.sink_size, self.sliding_window, self.num_kv_heads, self.head_size)
@@ -277,6 +284,7 @@ class XFormersImpl(AttentionImpl):
             if do_backup:
                 sink_attn_obj.restore_cache_from_backup(key_cache, backed_up_sink)
 
+        print(attn_metadata.decode_metadata.total_sequence_length_w_sink)
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)
 
