@@ -11,12 +11,12 @@ class BackedUpSink:
         self.sink_blocks = []
         self.is_empty = []
 
-    def append(self, sink_key_cache: torch.Tensor, sink_blocks: torch.Tensor):
+    def register(self, sink_key_cache: torch.Tensor, sink_blocks: torch.Tensor):
         self.sink_key_cache.append(sink_key_cache)
         self.sink_blocks.append(sink_blocks)
         self.is_empty.append(False)
 
-    def append_empty(self):
+    def register_empty(self):
         self.sink_key_cache.append(torch.empty(0))
         self.sink_blocks.append(torch.empty(0, dtype=torch.long))
         self.is_empty.append(True)
@@ -50,8 +50,8 @@ class SinkAttentionRotaryImpl:
     def restore_cache_from_backup(
         self, key_cache: torch.Tensor, backed_up_sink: BackedUpSink
     ) -> None:
-        for _, prefix_sinks_pre_roll, sink_blocks in backed_up_sink:
-            key_cache[sink_blocks] = prefix_sinks_pre_roll
+        for _, backup, blocks in backed_up_sink:
+            key_cache[blocks] = backup
 
     def process_decode_metadata(
         self, attn_metadata, key_cache: torch.Tensor, rotary_emb: Callable, positions
@@ -75,7 +75,7 @@ class SinkAttentionRotaryImpl:
                     batch_i, positions[batch_i], decode_meta, key_cache, backed_up_sink
                 )
             else:
-                backed_up_sink.append_empty()
+                backed_up_sink.register_empty()
 
     def _backup_sink(
         self,
@@ -90,7 +90,7 @@ class SinkAttentionRotaryImpl:
         )
         sink_blocks = decode_meta.block_tables[batch_i, :num_sinks_current]
         sink_key_cache = torch.index_select(key_cache, index=sink_blocks, dim=0)
-        backed_up_sink.append(sink_key_cache.clone(), sink_blocks)
+        backed_up_sink.register(sink_key_cache.clone(), sink_blocks)
 
     def _rotate_sinks(
         self,
@@ -102,7 +102,7 @@ class SinkAttentionRotaryImpl:
         """Perform rotation on sinks and put it rotated in the cache."""
         for batch_i, backup, blocks in backed_up_sink:
             self._rotate_sink_positions(
-                backup, blocks, key_cache, rotary_emb, batch_i, positions
+                backup, blocks, key_cache, rotary_emb, self._calculate_evictions(positions, batch_i)
             )
 
     def _rotate_sink_positions(
@@ -111,11 +111,9 @@ class SinkAttentionRotaryImpl:
         blocks: torch.Tensor,
         key_cache: torch.Tensor,
         rotary_emb: Callable,
-        batch_i: int,
-        positions: torch.Tensor,
+        num_total_tokens_evicted: int
     ) -> None:
         # get rotations angles
-        num_total_tokens_evicted = self._calculate_evictions(positions, batch_i)
         rotation_positions = (
             torch.ones(1, self.sink_size).to(key_cache.device)
             * num_total_tokens_evicted
@@ -140,4 +138,3 @@ class SinkAttentionRotaryImpl:
 
     def _calculate_evictions(self, positions: torch.Tensor, batch_i: int):
         return max(positions[batch_i] - self.cache_size, 0)
-

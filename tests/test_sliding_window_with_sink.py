@@ -18,12 +18,12 @@ class BackedUpSink:
         self.sink_blocks = []
         self.is_empty = []
 
-    def append(self, sink_key_cache: torch.Tensor, sink_blocks: torch.Tensor):
+    def register(self, sink_key_cache: torch.Tensor, sink_blocks: torch.Tensor):
         self.sink_key_cache.append(sink_key_cache)
         self.sink_blocks.append(sink_blocks)
         self.is_empty.append(False)
 
-    def append_empty(self):
+    def register_empty(self):
         self.sink_key_cache.append(torch.empty(0))
         self.sink_blocks.append(torch.empty(0, dtype=torch.long))
         self.is_empty.append(True)
@@ -57,72 +57,70 @@ class SinkAttentionRotaryImpl:
     def restore_cache_from_backup(
         self, key_cache: torch.Tensor, backed_up_sink: BackedUpSink
     ) -> None:
-        for _, prefix_sinks_pre_roll, sink_blocks in backed_up_sink:
-            key_cache[sink_blocks] = prefix_sinks_pre_roll
+        for _, backup, blocks in backed_up_sink:
+            key_cache[blocks] = backup
 
     def process_decode_metadata(
-        self, attn_metadata, key_cache: torch.Tensor, rotary_emb: Callable
+        self, attn_metadata, key_cache: torch.Tensor, rotary_emb: Callable, positions
     ) -> BackedUpSink:
         decode_meta = attn_metadata.decode_metadata
         backed_up_sink = BackedUpSink()
 
         if self.sink_size > 0:
-            self._prepare_sink_rotation(decode_meta, key_cache, backed_up_sink)
-            self._rotate_sinks(decode_meta, key_cache, rotary_emb, backed_up_sink)
+            self._prepare_sink_rotation(decode_meta, key_cache, backed_up_sink, positions)
+            self._rotate_sinks(key_cache, rotary_emb, backed_up_sink, positions)
         return backed_up_sink
 
     def _prepare_sink_rotation(
-        self, decode_meta, key_cache: torch.Tensor, backed_up_sink: BackedUpSink
+        self, decode_meta, key_cache: torch.Tensor, backed_up_sink: BackedUpSink, positions: torch.Tensor
     ):
         """Prepare and return backup of sink positions for potential restoration."""
         for batch_i, batch_context_len in enumerate(decode_meta.context_lens):
-            num_total_tokens_evicted = batch_context_len - self.cache_size
+            num_total_tokens_evicted = positions[batch_i] - self.cache_size
             if num_total_tokens_evicted > 0:
                 self._backup_sink(
-                    batch_i, batch_context_len, decode_meta, key_cache, backed_up_sink
+                    batch_i, positions[batch_i], decode_meta, key_cache, backed_up_sink
                 )
             else:
-                backed_up_sink.append_empty()
+                backed_up_sink.register_empty()
 
     def _backup_sink(
         self,
         batch_i: int,
-        batch_context_len: int,
+        position_i: int,
         decode_meta,
         key_cache: torch.Tensor,
         backed_up_sink: BackedUpSink,
     ) -> None:
         num_sinks_current = (
-            min(self.sink_size, batch_context_len) // key_cache.shape[-2]
+            min(self.sink_size, position_i) // key_cache.shape[-2]
         )
         sink_blocks = decode_meta.block_tables[batch_i, :num_sinks_current]
         sink_key_cache = torch.index_select(key_cache, index=sink_blocks, dim=0)
-        backed_up_sink.append(sink_key_cache.clone(), sink_blocks)
+        backed_up_sink.register(sink_key_cache.clone(), sink_blocks)
 
     def _rotate_sinks(
         self,
-        decode_meta: MagicMock,
         key_cache: torch.Tensor,
         rotary_emb: MagicMock,
         backed_up_sink: BackedUpSink,
+        positions: torch.Tensor,
     ):
         """Perform rotation on sinks and put it rotated in the cache."""
         for batch_i, backup, blocks in backed_up_sink:
             self._rotate_sink_positions(
-                backup, blocks, decode_meta, key_cache, rotary_emb, batch_i
+                backup, blocks, key_cache, rotary_emb, self._calculate_evictions(positions, batch_i)
             )
 
     def _rotate_sink_positions(
         self,
         backup: torch.Tensor,
         blocks: torch.Tensor,
-        decode_meta,
         key_cache: torch.Tensor,
-        rotary_emb: MagicMock,
-        batch_i: int,
+        rotary_emb: Callable,
+        num_total_tokens_evicted: int
     ) -> None:
         # get rotations angles
-        num_total_tokens_evicted = self._calculate_evictions(decode_meta, batch_i)
         rotation_positions = (
             torch.ones(1, self.sink_size).to(key_cache.device)
             * num_total_tokens_evicted
@@ -145,8 +143,8 @@ class SinkAttentionRotaryImpl:
         # in: bs,  num_kv_heads, self.head_size/8, 16, 8
         return x.permute(3, 0, 1, 2, 4).reshape(self.sink_size, -1)
 
-    def _calculate_evictions(self, decode_meta: MagicMock, batch_i: int):
-        return max(decode_meta.context_lens[batch_i] - self.cache_size, 0)
+    def _calculate_evictions(self, positions: torch.Tensor, batch_i: int):
+        return max(positions[batch_i] - self.cache_size, 0)
 
 
 @pytest.fixture
@@ -162,6 +160,7 @@ def setup_environment_for_sink(request):
     # cache persistency
     sliding_window = 6
     sink_size = 3
+    cache_size = sink_size + sliding_window
 
     context_len1 = request.param
     context_len2 = 1 + (context_len1 + 10) % MAX_BLOCK_PER_ONE_EL
@@ -172,7 +171,8 @@ def setup_environment_for_sink(request):
     decode_meta.block_tables = (
         torch.arange(num_blocks).__reversed__().reshape(batch_size, -1)
     )
-    decode_meta.context_lens = torch.LongTensor((context_len1, context_len2))
+    positions = torch.LongTensor((context_len1, context_len2))
+    decode_meta.context_lens = torch.LongTensor((min(context_len1,cache_size), min(cache_size,context_len2)))
     attn_metadata = MagicMock()
     attn_metadata.decode_metadata = decode_meta
     sink_attn_obj = SinkAttentionRotaryImpl(
@@ -189,16 +189,16 @@ def setup_environment_for_sink(request):
             _fake_rotate(sink_key, positions),
         )
     )
-    return sink_attn_obj, key_cache, attn_metadata, rotary_emb
+    return sink_attn_obj, key_cache, attn_metadata, rotary_emb, positions
 
 
 @pytest.mark.parametrize("setup_environment_for_sink", CONTEXT_LEN_1, indirect=True)
 def test_process_decode_metadata_and_restore(setup_environment_for_sink):
-    sink_attn_obj, key_cache, attn_metadata, rotary_emb = setup_environment_for_sink
+    sink_attn_obj, key_cache, attn_metadata, rotary_emb, positions = setup_environment_for_sink
     initial_key_cache = key_cache.clone()
     # Run the method under test
     backed_up_sink = sink_attn_obj.process_decode_metadata(
-        attn_metadata, key_cache, rotary_emb
+        attn_metadata, key_cache, rotary_emb, positions
     )
     # key cache should be updated
     if not backed_up_sink.all_empty:
