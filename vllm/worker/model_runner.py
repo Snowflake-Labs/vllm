@@ -871,7 +871,12 @@ class ModelRunner:
     def profile_run(self) -> None:
         # Enable top-k sampling to reflect the accurate memory usage.
         sampling_params = SamplingParams(top_p=0.99, top_k=self.vocab_size - 1)
-        max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
+        if self.sliding_window is not None:     # profiling to the max usage that will be in the inference
+            cache_size = self.sliding_window + (self.sink_size or 0)
+        else:
+            cache_size = self.scheduler_config.max_num_batched_tokens
+
+        max_num_batched_tokens = min(cache_size, self.scheduler_config.max_num_batched_tokens)
         max_num_seqs = self.scheduler_config.max_num_seqs
 
         # This represents the maximum number of different requests

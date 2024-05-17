@@ -169,7 +169,9 @@ class Worker(WorkerBase):
         """
         raise_if_cache_size_invalid(num_gpu_blocks,
                                     self.cache_config.block_size,
-                                    self.model_config.max_model_len)
+                                    self.model_config.max_model_len,
+                                    self.cache_config.sliding_window,
+                                    self.cache_config.sink_size)
 
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
@@ -329,12 +331,16 @@ def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):
 
 
 def raise_if_cache_size_invalid(num_gpu_blocks, block_size,
-                                max_model_len) -> None:
+                                max_model_len, sliding_window=None, sink_size=None) -> None:
     if num_gpu_blocks <= 0:
         raise ValueError("No available memory for the cache blocks. "
                          "Try increasing `gpu_memory_utilization` when "
                          "initializing the engine.")
     max_seq_len = block_size * num_gpu_blocks
+
+    if sliding_window is not None:  # sink-adjusting max seq len
+        max_seq_len = sliding_window + (sink_size or 0)
+
     if max_model_len > max_seq_len:
         raise ValueError(
             f"The model's max seq len ({max_model_len}) "
