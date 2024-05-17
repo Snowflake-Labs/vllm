@@ -339,7 +339,7 @@ def raise_if_cache_size_invalid(num_gpu_blocks, block_size,
     max_seq_len = block_size * num_gpu_blocks
 
     if sliding_window is not None:  # sink-adjusting max seq len
-        max_seq_len = sliding_window + (sink_size or 0)
+        max_model_len = sliding_window + (sink_size or 0)
 
     if max_model_len > max_seq_len:
         raise ValueError(
