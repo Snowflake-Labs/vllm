@@ -184,6 +184,7 @@ class XFormersImpl(AttentionImpl):
         kv_cache: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata[XFormersMetadata],
         rotary_emb,
+        positions: torch.Tensor,
         kv_scale: float,
     ) -> torch.Tensor:
         """Forward pass with xFormers and PagedAttention.
@@ -271,7 +272,7 @@ class XFormersImpl(AttentionImpl):
             do_backup = self.sink_size is not None and self.sink_size > 0
             if do_backup:
                 sink_attn_obj = SinkAttentionRotaryImpl(self.sink_size, self.sliding_window, self.num_kv_heads, self.head_size)
-                backed_up_sink = sink_attn_obj.process_decode_metadata(attn_metadata, key_cache, rotary_emb)
+                backed_up_sink = sink_attn_obj.process_decode_metadata(attn_metadata, key_cache, rotary_emb, positions)
 
             output[num_prefill_tokens:] = PagedAttention.forward_decode(
                 decode_query,

@@ -46,7 +46,8 @@ class Attention(nn.Module):
         kv_cache: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata[AttentionMetadataPerStage],
         rotary_emb: RotaryEmbedding,
+        positions: torch.Tensor,
         kv_scale: float = 1.0,
     ) -> torch.Tensor:
-        return self.impl.forward(query, key, value, kv_cache, attn_metadata, rotary_emb,
+        return self.impl.forward(query, key, value, kv_cache, attn_metadata, rotary_emb, positions,
                                  kv_scale)

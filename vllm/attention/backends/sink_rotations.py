@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 import torch
 
 
+
 class BackedUpSink:
     def __init__(self):
         self.sink_key_cache = []
@@ -53,25 +54,25 @@ class SinkAttentionRotaryImpl:
             key_cache[sink_blocks] = prefix_sinks_pre_roll
 
     def process_decode_metadata(
-        self, attn_metadata, key_cache: torch.Tensor, rotary_emb: Callable
+        self, attn_metadata, key_cache: torch.Tensor, rotary_emb: Callable, positions
     ) -> BackedUpSink:
         decode_meta = attn_metadata.decode_metadata
         backed_up_sink = BackedUpSink()
 
         if self.sink_size > 0:
-            self._prepare_sink_rotation(decode_meta, key_cache, backed_up_sink)
-            self._rotate_sinks(decode_meta, key_cache, rotary_emb, backed_up_sink)
+            self._prepare_sink_rotation(decode_meta, key_cache, backed_up_sink, positions)
+            self._rotate_sinks(key_cache, rotary_emb, backed_up_sink, positions)
         return backed_up_sink
 
     def _prepare_sink_rotation(
-        self, decode_meta, key_cache: torch.Tensor, backed_up_sink: BackedUpSink
+        self, decode_meta, key_cache: torch.Tensor, backed_up_sink: BackedUpSink, positions: torch.Tensor
     ):
         """Prepare and return backup of sink positions for potential restoration."""
         for batch_i, batch_context_len in enumerate(decode_meta.context_lens):
-            num_total_tokens_evicted = batch_context_len - self.cache_size
+            num_total_tokens_evicted = positions[batch_i] - self.cache_size
             if num_total_tokens_evicted > 0:
                 self._backup_sink(
-                    batch_i, batch_context_len, decode_meta, key_cache, backed_up_sink
+                    batch_i, positions[batch_i], decode_meta, key_cache, backed_up_sink
                 )
             else:
                 backed_up_sink.append_empty()
@@ -79,13 +80,13 @@ class SinkAttentionRotaryImpl:
     def _backup_sink(
         self,
         batch_i: int,
-        batch_context_len: int,
+        position_i: int,
         decode_meta,
         key_cache: torch.Tensor,
         backed_up_sink: BackedUpSink,
     ) -> None:
         num_sinks_current = (
-            min(self.sink_size, batch_context_len) // key_cache.shape[-2]
+            min(self.sink_size, position_i) // key_cache.shape[-2]
         )
         sink_blocks = decode_meta.block_tables[batch_i, :num_sinks_current]
         sink_key_cache = torch.index_select(key_cache, index=sink_blocks, dim=0)
@@ -93,28 +94,28 @@ class SinkAttentionRotaryImpl:
 
     def _rotate_sinks(
         self,
-        decode_meta: MagicMock,
         key_cache: torch.Tensor,
         rotary_emb: MagicMock,
         backed_up_sink: BackedUpSink,
+        positions: torch.Tensor,
     ):
         """Perform rotation on sinks and put it rotated in the cache."""
         for batch_i, backup, blocks in backed_up_sink:
             self._rotate_sink_positions(
-                backup, blocks, decode_meta, key_cache, rotary_emb, batch_i
+                backup, blocks, key_cache, rotary_emb, batch_i, positions
             )
 
     def _rotate_sink_positions(
         self,
         backup: torch.Tensor,
         blocks: torch.Tensor,
-        decode_meta,
         key_cache: torch.Tensor,
-        rotary_emb: MagicMock,
+        rotary_emb: Callable,
         batch_i: int,
+        positions: torch.Tensor,
     ) -> None:
         # get rotations angles
-        num_total_tokens_evicted = self._calculate_evictions(decode_meta, batch_i)
+        num_total_tokens_evicted = self._calculate_evictions(positions, batch_i)
         rotation_positions = (
             torch.ones(1, self.sink_size).to(key_cache.device)
             * num_total_tokens_evicted
@@ -137,5 +138,6 @@ class SinkAttentionRotaryImpl:
         # in: bs,  num_kv_heads, self.head_size/8, 16, 8
         return x.permute(3, 0, 1, 2, 4).reshape(self.sink_size, -1)
 
-    def _calculate_evictions(self, decode_meta: MagicMock, batch_i: int):
-        return max(decode_meta.context_lens[batch_i] - self.cache_size, 0)
+    def _calculate_evictions(self, positions: torch.Tensor, batch_i: int):
+        return max(positions[batch_i] - self.cache_size, 0)
+
