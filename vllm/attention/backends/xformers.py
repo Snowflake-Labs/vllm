@@ -169,6 +169,9 @@ class XFormersImpl(AttentionImpl):
                 f"Head size {head_size} is not supported by PagedAttention. "
                 f"Supported head sizes are: {suppored_head_sizes}.")
 
+        self.do_backup = self.sink_size is not None and self.sink_size > 0
+        self.sink_attn_rotater = SinkAttentionRotaryImpl(self.sink_size, self.sliding_window, self.num_kv_heads, self.head_size)
+
     def forward(
         self,
         query: torch.Tensor,
@@ -258,10 +261,8 @@ class XFormersImpl(AttentionImpl):
                 output[:num_prefill_tokens] = out
 
         if decode_meta := attn_metadata.decode_metadata:
-            do_backup = self.sink_size is not None and self.sink_size > 0
-            if do_backup:
-                sink_attn_obj = SinkAttentionRotaryImpl(self.sink_size, self.sliding_window, self.num_kv_heads, self.head_size)
-                backed_up_sink = sink_attn_obj.process_decode_metadata(attn_metadata, key_cache, rotary_emb, positions)
+            if self.do_backup:
+                backed_up_sink = self.sink_attn_rotater.process_decode_metadata(attn_metadata, key_cache, rotary_emb, positions)
 
             output[num_prefill_tokens:] = PagedAttention.forward_decode(
                 decode_query,
@@ -277,8 +278,8 @@ class XFormersImpl(AttentionImpl):
                 kv_scale,
             )
 
-            if do_backup:
-                sink_attn_obj.restore_cache_from_backup(key_cache, backed_up_sink)
+            if self.do_backup:
+                self.sink_attn_rotater.restore_cache_from_backup(key_cache, backed_up_sink)
 
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)
