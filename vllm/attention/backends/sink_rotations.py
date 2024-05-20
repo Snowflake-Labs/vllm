@@ -128,7 +128,7 @@ class SinkAttentionRotaryImpl(torch.nn.Module):
         p_i = positions[batch_i]
         cs = self.cache_size    #.to(p_i.device)
         diff = p_i - cs #self.cache_size_gpu.to(p_i.device)
-        return max(diff, self._cache_zeros)
+        return torch.max(diff, self._cache_zeros)
         # return max(positions[batch_i] - self.cache_size, 0)
 
     # Method to set the device of cache_size_gpu
