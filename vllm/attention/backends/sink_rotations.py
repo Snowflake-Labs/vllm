@@ -113,12 +113,18 @@ class SinkAttentionRotaryImpl(torch.nn.Module):
         _, rotated_sinks = rotary_emb(rotation_positions, dummy_query, sink_to_rotate)
 
         # Put correctly rotated sinks into the original position in the cache
-        key_cache[blocks[0]] = rotated_sinks.view(
-            rotated_sinks.shape[0],  # fixme: only the first block
-            self.num_kv_heads,
-            self.head_size // 8,
-            8,
-        ).permute(1, 2, 0, 3)
+        a = rotated_sinks.shape[0]  # fixme: only the first block
+        b = self.num_kv_heads
+        c = self.head_size // 8
+        d = 8
+        e = rotated_sinks.view(
+            a,  # rotated_sinks.shape[0],  # fixme: only the first block
+            b,  # self.num_kv_heads,
+            c,  # self.head_size // 8,
+            d,  # 8,
+        )
+        f = e.permute(1, 2, 0, 3)
+        key_cache[blocks[0]] = f
 
     def _format_key_cache_to_rotation(self, x):
         # in: bs,  num_kv_heads, self.head_size/8, 16, 8
