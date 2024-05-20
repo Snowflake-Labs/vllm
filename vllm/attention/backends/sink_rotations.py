@@ -124,7 +124,11 @@ class SinkAttentionRotaryImpl(torch.nn.Module):
             d,  # 8,
         )
         f = e.permute(1, 2, 0, 3)
-        key_cache[blocks[0]] = f
+        # key_cache[blocks[0]] = f
+        # Put correctly rotated sinks into the original position in the cache
+        block_index = blocks[0]
+        # Use torch.index_put_ to assign values to specific indices of key_cache
+        torch.index_put_(key_cache, (block_index,), f)
 
     def _format_key_cache_to_rotation(self, x):
         # in: bs,  num_kv_heads, self.head_size/8, 16, 8
