@@ -25,7 +25,7 @@ class BackedUpSink:
         return len(self.sink_blocks)
 
 
-class SinkAttentionRotaryImpl:
+class SinkAttentionRotaryImpl(torch.nn.Module):
     def __init__(
         self,
         sink_size: int,
@@ -33,6 +33,7 @@ class SinkAttentionRotaryImpl:
         num_kv_heads: int,
         head_size: int,
     ):
+        super(self).__init__()
         self.sink_size = sink_size
         self.sliding_window_size = sliding_window_size
         self.cache_size = torch.Tensor([sliding_window_size + sink_size])
