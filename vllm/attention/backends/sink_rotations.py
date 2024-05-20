@@ -5,32 +5,24 @@ import torch
 
 
 
+
 class BackedUpSink:
     def __init__(self):
         self.sink_key_cache = []
         self.sink_blocks = []
-        self.is_empty = []
 
     def register(self, sink_key_cache: torch.Tensor, sink_blocks: torch.Tensor):
         self.sink_key_cache.append(sink_key_cache)
         self.sink_blocks.append(sink_blocks)
-        self.is_empty.append(False)
-
-    def register_empty(self):
-        self.sink_key_cache.append(torch.empty(0))
-        self.sink_blocks.append(torch.empty(0, dtype=torch.long))
-        self.is_empty.append(True)
 
     def __iter__(self):
         for batch_i, (backup, blocks) in enumerate(
             zip(self.sink_key_cache, self.sink_blocks)
         ):
-            if not self.is_empty[batch_i]:
-                yield batch_i, backup, blocks
+            yield batch_i, backup, blocks
 
-    @property
-    def all_empty(self) -> bool:
-        return all(self.is_empty)
+    def __len__(self):
+        return len(self.sink_blocks)
 
 
 class SinkAttentionRotaryImpl:
@@ -69,24 +61,19 @@ class SinkAttentionRotaryImpl:
     ):
         """Prepare and return backup of sink positions for potential restoration."""
         for batch_i, batch_context_len in enumerate(decode_meta.context_lens):
-            num_total_tokens_evicted = positions[batch_i] - self.cache_size
-            if num_total_tokens_evicted > 0:
-                self._backup_sink(
-                    batch_i, positions[batch_i], decode_meta, key_cache, backed_up_sink
+            self._backup_sink(
+                    batch_i, decode_meta, key_cache, backed_up_sink
                 )
-            else:
-                backed_up_sink.register_empty()
 
     def _backup_sink(
         self,
         batch_i: int,
-        position_i: int,
         decode_meta,
         key_cache: torch.Tensor,
         backed_up_sink: BackedUpSink,
     ) -> None:
         num_sinks_current = (
-            min(self.sink_size, position_i) // key_cache.shape[-2]
+            self.sink_size // key_cache.shape[-2]
         )
         sink_blocks = decode_meta.block_tables[batch_i, :num_sinks_current]
         sink_key_cache = torch.index_select(key_cache, index=sink_blocks, dim=0)
@@ -124,7 +111,7 @@ class SinkAttentionRotaryImpl:
         dummy_query = torch.zeros_like(sink_to_rotate).to(key_cache.device)
         _, rotated_sinks = rotary_emb(rotation_positions, dummy_query, sink_to_rotate)
 
-        # Restore rotated sinks into the original position in the cache
+        # Put correctly rotated sinks into the original position in the cache
         key_cache[blocks[0]] = rotated_sinks.view(
             rotated_sinks.shape[0],  # fixme: only the first block
             self.num_kv_heads,
@@ -138,3 +125,4 @@ class SinkAttentionRotaryImpl:
 
     def _calculate_evictions(self, positions: torch.Tensor, batch_i: int):
         return max(positions[batch_i] - self.cache_size, 0)
+
