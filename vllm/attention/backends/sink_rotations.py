@@ -33,10 +33,11 @@ class SinkAttentionRotaryImpl(torch.nn.Module):
         num_kv_heads: int,
         head_size: int,
     ):
-        super(self).__init__()
+        super().__init__()
         self.sink_size = sink_size
         self.sliding_window_size = sliding_window_size
         self.cache_size = torch.Tensor([sliding_window_size + sink_size])
+        self._cache_zeros = torch.Tensor([0])
         self.num_kv_heads = num_kv_heads
         self.head_size = head_size
 
@@ -128,11 +129,12 @@ class SinkAttentionRotaryImpl(torch.nn.Module):
         p_i = positions[batch_i]
         cs = self.cache_size    #.to(p_i.device)
         diff = p_i - cs #self.cache_size_gpu.to(p_i.device)
-        return max(diff, 0)
+        return max(diff, self._cache_zeros)
         # return max(positions[batch_i] - self.cache_size, 0)
 
     # Method to set the device of cache_size_gpu
     def to(self, device):
         self.cache_size = self.cache_size.to(device)
+        self._cache_zeros = self._cache_zeros.to(device)
         return self  # Return self for method chaining
 

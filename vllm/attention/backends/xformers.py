@@ -198,7 +198,7 @@ class XFormersImpl(AttentionImpl):
         query = query.view(-1, self.num_heads, self.head_size)
         key = key.view(-1, self.num_kv_heads, self.head_size)
         value = value.view(-1, self.num_kv_heads, self.head_size)
-
+        self.sink_attn_rotater.to(query.device)
         if kv_cache is not None:
             key_cache, value_cache = PagedAttention.split_kv_cache(
                 kv_cache, self.num_kv_heads, self.head_size)
