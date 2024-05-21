@@ -3,4 +3,4 @@ python benchmark_online.py \
 	--max_new_tokens 256 \
 	-qps 1.0 \
 	--framework vllm \
-	--model /data-fast/yak-700m 
+	--model /data-fast/yak2b-instruct
