@@ -417,7 +417,7 @@ class SamplingTensors:
             temperatures, top_ps, top_ks, min_ps, presence_penalties,
             frequency_penalties, repetition_penalties, sampling_seeds,
             sample_indices, prompt_tokens, output_tokens, vocab_size,
-            extra_seeds_to_generate, device, dtype)
+            extra_seeds_to_generate, device, dtype, do_penalties)
         return (sampling_tensors, do_penalties, do_top_p_top_k, do_min_p)
 
     @classmethod
@@ -430,22 +430,23 @@ class SamplingTensors:
                    prompt_tokens: List[List[int]],
                    output_tokens: List[List[int]], vocab_size: int,
                    extra_seeds_to_generate: int, device: torch.device,
-                   dtype: torch.dtype) -> "SamplingTensors":
+                   dtype: torch.dtype, do_penalties: bool) -> "SamplingTensors":
         # Note that the performance will be very bad without
         # pinned memory.
         pin_memory = is_pin_memory_available()
-        prompt_max_len = max([len(tokens) for tokens in prompt_tokens],
-                             default=0)
-        prompt_padded_tokens = [
-            tokens + [vocab_size] * (prompt_max_len - len(tokens))
-            for tokens in prompt_tokens
-        ]
-        output_max_len = max([len(tokens) for tokens in output_tokens],
-                             default=0)
-        output_padded_tokens = [
-            tokens + [vocab_size] * (output_max_len - len(tokens))
-            for tokens in output_tokens
-        ]
+        if do_penalties:
+            prompt_max_len = max([len(tokens) for tokens in prompt_tokens],
+                                default=0)
+            prompt_padded_tokens = [
+                tokens + [vocab_size] * (prompt_max_len - len(tokens))
+                for tokens in prompt_tokens
+            ]
+            output_max_len = max([len(tokens) for tokens in output_tokens],
+                                default=0)
+            output_padded_tokens = [
+                tokens + [vocab_size] * (output_max_len - len(tokens))
+                for tokens in output_tokens
+            ]
 
         temperatures_t = torch.tensor(
             temperatures,
@@ -465,24 +466,25 @@ class SamplingTensors:
             dtype=dtype,
             pin_memory=pin_memory,
         )
-        presence_penalties_t = torch.tensor(
-            presence_penalties,
-            device="cpu",
-            dtype=dtype,
-            pin_memory=pin_memory,
-        )
-        frequency_penalties_t = torch.tensor(
-            frequency_penalties,
-            device="cpu",
-            dtype=dtype,
-            pin_memory=pin_memory,
-        )
-        repetition_penalties_t = torch.tensor(
-            repetition_penalties,
-            device="cpu",
-            dtype=dtype,
-            pin_memory=pin_memory,
-        )
+        if do_penalties:
+            presence_penalties_t = torch.tensor(
+                presence_penalties,
+                device="cpu",
+                dtype=dtype,
+                pin_memory=pin_memory,
+            )
+            frequency_penalties_t = torch.tensor(
+                frequency_penalties,
+                device="cpu",
+                dtype=dtype,
+                pin_memory=pin_memory,
+            )
+            repetition_penalties_t = torch.tensor(
+                repetition_penalties,
+                device="cpu",
+                dtype=dtype,
+                pin_memory=pin_memory,
+            )
         top_ks_t = torch.tensor(
             top_ks,
             device="cpu",
@@ -495,18 +497,19 @@ class SamplingTensors:
             dtype=torch.long,
             pin_memory=pin_memory,
         )
-        prompt_tensor = torch.tensor(
-            prompt_padded_tokens,
-            device="cpu",
-            dtype=torch.long,
-            pin_memory=pin_memory,
-        )
-        output_tensor = torch.tensor(
-            output_padded_tokens,
-            device="cpu",
-            dtype=torch.long,
-            pin_memory=pin_memory,
-        )
+        if do_penalties:
+            prompt_tensor = torch.tensor(
+                prompt_padded_tokens,
+                device="cpu",
+                dtype=torch.long,
+                pin_memory=pin_memory,
+            )
+            output_tensor = torch.tensor(
+                output_padded_tokens,
+                device="cpu",
+                dtype=torch.long,
+                pin_memory=pin_memory,
+            )
         # need to transpose and make contiguous to
         # copy the tensor correctly.
         # [batch_size, n_seeds] -> [n_seeds, batch_size]
@@ -535,13 +538,13 @@ class SamplingTensors:
             top_ks=top_ks_t.to(device=device, non_blocking=True),
             min_ps=min_ps_t.to(device=device, non_blocking=True),
             presence_penalties=presence_penalties_t.to(device=device,
-                                                       non_blocking=True),
+                                                       non_blocking=True) if do_penalties else None,
             frequency_penalties=frequency_penalties_t.to(device=device,
-                                                         non_blocking=True),
+                                                         non_blocking=True) if do_penalties else None,
             repetition_penalties=repetition_penalties_t.to(device=device,
-                                                           non_blocking=True),
-            prompt_tokens=prompt_tensor.to(device=device, non_blocking=True),
-            output_tokens=output_tensor.to(device=device, non_blocking=True),
+                                                           non_blocking=True) if do_penalties else None,
+            prompt_tokens=prompt_tensor.to(device=device, non_blocking=True) if do_penalties else None,
+            output_tokens=output_tensor.to(device=device, non_blocking=True) if do_penalties else None,
             sampling_seeds=sampling_seeds_gpu,
             sample_indices=sample_indices_t.to(device=device,
                                                non_blocking=True),
