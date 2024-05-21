@@ -223,7 +223,6 @@ class ArcticMoE(nn.Module):
         if self.reduce_results and self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(
                 final_hidden_states)
-        torch.cuda.empty_cache()
         return final_hidden_states.view(num_tokens, hidden_size)
 
     def forward(self, hidden_states: torch.Tensor):
@@ -396,10 +395,8 @@ class ArcticModel(nn.Module):
         self.start_layer, self.end_layer = get_pp_indices_arctic(
             config.num_hidden_layers, get_pipeline_model_parallel_rank(),
             get_pipeline_model_parallel_world_size())
-        logger.debug(f"PP rank {get_pipeline_model_parallel_rank()}, start layer: {self.start_layer}, end layer: {self.end_layer}")
+        # print(f"PP rank {get_pipeline_model_parallel_rank()}, start layer: {self.start_layer}, end layer: {self.end_layer}")
         layers_1 = [nn.Identity() for _ in range(self.start_layer)]
-        # from vllm.model_executor.models.mixtral import MixtralDecoderLayer
-        # layers_2 = [MixtralDecoderLayer(config, None) for _ in range(self.start_layer, self.end_layer)]
 
         if self.end_layer < config.num_hidden_layers:
             layers_2 = [ArcticDecoderLayer(config, layer_idx, quant_config=quant_config) for layer_idx in range(self.start_layer, self.end_layer)]
@@ -418,33 +415,40 @@ class ArcticModel(nn.Module):
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        
-        logger.debug(f"PP rank {get_pipeline_model_parallel_rank()}: input_ids: {input_ids}, shape {list(input_ids.size())}")
+        # print(f"PP rank {get_pipeline_model_parallel_rank()} TP rank {get_tensor_model_parallel_rank()}: input_ids: {input_ids}, shape {list(input_ids.size())}")
+        # if torch.distributed.get_rank() == 0:
+        #     import pdb; pdb.set_trace()
+        # else:
+        #     _sleep_infinity()
         if is_pipeline_model_parallel_first_rank():
             hidden_states = self.embed_tokens(input_ids)
         else:
             sizes = list(input_ids.size()) + [self.config.hidden_size]
             hidden_states = recv_prev_rank(1, sizes, self.embed_tokens.weight.dtype,
-                                           self.embed_tokens.weight.device)
+                                            self.embed_tokens.weight.device)
             if isinstance(hidden_states, tuple):
                 hidden_states = hidden_states[0]
-            logger.debug(f"PP rank {get_pipeline_model_parallel_rank()}: recv done from {get_pipeline_model_parallel_prev_rank()}, "
-                         f"shape: {hidden_states.shape}, device: {hidden_states.device}, for request with {input_ids.size()} tokens...")
+            # print(f"PP rank {get_pipeline_model_parallel_rank()} TP rank {get_tensor_model_parallel_rank()}: "
+            #       f"recv done from {get_pipeline_model_parallel_prev_rank()}, "
+            #       f"shape: {hidden_states.shape}, device: {hidden_states.device}, for request with {input_ids.size()} tokens...")
 
-        for i in range(self.start_layer, self.end_layer):
+        
+        for i in range(self.start_layer, min(self.end_layer, self.config.num_hidden_layers)):
             layer = self.layers[i]
-            logger.debug(f"PP rank {get_pipeline_model_parallel_rank()}: layer {i} to start, kv size: {len(kv_caches)}, "
-                         f"postions: {positions.device if positions is not None else None}, hidden_states: {hidden_states.device}, kv cache devices: {[str(kv.device) if kv is not None else None for kv in kv_caches]}, "
-                        )
+            # print(f"PP rank {get_pipeline_model_parallel_rank()}: layer {i} to start, kv size: {len(kv_caches)}, "
+            #              f"postions: {positions.device if positions is not None else None}, hidden_states: {hidden_states.device}, kv cache devices: {[str(kv.device) if kv is not None else None for kv in kv_caches]}, "
+            #             )
+            # print(f"kv cache size: {len(kv_caches)}, index is {i - self.start_layer}")
             hidden_states = layer(positions, hidden_states, kv_caches[i - self.start_layer], attn_metadata)
-            logger.debug(f"PP rank {get_pipeline_model_parallel_rank()}: layer {i} to finish...")     
+            # print(f"PP rank {get_pipeline_model_parallel_rank()} TP rank {get_tensor_model_parallel_rank()}: layer {i} finishes...")     
             
         if is_pipeline_model_parallel_last_rank():
             hidden_states = self.norm(hidden_states)
         else:
+            # print(f"PP rank {get_pipeline_model_parallel_rank()} TP rank {get_tensor_model_parallel_rank()} about to send {hidden_states.shape}" )
             send_next_rank([hidden_states])
-            logger.debug(f"PP rank {get_pipeline_model_parallel_rank()}, send done to {get_pipeline_model_parallel_next_rank()}, "
-                         f"shape: {hidden_states.shape}, device: {hidden_states.device}, for request with {input_ids.size()} tokens...")
+            # print(f"PP rank {get_pipeline_model_parallel_rank()} TP rank {get_tensor_model_parallel_rank()}, send done to {get_pipeline_model_parallel_next_rank()}, "
+                #   f"shape: {hidden_states.shape}, device: {hidden_states.device}, for request with {input_ids.size()} tokens...")
         return hidden_states
 
 
@@ -533,11 +537,13 @@ class ArcticForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
 
-        logger.info(
+        print(
             "It will take ~10 minutes loading from the 16-bit weights. "
             "Alternatively, use the prequantized 8-bit weights of arctic "
             "and set load-format to `sharded_state` will accelerate loading.")
         for name, loaded_weight in weights:
+            # print(f"Global rank {torch.distributed.get_rank()}, PP rank: {get_pipeline_model_parallel_rank()}, TP rank: {get_tensor_model_parallel_rank()}, "
+            #       f"Loading param {name} weight shape {loaded_weight.shape}")
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -550,6 +556,8 @@ class ArcticForCausalLM(nn.Module):
                     weight_loader = param.weight_loader
                     weight_loader(param, loaded_weight, shard_id)
                 except KeyError:
+                    # print(f"Global rank {torch.distributed.get_rank()}, PP rank: {get_pipeline_model_parallel_rank()}, TP rank: {get_tensor_model_parallel_rank()}, "
+                    #       f"Param {name} shape {loaded_weight.shape}, shard_id {shard_id} is not here.")
                     pass
                 break
             else:
@@ -562,6 +570,8 @@ class ArcticForCausalLM(nn.Module):
                         weight_loader = param.weight_loader
                         weight_loader(param, loaded_weight, shard_id)
                     except KeyError:
+                        # print(f"Global rank {torch.distributed.get_rank()}, PP rank: {get_pipeline_model_parallel_rank()}, TP rank: {get_tensor_model_parallel_rank()}, "
+                        # f"Param {name} shape {loaded_weight.shape}, shard_id {shard_id} is not here.")
                         pass
                     break
                 else:
@@ -578,6 +588,8 @@ class ArcticForCausalLM(nn.Module):
                                         weight_name,
                                         expert_id=shard_id)
                         except KeyError:
+                            # print(f"Global rank {torch.distributed.get_rank()}, PP rank: {get_pipeline_model_parallel_rank()}, TP rank: {get_tensor_model_parallel_rank()}, "
+                            #       f"Param {name} shape {loaded_weight.shape}, shard_id {shard_id} is not here.")
                             pass
                         break
                     else:
@@ -589,4 +601,6 @@ class ArcticForCausalLM(nn.Module):
                                                     default_weight_loader)
                             weight_loader(param, loaded_weight)
                         except KeyError:
+                            # print(f"Global rank {torch.distributed.get_rank()}, PP rank: {get_pipeline_model_parallel_rank()}, TP rank: {get_tensor_model_parallel_rank()}, "
+                            #       f"Param {name} shape {loaded_weight.shape}, shard_id {shard_id} is not here.")
                             pass
