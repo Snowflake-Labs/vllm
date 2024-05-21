@@ -120,12 +120,22 @@ class RayGPUExecutor(DistributedGPUExecutor):
             else:
                 # Else, added to the list of workers.
                 self.workers.append(worker)
-
         if self.driver_dummy_worker is None:
             raise ValueError(
                 "Ray does not allocate any GPUs on the driver node. Consider "
                 "adjusting the Ray placement group or running the driver on a "
                 "GPU node.")
+
+        driver_ip = ray.get(self.driver_dummy_worker.get_node_ip.remote())
+        worker_ips = [ray.get(worker.get_node_ip.remote()) for worker in self.workers]
+        ip_counts = {}
+        for ip in worker_ips:
+            ip_counts[ip] = ip_counts.get(ip, 0) + 1
+
+        def sort_by_driver_then_worker_ip(worker):
+            ip = ray.get(worker.get_node_ip.remote())
+            return (ip != driver_ip, ip_counts[ip], ip)
+        self.workers = sorted(self.workers, key=sort_by_driver_then_worker_ip)
 
         # Get the set of GPU IDs used on each node.
         worker_node_and_gpu_ids = self._run_workers("get_node_and_gpu_ids",
@@ -323,6 +333,7 @@ class RayGPUExecutorAsync(RayGPUExecutor, DistributedGPUExecutorAsync):
         # Run the ray workers asynchronously.
 
         for pp_rank in range(self.parallel_config.pipeline_parallel_size):
+            # print(f"= in RayGPUExecutorAsync =: {pp_rank} launched.........")
             coros = []
             # Locks are necessary for correctness in the TP + PP case.
             async with self.pp_locks[pp_rank]:
@@ -331,10 +342,15 @@ class RayGPUExecutorAsync(RayGPUExecutor, DistributedGPUExecutorAsync):
                     rank = (pp_rank * self.parallel_config.tensor_parallel_size
                             ) + tp_rank
                     if rank == 0:
+                        # print(f"= in RayGPUExecutorAsync =if: rank {rank} pp {pp_rank} tp {tp_rank} scheduled with data: {[seq.seq_data for seq in driver_args[0]]}...")
                         coros.append(
                             self.driver_executor(method, *driver_args,
                                                  **driver_kwargs))
+                        # import time
+                        # print("============== in RayGPUExecutorAsync =if wait 30 seconds ============")
+                        # time.sleep(30)
                     else:
+                        # print(f"= in RayGPUExecutorAsync =else: rank {rank} pp {pp_rank} tp {tp_rank} scheduled with data: {driver_args[0]}...")
                         worker = self.workers[rank - 1]
                         if tp_rank == 0:
                             coros.append(
