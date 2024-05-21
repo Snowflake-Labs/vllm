@@ -12,6 +12,8 @@ from unittest.mock import MagicMock
 CONTEXT_LEN_1 = list(range(1, 15))
 
 
+
+
 class BackedUpSink:
     def __init__(self):
         self.sink_key_cache = []
@@ -31,7 +33,7 @@ class BackedUpSink:
         return len(self.sink_blocks)
 
 
-class SinkAttentionRotaryImpl:
+class SinkAttentionRotaryImpl(torch.nn.Module):
     def __init__(
         self,
         sink_size: int,
@@ -39,9 +41,13 @@ class SinkAttentionRotaryImpl:
         num_kv_heads: int,
         head_size: int,
     ):
+        super().__init__()
         self.sink_size = sink_size
         self.sliding_window_size = sliding_window_size
-        self.cache_size = sliding_window_size + sink_size
+        self.cache_size = torch.Tensor([sliding_window_size + sink_size])
+        self._cache_zeros = torch.Tensor([0])
+        self._dummy_rotations = torch.ones(1, self.sink_size)
+        self._dummy_query = torch.ones(1, 1)
         self.num_kv_heads = num_kv_heads
         self.head_size = head_size
 
@@ -107,14 +113,11 @@ class SinkAttentionRotaryImpl:
         num_total_tokens_evicted: int
     ) -> None:
         # get rotations angles
-        rotation_positions = (
-            torch.ones(1, self.sink_size).to(key_cache.device)
-            * num_total_tokens_evicted
-        ).to(int)
+        rotation_positions = (self._dummy_rotations * num_total_tokens_evicted).to(int)
 
         # rotate
         sink_to_rotate = self._format_key_cache_to_rotation(backup)
-        dummy_query = torch.zeros_like(sink_to_rotate).to(key_cache.device)
+        dummy_query = self._dummy_query.repeat(sink_to_rotate.shape) #torch.zeros_like(sink_to_rotate).to(key_cache.device)
         _, rotated_sinks = rotary_emb(rotation_positions, dummy_query, sink_to_rotate)
 
         # Put correctly rotated sinks into the original position in the cache
@@ -130,7 +133,20 @@ class SinkAttentionRotaryImpl:
         return x.permute(3, 0, 1, 2, 4).reshape(self.sink_size, -1)
 
     def _calculate_evictions(self, positions: torch.Tensor, batch_i: int):
-        return max(positions[batch_i] - self.cache_size, 0)
+        p_i = positions[batch_i]
+        cs = self.cache_size    #.to(p_i.device)
+        diff = p_i - cs #self.cache_size_gpu.to(p_i.device)
+        return max(diff, self._cache_zeros)
+        # return max(positions[batch_i] - self.cache_size, 0)
+
+    # Method to set the device of cache_size_gpu
+    def to(self, device):
+        self.cache_size = self.cache_size.to(device)
+        self._cache_zeros = self._cache_zeros.to(device)
+        self._dummy_rotations = self._dummy_rotations.to(device)
+        self._dummy_query = self._dummy_query.to(device)
+        return self  # Return self for method chaining
+
 
 
 @pytest.fixture
