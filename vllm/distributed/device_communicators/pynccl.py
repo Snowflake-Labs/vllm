@@ -99,6 +99,13 @@ class PyNcclCommunicator:
             data = torch.zeros(1, device=device)
             self.all_reduce(data)
             self.stream.synchronize()
+            
+            # A small send/recv for warmup with next rank.
+            # data = torch.zeros(1, device=device)
+            # self.send(data, (self.rank + 1) % len(ranks))
+            # self.recv(data, (len(ranks) + self.rank - 1) % len(ranks))
+            # print('sync')
+            # self.stream.synchronize()
             del data
 
         # by default it is disabled, e.g. in profiling models and prefill phase.
@@ -125,6 +132,35 @@ class PyNcclCommunicator:
                                 ncclDataTypeEnum.from_torch(tensor.dtype),
                                 ncclRedOpTypeEnum.from_torch(op), self.comm,
                                 cudaStream_t(stream.cuda_stream))
+        
+    def send(self, tensor: torch.Tensor, peer: int, stream=None):
+        if self.disabled:
+            return
+        # nccl communicator created on a specific device
+        # will only work on tensors on the same device
+        # otherwise it will cause "illegal memory access"
+        assert tensor.device == self.device, {
+            f"this nccl communicator is created to work on {self.device}, "
+            f"but the input tensor is on {tensor.device}"
+        }
+        if stream is None:
+            stream = self.stream
+        self.nccl.ncclSend(buffer_type(tensor.data_ptr()), tensor.numel(),
+                           ncclDataTypeEnum.from_torch(tensor.dtype), peer,
+                           self.comm, cudaStream_t(stream.cuda_stream))
+
+    def recv(self, tensor: torch.Tensor, peer: int, stream=None):
+        if self.disabled:
+            return
+        assert tensor.device == self.device, {
+            f"this nccl communicator is created to work on {self.device}, "
+            f"but the input tensor is on {tensor.device}"
+        }
+        if stream is None:
+            stream = self.stream
+        self.nccl.ncclRecv(buffer_type(tensor.data_ptr()), tensor.numel(),
+                           ncclDataTypeEnum.from_torch(tensor.dtype), peer,
+                           self.comm, cudaStream_t(stream.cuda_stream))
 
     @contextmanager
     def change_state(self,

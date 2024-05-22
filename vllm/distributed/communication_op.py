@@ -14,7 +14,8 @@ from .parallel_state import (get_cpu_world_group,
                              get_tensor_model_parallel_group,
                              get_tensor_model_parallel_world_size,
                              get_tp_ca_communicator,
-                             get_tp_pynccl_communicator)
+                             get_tp_pynccl_communicator,
+                             get_pp_pynccl_communicator)
 
 
 @dataclass
@@ -57,13 +58,22 @@ def graph_capture():
         # graph, we use either custom all-reduce kernel or PyTorch NCCL.
         # We always prioritize using custom all-reduce kernel but fall back
         # to PyTorch or pynccl if it is disabled or not supported.
-        pynccl_comm = get_tp_pynccl_communicator()
-        if pynccl_comm is None:
-            maybe_pynccl_context = nullcontext()
+        pynccl_tp_comm = get_tp_pynccl_communicator()
+        pynccl_pp_comm = get_pp_pynccl_communicator()
+
+        if pynccl_tp_comm is None:
+            maybe_pynccl_tp_context = nullcontext()
         else:
-            maybe_pynccl_context = pynccl_comm.change_state(
+            maybe_pynccl_tp_context = pynccl_tp_comm.change_state(
                 enable=True, stream=torch.cuda.current_stream())
-        with maybe_pynccl_context:
+
+        if pynccl_pp_comm is None:
+            maybe_pynccl_pp_context = nullcontext()
+        else:
+            maybe_pynccl_pp_context = pynccl_pp_comm.change_state(
+                enable=True, stream=torch.cuda.current_stream())
+            
+        with maybe_pynccl_tp_context, maybe_pynccl_pp_context:
             yield graph_capture_context
 
 
@@ -315,22 +325,36 @@ def broadcast_tensor_dict(
 
 
 def send_next_rank(tensors: List[torch.Tensor]) -> None:
-    """Send the tensors to the next pipeline model parallel rank."""
+    """Send the tensors to the next pipeline model parallel rank.""" 
+    pynccl_comm = get_pp_pynccl_communicator()
+    
     combined_tensor = torch.cat(tensors, dim=0)
     torch.cat(tensors, dim=0)
-    torch.distributed.send(combined_tensor,
-                           get_pipeline_model_parallel_next_rank(),
-                           get_pipeline_model_parallel_group())
+
+    if (pynccl_comm is not None and not pynccl_comm.disabled):
+        dst = torch.distributed.get_group_rank(get_pipeline_model_parallel_group(), get_pipeline_model_parallel_next_rank())
+        pynccl_comm.send(combined_tensor, dst)
+    else:
+        torch.distributed.send(combined_tensor,
+                            get_pipeline_model_parallel_next_rank(),
+                            get_pipeline_model_parallel_group())
 
 
 def recv_prev_rank(num_tensors: int, sizes: torch.Size, dtype: torch.dtype,
                    device: torch.device) -> List[torch.Tensor]:
-    sizes = list(sizes)
     """Receive tensors from the previous pipeline model parallel rank."""
+    pynccl_comm = get_pp_pynccl_communicator()
+
+    sizes = list(sizes)
     combined_tensor = torch.empty([sizes[0] * num_tensors] + sizes[1:],
                                   dtype=dtype,
                                   device=device)
-    torch.distributed.recv(combined_tensor,
-                           get_pipeline_model_parallel_prev_rank(),
-                           get_pipeline_model_parallel_group())
+
+    if (pynccl_comm is not None and not pynccl_comm.disabled):
+        src = torch.distributed.get_group_rank(get_pipeline_model_parallel_group(), get_pipeline_model_parallel_prev_rank())
+        pynccl_comm.recv(combined_tensor, src)
+    else:
+        torch.distributed.recv(combined_tensor,
+                            get_pipeline_model_parallel_prev_rank(),
+                            get_pipeline_model_parallel_group())
     return torch.chunk(combined_tensor, num_tensors, dim=0)
