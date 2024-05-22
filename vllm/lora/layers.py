@@ -10,6 +10,7 @@ from transformers import PretrainedConfig
 
 from vllm.config import LoRAConfig
 from vllm.distributed import (get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_src_rank,
                               get_tensor_model_parallel_world_size,
                               split_tensor_along_last_dim,
                               tensor_model_parallel_all_gather,
@@ -1150,7 +1151,8 @@ class LogitsProcessorWithLoRA(BaseLayerWithLoRA):
         logits = torch.matmul(hidden_states, embedding.t())
         if embedding_bias is not None:
             logits += embedding_bias
-        logits = tensor_model_parallel_gather(logits)
+        logits = tensor_model_parallel_gather(
+            logits, dst=get_tensor_model_parallel_src_rank())
         if logits is None:
             return None
 

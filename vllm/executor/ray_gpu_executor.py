@@ -60,7 +60,8 @@ class RayGPUExecutor(DistributedGPUExecutor):
 
     def _init_workers_ray(self, placement_group: "PlacementGroup",
                           **ray_remote_kwargs):
-        if self.parallel_config.tensor_parallel_size == 1:
+        if (self.parallel_config.tensor_parallel_size == 1
+                and self.parallel_config.pipeline_parallel_size == 1):
             # For single GPU case, we use a ray worker with constrained memory.
             num_gpus = self.cache_config.gpu_memory_utilization
         else:
@@ -314,19 +315,35 @@ class RayGPUExecutorAsync(RayGPUExecutor, DistributedGPUExecutorAsync):
         **kwargs,
     ) -> Any:
         """Runs the given method on all workers."""
-        coros = []
-
         if driver_args is None:
             driver_args = args
         if driver_kwargs is None:
             driver_kwargs = kwargs
 
-        coros.append(
-            self.driver_executor(method, *driver_args, **driver_kwargs))
-
         # Run the ray workers asynchronously.
-        for worker in self.workers:
-            coros.append(worker.execute_method.remote(method, *args, **kwargs))
 
-        all_outputs = await asyncio.gather(*coros)
+        for pp_rank in range(self.parallel_config.pipeline_parallel_size):
+            coros = []
+            # Locks are necessary for correctness in the TP + PP case.
+            async with self.pp_locks[pp_rank]:
+                for tp_rank in range(
+                        self.parallel_config.tensor_parallel_size):
+                    rank = (pp_rank * self.parallel_config.tensor_parallel_size
+                            ) + tp_rank
+                    if rank == 0:
+                        coros.append(
+                            self.driver_executor(method, *driver_args,
+                                                 **driver_kwargs))
+                    else:
+                        worker = self.workers[rank - 1]
+                        if tp_rank == 0:
+                            coros.append(
+                                worker.execute_method.remote(
+                                    method, *driver_args, **driver_kwargs))
+                        else:
+                            coros.append(
+                                worker.execute_method.remote(
+                                    method, *args, **kwargs))
+                all_outputs = await asyncio.gather(*coros)
+
         return all_outputs

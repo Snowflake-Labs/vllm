@@ -34,8 +34,10 @@ class CacheEngine:
         self.num_kv_heads = model_config.get_num_kv_heads(parallel_config)
 
         self.block_size = cache_config.block_size
-        self.num_gpu_blocks = cache_config.num_gpu_blocks
-        self.num_cpu_blocks = cache_config.num_cpu_blocks
+        self.num_gpu_blocks = (cache_config.num_gpu_blocks //
+                               parallel_config.pipeline_parallel_size)
+        self.num_cpu_blocks = (cache_config.num_cpu_blocks //
+                               parallel_config.pipeline_parallel_size)
 
         if cache_config.cache_dtype == "auto":
             self.dtype = model_config.dtype

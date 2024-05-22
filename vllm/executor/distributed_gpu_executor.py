@@ -1,4 +1,5 @@
 from abc import abstractmethod
+from functools import reduce
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from vllm.executor.executor_base import ExecutorAsyncBase
@@ -122,5 +123,7 @@ class DistributedGPUExecutorAsync(DistributedGPUExecutor, ExecutorAsyncBase):
                                                     driver_args=args,
                                                     driver_kwargs=kwargs)
 
-        # Only the driver worker returns the sampling results.
-        return all_outputs[0]
+        # Only the first tensor parallel worker on the last pipeline parallel
+        # rank returns the output
+        output = reduce(lambda x, y: [x[0] or y[0]], all_outputs)
+        return output
