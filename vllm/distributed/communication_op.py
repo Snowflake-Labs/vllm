@@ -8,7 +8,9 @@ from torch.distributed import ProcessGroup
 from .parallel_state import (get_pipeline_model_parallel_group,
                              get_pipeline_model_parallel_next_rank,
                              get_pipeline_model_parallel_prev_rank,
+                             get_pp_communication_method,
                              get_tensor_model_parallel_group,
+                             get_tensor_model_parallel_rank,
                              get_tensor_model_parallel_world_size,
                              is_pynccl_enabled_for_all_reduce)
 
@@ -217,7 +219,27 @@ def broadcast_tensor_dict(
 def send_next_rank(tensors: List[torch.Tensor]) -> None:
     """Send the tensors to the next pipeline model parallel rank."""
     combined_tensor = torch.cat(tensors, dim=0)
-    torch.distributed.send(combined_tensor,
+
+    communication_method = get_pp_communication_method()
+    if communication_method == "signal":
+        torch.distributed.send(combined_tensor.reshape(-1)[0],
+                               get_pipeline_model_parallel_next_rank(),
+                               get_pipeline_model_parallel_group())
+    elif communication_method == "allgather":
+        _send_next_rank_sliced(combined_tensor)
+    else:
+        assert communication_method == "send_recv"
+        torch.distributed.send(combined_tensor,
+                               get_pipeline_model_parallel_next_rank(),
+                               get_pipeline_model_parallel_group())
+
+
+def _send_next_rank_sliced(tensor: torch.Tensor):
+    tensor_parallel_rank = get_tensor_model_parallel_rank()
+    # reshape to (tp_size, size // tp_size), then simply send (size // tp_size)
+    tensor = tensor.reshape(get_tensor_model_parallel_world_size(), -1)
+    sliced = tensor[tensor_parallel_rank]
+    torch.distributed.send(sliced,
                            get_pipeline_model_parallel_next_rank(),
                            get_pipeline_model_parallel_group())
 
@@ -229,7 +251,40 @@ def recv_prev_rank(num_tensors: int, sizes: torch.Size, dtype: torch.dtype,
     combined_tensor = torch.empty([sizes[0] * num_tensors] + sizes[1:],
                                   dtype=dtype,
                                   device=device)
-    torch.distributed.recv(combined_tensor,
+
+    communication_method = get_pp_communication_method()
+    if communication_method == "signal":
+        combined_tensor = torch.ones([sizes[0] * num_tensors] + sizes[1:],
+                                     dtype=dtype,
+                                     device=device)
+        torch.distributed.recv(combined_tensor.reshape(-1)[0],
+                               get_pipeline_model_parallel_prev_rank(),
+                               get_pipeline_model_parallel_group())
+
+    elif communication_method == "allgather":
+        combined_tensor = _recv_next_rank_sliced(combined_tensor)
+    else:
+        assert communication_method == "send_recv"
+        torch.distributed.recv(combined_tensor,
+                               get_pipeline_model_parallel_prev_rank(),
+                               get_pipeline_model_parallel_group())
+
+    return torch.chunk(combined_tensor, num_tensors, dim=0)
+
+def _recv_next_rank_sliced(tensor: torch.Tensor):
+    prev_shape = tensor.shape
+    # Step 1: receive a slice
+    tensor_parallel_rank = get_tensor_model_parallel_rank()
+    # reshape to (tp_size, size // tp_size), then simply recv (size // tp_size)
+    tensor = tensor.reshape(get_tensor_model_parallel_world_size(), -1)
+
+    # torch.distributed.recv(tensor[tensor_parallel_rank],
+    sliced = torch.empty_like(tensor[tensor_parallel_rank])
+    torch.distributed.recv(sliced,
                            get_pipeline_model_parallel_prev_rank(),
                            get_pipeline_model_parallel_group())
-    return torch.chunk(combined_tensor, num_tensors, dim=0)
+    # Step 2: AllGather for all slices
+    torch.distributed.all_gather_into_tensor(
+        tensor, sliced, group=get_tensor_model_parallel_group()
+    )
+    return tensor.reshape(prev_shape)

@@ -89,6 +89,7 @@ def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
     backend: Optional[str] = None,
+    pipeline_model_parallel_communication_method: str = "send_recv"
 ) -> None:
     """
     Initialize model parallel groups.
@@ -153,6 +154,10 @@ def initialize_model_parallel(
         if rank in ranks:
             _PIPELINE_MODEL_PARALLEL_GROUP = group
             _PIPELINE_GLOBAL_RANKS = ranks
+
+    if _PIPELINE_MODEL_PARALLEL_GROUP is not None:
+        set_pp_communication_method(
+            pipeline_model_parallel_communication_method)
 
 
 def ensure_model_parallel_initialized(
@@ -351,3 +356,26 @@ def is_pynccl_enabled_for_all_reduce():
     """check if pynccl is enabled for all reduce"""
     global _ENABLE_PYNCCL_FOR_ALL_REDUCE
     return _ENABLE_PYNCCL_FOR_ALL_REDUCE
+
+
+# Communication method for pipeline parallel. See the function above for details
+_PP_COMMUNICATION_METHOD = "send_recv"
+
+
+def set_pp_communication_method(method: str):
+    """
+    Set the communication method for pipeline parallel. Available methods are:
+    send_recv: (default) P2P send recv between workers of the same tp rank.
+    allgather: Slice tensor to tp_degree slices. Worker of tp rank i sends
+      slice i (inter-node), then receivers run an allgather (intra-node)
+    signal: debug only. This results in numerical error. Only send 1 byte for
+      pipeline data dependency.
+    """
+    global _PP_COMMUNICATION_METHOD
+    if method == "signal":
+        logger.warning("Using signal communication, which is only allowed for"
+                       "debug. It will cause numerical incorrectness.")
+    _PP_COMMUNICATION_METHOD = method
+
+def get_pp_communication_method():
+    return _PP_COMMUNICATION_METHOD
