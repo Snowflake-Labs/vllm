@@ -191,7 +191,7 @@ class ArcticMoE(nn.Module):
                 gc.collect()
                 torch.cuda.empty_cache()
             else:
-                param_data.copy_(new_data)
+                param.data.copy_(new_data)
 
     def local_moe_fused(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
@@ -431,6 +431,7 @@ class ArcticModel(nn.Module):
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
+import time
 
 class ArcticForCausalLM(nn.Module):
 
@@ -459,6 +460,8 @@ class ArcticForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
                                                 config.vocab_size)
         self.sampler = Sampler()
+        #with open(f"trace.csv", "w") as f:
+        #    f.write("time,tokens\n")
 
     def forward(
         self,
@@ -467,8 +470,18 @@ class ArcticForCausalLM(nn.Module):
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
+        #start = time.time()
         hidden_states = self.model(input_ids, positions, kv_caches,
                                    attn_metadata)
+        #torch.cuda.synchronize()
+        #print("FORWARD", time.time() - start)
+        #if hasattr(self, "start_time"):
+        #    duration = time.time() - self.start_time
+        #    if not get_tensor_model_parallel_rank():
+        #        print("ITERATION", duration)
+        #        with open(f"trace.csv", "a") as f:
+        #            f.write(f"{duration},{input_ids.shape[0]}\n")
+        #self.start_time = time.time()
         return hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor,
@@ -482,7 +495,9 @@ class ArcticForCausalLM(nn.Module):
         logits: Optional[torch.Tensor],
         sampling_metadata: SamplingMetadata,
     ) -> Optional[SamplerOutput]:
+        #start = time.time()
         next_tokens = self.sampler(logits, sampling_metadata)
+        #print("SAMPLER", time.time() - start)
         return next_tokens
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
@@ -536,6 +551,9 @@ class ArcticForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+                if name not in params_dict:
+                    logger.warning("Skipping loading weight %s", name)
+                    break
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -557,6 +575,9 @@ class ArcticForCausalLM(nn.Module):
                         if weight_name not in name:
                             continue
                         name = name.replace(weight_name, param_name)
+                        if name not in params_dict:
+                            logger.warning("Skipping loading weight %s", name)
+                            break
                         param = params_dict[name]
                         weight_loader = param.weight_loader
                         weight_loader(param,
@@ -566,6 +587,9 @@ class ArcticForCausalLM(nn.Module):
                         break
                     else:
                         if name.endswith(".bias") and name not in params_dict:
+                            continue
+                        if name not in params_dict:
+                            logger.warning("Skipping loading weight %s", name)
                             continue
                         param = params_dict[name]
 

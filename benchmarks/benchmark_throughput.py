@@ -78,12 +78,14 @@ def run_vllm(
     enable_prefix_caching: bool,
     enable_chunked_prefill: bool,
     max_num_batched_tokens: int,
+    max_num_seqs: int,
     gpu_memory_utilization: float = 0.9,
     download_dir: Optional[str] = None,
 ) -> float:
     from vllm import LLM, SamplingParams
     llm = LLM(
         model=model,
+        #load_format="dummy",
         tokenizer=tokenizer,
         quantization=quantization,
         tensor_parallel_size=tensor_parallel_size,
@@ -100,6 +102,7 @@ def run_vllm(
         download_dir=download_dir,
         enable_chunked_prefill=enable_chunked_prefill,
         max_num_batched_tokens=max_num_batched_tokens,
+        max_num_seqs=max_num_seqs,
     )
 
     # Add the requests to the engine.
@@ -225,8 +228,8 @@ def main(args: argparse.Namespace):
             args.enforce_eager, args.kv_cache_dtype,
             args.quantization_param_path, args.device,
             args.enable_prefix_caching, args.enable_chunked_prefill,
-            args.max_num_batched_tokens, args.gpu_memory_utilization,
-            args.download_dir)
+            args.max_num_batched_tokens, args.max_num_seqs,
+            args.gpu_memory_utilization, args.download_dir)
     elif args.backend == "hf":
         assert args.tensor_parallel_size == 1
         elapsed_time = run_hf(requests, args.model, tokenizer, args.n,
@@ -241,18 +244,6 @@ def main(args: argparse.Namespace):
                            for _, prompt_len, output_len in requests)
     print(f"Throughput: {len(requests) / elapsed_time:.2f} requests/s, "
           f"{total_num_tokens / elapsed_time:.2f} tokens/s")
-
-    # Output JSON results if specified
-    if args.output_json:
-        results = {
-            "elapsed_time": elapsed_time,
-            "num_requests": len(requests),
-            "total_num_tokens": total_num_tokens,
-            "requests_per_second": len(requests) / elapsed_time,
-            "tokens_per_second": total_num_tokens / elapsed_time,
-        }
-        with open(args.output_json, "w") as f:
-            json.dump(results, f, indent=4)
 
 
 if __name__ == "__main__":
@@ -360,16 +351,15 @@ if __name__ == "__main__":
                         default=None,
                         help='maximum number of batched tokens per '
                         'iteration')
+    parser.add_argument('--max-num-seqs',
+                        type=int,
+                        default=None,
+                        help='maximum number of sequences per iteration')
     parser.add_argument('--download-dir',
                         type=str,
                         default=None,
                         help='directory to download and load the weights, '
                         'default to the default cache dir of huggingface')
-    parser.add_argument(
-        '--output-json',
-        type=str,
-        default=None,
-        help='Path to save the throughput results in JSON format.')
     args = parser.parse_args()
     if args.tokenizer is None:
         args.tokenizer = args.model
