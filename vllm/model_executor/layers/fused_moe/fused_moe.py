@@ -116,7 +116,9 @@ def fused_moe_kernel(
                       offs_k[None, :] * stride_ak)
 
     off_experts = tl.load(expert_ids_ptr + pid_m)
-    # off_experts = 0
+    off_experts = off_experts.to(tl.int64)
+    stride_be = stride_be.to(tl.int64)
+    tl.device_assert(off_experts * stride_be >= 0, "off_experts * stride_be overflows!")
     b_ptrs = b_ptr + off_experts * stride_be + (offs_k[:, None] * stride_bk +
                                                 offs_bn[None, :] * stride_bn)
 
