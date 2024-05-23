@@ -182,9 +182,30 @@ class ArcticMoE(nn.Module):
             param_data[expert_id,
                        shard_size:2 * shard_size, :] = loaded_weight[shard, :]
         if weight_name.endswith("w2.weight"):
-            param_data[expert_id, :, :] = loaded_weight[:, shard]
-        if self.is_quant:
-            param.ds_quantize_(param_data)
+            param.shadow_data[expert_id][:, :shard_size] = loaded_weight[:, shard]
+            self.load_completion_w2 += 1
+        if (self.load_completion_w2 == self.num_experts or self.load_completion_w1_w3 == self.num_experts * 2):
+            new_data = torch.stack(param.shadow_data).to(param.data.device)
+
+            len_sd = len(param.shadow_data)
+            for _ in range(len_sd):
+                sd = param.shadow_data.pop()
+                del sd
+            del param.shadow_data
+            
+            if self.load_completion_w2 == self.num_experts:
+                self.load_completion_w2 = 0
+            if self.load_completion_w1_w3 == self.num_experts * 2:
+                self.load_completion_w1_w3 = 0 
+            
+            if self.is_quant:
+                param.ds_quantize_(new_data)
+                del new_data
+                new_data = None
+                gc.collect()
+                torch.cuda.empty_cache()
+            else:
+                param.data.copy_(new_data)
 
     def local_moe_fused(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
@@ -451,6 +472,7 @@ class ArcticModel(nn.Module):
                 #   f"shape: {hidden_states.shape}, device: {hidden_states.device}, for request with {input_ids.size()} tokens...")
         return hidden_states
 
+import time
 
 class ArcticForCausalLM(nn.Module):
 
@@ -472,6 +494,8 @@ class ArcticForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
                                                 config.vocab_size)
         self.sampler = Sampler()
+        #with open(f"trace.csv", "w") as f:
+        #    f.write("time,tokens\n")
 
     def forward(
         self,
@@ -480,8 +504,18 @@ class ArcticForCausalLM(nn.Module):
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
+        #start = time.time()
         hidden_states = self.model(input_ids, positions, kv_caches,
                                    attn_metadata)
+        #torch.cuda.synchronize()
+        #print("FORWARD", time.time() - start)
+        #if hasattr(self, "start_time"):
+        #    duration = time.time() - self.start_time
+        #    if not get_tensor_model_parallel_rank():
+        #        print("ITERATION", duration)
+        #        with open(f"trace.csv", "a") as f:
+        #            f.write(f"{duration},{input_ids.shape[0]}\n")
+        #self.start_time = time.time()
         return hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor,
@@ -495,7 +529,9 @@ class ArcticForCausalLM(nn.Module):
         logits: Optional[torch.Tensor],
         sampling_metadata: SamplingMetadata,
     ) -> Optional[SamplerOutput]:
+        #start = time.time()
         next_tokens = self.sampler(logits, sampling_metadata)
+        #print("SAMPLER", time.time() - start)
         return next_tokens
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
@@ -551,14 +587,14 @@ class ArcticForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                try:
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(param, loaded_weight, shard_id)
-                except KeyError:
-                    # print(f"Global rank {torch.distributed.get_rank()}, PP rank: {get_pipeline_model_parallel_rank()}, TP rank: {get_tensor_model_parallel_rank()}, "
-                    #       f"Param {name} shape {loaded_weight.shape}, shard_id {shard_id} is not here.")
-                    pass
+                if name not in params_dict:
+                    logger.warning("Skipping loading weight %s", name)
+                    break
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                # print(loaded_weight, param.data, param.data.shape)
+                # exit()
                 break
             else:
                 for param_name, weight_name, shard_id in mlp_params_mapping:
@@ -580,27 +616,24 @@ class ArcticForCausalLM(nn.Module):
                         if weight_name not in name:
                             continue
                         name = name.replace(weight_name, param_name)
-                        try:
-                            param = params_dict[name]
-                            weight_loader = param.weight_loader
-                            weight_loader(param,
-                                        loaded_weight,
-                                        weight_name,
-                                        expert_id=shard_id)
-                        except KeyError:
-                            # print(f"Global rank {torch.distributed.get_rank()}, PP rank: {get_pipeline_model_parallel_rank()}, TP rank: {get_tensor_model_parallel_rank()}, "
-                            #       f"Param {name} shape {loaded_weight.shape}, shard_id {shard_id} is not here.")
-                            pass
+                        if name not in params_dict:
+                            logger.warning("Skipping loading weight %s", name)
+                            break
+                        param = params_dict[name]
+                        weight_loader = param.weight_loader
+                        weight_loader(param,
+                                      loaded_weight,
+                                      weight_name,
+                                      expert_id=shard_id)
                         break
                     else:
                         if name.endswith(".bias") and name not in params_dict:
                             continue
-                        try:
-                            param = params_dict[name]
-                            weight_loader = getattr(param, "weight_loader",
-                                                    default_weight_loader)
-                            weight_loader(param, loaded_weight)
-                        except KeyError:
-                            # print(f"Global rank {torch.distributed.get_rank()}, PP rank: {get_pipeline_model_parallel_rank()}, TP rank: {get_tensor_model_parallel_rank()}, "
-                            #       f"Param {name} shape {loaded_weight.shape}, shard_id {shard_id} is not here.")
-                            pass
+                        if name not in params_dict:
+                            logger.warning("Skipping loading weight %s", name)
+                            continue
+                        param = params_dict[name]
+
+                        weight_loader = getattr(param, "weight_loader",
+                                                default_weight_loader)
+                        weight_loader(param, loaded_weight)

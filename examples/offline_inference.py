@@ -11,7 +11,8 @@ prompts = [
 sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
 
 # Create an LLM.
-llm = LLM(model="facebook/opt-125m")
+#llm = LLM(model="/data-fast/llama3-8b-tp8", load_format="sharded_state", tensor_parallel_size=8, enable_lora=True)
+llm = LLM(model="meta-llama/Meta-Llama-3-8B", tensor_parallel_size=8, enable_lora=True)
 # Generate texts from the prompts. The output is a list of RequestOutput objects
 # that contain the prompt, generated text, and other information.
 outputs = llm.generate(prompts, sampling_params)
