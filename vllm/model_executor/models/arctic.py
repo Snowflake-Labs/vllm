@@ -16,6 +16,7 @@ from vllm.distributed import (get_pipeline_model_parallel_rank,
                               is_pipeline_model_parallel_last_rank,
                               recv_prev_rank, send_next_rank,
                               tensor_model_parallel_all_reduce)
+from vllm.config import CacheConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import fused_experts, fused_topk
@@ -420,16 +421,11 @@ class ArcticModel(nn.Module):
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-<<<<<<< HEAD
-
-        logger.debug(f"PP rank {get_pipeline_model_parallel_rank()}: input_ids: {input_ids}, shape {list(input_ids.size())}")
-=======
         # print(f"PP rank {get_pipeline_model_parallel_rank()} TP rank {get_tensor_model_parallel_rank()}: input_ids: {input_ids}, shape {list(input_ids.size())}")
         # if torch.distributed.get_rank() == 0:
         #     import pdb; pdb.set_trace()
         # else:
         #     _sleep_infinity()
->>>>>>> 03944982 (add new benchmarking scripts)
         if is_pipeline_model_parallel_first_rank():
             hidden_states = self.embed_tokens(input_ids)
         else:
@@ -450,13 +446,8 @@ class ArcticModel(nn.Module):
             #             )
             # print(f"kv cache size: {len(kv_caches)}, index is {i - self.start_layer}")
             hidden_states = layer(positions, hidden_states, kv_caches[i - self.start_layer], attn_metadata)
-<<<<<<< HEAD
-            logger.debug(f"PP rank {get_pipeline_model_parallel_rank()}: layer {i} to finish...")
-
-=======
             # print(f"PP rank {get_pipeline_model_parallel_rank()} TP rank {get_tensor_model_parallel_rank()}: layer {i} finishes...")     
             
->>>>>>> 03944982 (add new benchmarking scripts)
         if is_pipeline_model_parallel_last_rank():
             hidden_states = self.norm(hidden_states)
         else:
