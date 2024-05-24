@@ -47,6 +47,8 @@ class SinkAttentionRotaryImpl(torch.nn.Module):
         rotary_emb: Callable,
         positions: torch.Tensor,
     ) -> BackedUpSink:
+        assert rotary_emb is not None, f"Your model forward pass does not provide rotary_emb ({rotary_emb}). "
+        assert positions is not None, f"Your model forward pass does not provide positions ({positions}). "
         decode_meta = attn_metadata.decode_metadata
         backed_up_sink = BackedUpSink()
 

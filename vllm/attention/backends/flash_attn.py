@@ -5,7 +5,7 @@ XFormers backend. The duplicated code will be removed once we use flash-attn or
 flashinfer for all the attention operations.
 """
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Type
+from typing import Callable, Dict, List, Optional, Tuple, Type
 
 import torch
 from flash_attn import flash_attn_varlen_func
@@ -13,6 +13,7 @@ from flash_attn import flash_attn_varlen_func
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionMetadata,
                                               AttentionMetadataPerStage)
+from vllm.attention.backends.sink_rotations import SinkAttentionRotaryImpl
 from vllm.attention.ops.paged_attn import (PagedAttention,
                                            PagedAttentionMetadata)
 
@@ -144,7 +145,7 @@ class FlashAttentionImpl(AttentionImpl):
         self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
         self.sliding_window = ((sliding_window, sliding_window)
                                if sliding_window is not None else (-1, -1))
-        self.sink_size = sink_size if sink_size is not None else 0
+        self.sink_size = sink_size
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
         self.alibi_slopes = alibi_slopes
@@ -158,6 +159,11 @@ class FlashAttentionImpl(AttentionImpl):
                 f"Head size {head_size} is not supported by PagedAttention. "
                 f"Supported head sizes are: {suppored_head_sizes}.")
 
+        self.do_backup = self.sink_size is not None and self.sink_size > 0
+        self.sink_attn_rotater = SinkAttentionRotaryImpl(
+            self.sink_size, self.sliding_window, self.num_kv_heads, self.head_size
+        )
+
     def forward(
         self,
         query: torch.Tensor,
@@ -165,6 +171,8 @@ class FlashAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata[FlashAttentionMetadata],
+        rotary_emb: Optional[Callable],
+        positions: Optional[torch.Tensor],
         kv_scale: float,
     ) -> torch.Tensor:
         """Forward pass with FlashAttention and PagedAttention.
@@ -254,6 +262,9 @@ class FlashAttentionImpl(AttentionImpl):
                 )
         if decode_meta := attn_metadata.decode_metadata:
             # Decoding run.
+            if self.do_backup:
+                backed_up_sink = self.sink_attn_rotater.process_decode_metadata(attn_metadata, key_cache, rotary_emb, positions)
+
             output[num_prefill_tokens:] = PagedAttention.forward_decode(
                 decode_query,
                 key_cache,
@@ -267,6 +278,9 @@ class FlashAttentionImpl(AttentionImpl):
                 self.alibi_slopes,
                 kv_scale,
             )
+
+            if self.do_backup:
+                self.sink_attn_rotater.restore_cache_from_backup(key_cache, backed_up_sink)
 
         # Reshape the output tensor.
         return output.view(num_tokens, hidden_size)
