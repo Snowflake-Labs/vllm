@@ -245,7 +245,7 @@ class ArcticAttention(nn.Module):
 
         self.sliding_window = getattr(self.config, "sliding_window", int(1e7))
         if self.sliding_window is None:
-            self.sliding_window = int(1e6)
+            self.sliding_window = int(1e7)
         self.sink_size = getattr(self.config, "sink_size", 0)
 
         self.max_position_embeddings = config.max_position_embeddings

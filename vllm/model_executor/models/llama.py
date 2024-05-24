@@ -187,7 +187,6 @@ class LlamaDecoderLayer(nn.Module):
                                           8192)
         sliding_window = getattr(config, "sliding_window", None)
         sink_size = getattr(config, "sink_size", None)
-        print(f"SINK SIZE = {sink_size}, SW = {sliding_window}")
         # Support abacusai/Smaug-72B-v0.1 with attention_bias
         # Support internlm/internlm-7b with bias
         attention_bias = getattr(config, "attention_bias", False) or getattr(

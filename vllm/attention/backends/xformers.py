@@ -1,6 +1,6 @@
 """Attention layer with xFormers and PagedAttention."""
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Type
+from typing import Dict, List, Optional, Tuple, Type, Callable
 
 import torch
 from xformers import ops as xops
@@ -179,7 +179,7 @@ class XFormersImpl(AttentionImpl):
         value: torch.Tensor,
         kv_cache: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata[XFormersMetadata],
-        rotary_emb,
+        rotary_emb: Optional[Callable],
         positions: torch.Tensor,
         kv_scale: float,
     ) -> torch.Tensor:
