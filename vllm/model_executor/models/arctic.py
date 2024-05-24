@@ -191,7 +191,7 @@ class ArcticMoE(nn.Module):
                 gc.collect()
                 torch.cuda.empty_cache()
             else:
-                param_data.copy_(new_data)
+                param.data.copy_(new_data)
 
     def local_moe_fused(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
@@ -467,8 +467,21 @@ class ArcticForCausalLM(nn.Module):
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
+        # import time
+        # torch.cuda.synchronize()
+        # start = time.time()
         hidden_states = self.model(input_ids, positions, kv_caches,
                                    attn_metadata)
+        # torch.cuda.synchronize()
+        # if hasattr(self, "start_time"):
+        #    duration = time.time() - self.start_time
+        #    if not get_tensor_model_parallel_rank():
+        #        with open(f"trace.csv", "a") as f:
+        #            f.write(f"{duration},{input_ids.shape[0]}\n")
+        # else:
+        #    with open(f"trace.csv", "w") as f:
+        #        f.write("time,tokens\n")
+        # self.start_time = time.time()
         return hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor,
@@ -536,6 +549,9 @@ class ArcticForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+                if name not in params_dict:
+                    logger.warning("Skipping loading weight %s", name)
+                    break
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -557,6 +573,9 @@ class ArcticForCausalLM(nn.Module):
                         if weight_name not in name:
                             continue
                         name = name.replace(weight_name, param_name)
+                        if name not in params_dict:
+                            logger.warning("Skipping loading weight %s", name)
+                            break
                         param = params_dict[name]
                         weight_loader = param.weight_loader
                         weight_loader(param,
@@ -566,6 +585,9 @@ class ArcticForCausalLM(nn.Module):
                         break
                     else:
                         if name.endswith(".bias") and name not in params_dict:
+                            continue
+                        if name not in params_dict:
+                            logger.warning("Skipping loading weight %s", name)
                             continue
                         param = params_dict[name]
 
