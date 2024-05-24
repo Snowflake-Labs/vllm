@@ -1,7 +1,6 @@
 """A GPU worker class."""
 import gc
 import os
-import time
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch

@@ -431,7 +431,6 @@ class ArcticModel(nn.Module):
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
-import time
 
 class ArcticForCausalLM(nn.Module):
 
@@ -460,8 +459,6 @@ class ArcticForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
                                                 config.vocab_size)
         self.sampler = Sampler()
-        #with open(f"trace.csv", "w") as f:
-        #    f.write("time,tokens\n")
 
     def forward(
         self,
@@ -470,18 +467,21 @@ class ArcticForCausalLM(nn.Module):
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        #start = time.time()
+        # import time
+        # torch.cuda.synchronize()
+        # start = time.time()
         hidden_states = self.model(input_ids, positions, kv_caches,
                                    attn_metadata)
-        #torch.cuda.synchronize()
-        #print("FORWARD", time.time() - start)
-        #if hasattr(self, "start_time"):
+        # torch.cuda.synchronize()
+        # if hasattr(self, "start_time"):
         #    duration = time.time() - self.start_time
         #    if not get_tensor_model_parallel_rank():
-        #        print("ITERATION", duration)
         #        with open(f"trace.csv", "a") as f:
         #            f.write(f"{duration},{input_ids.shape[0]}\n")
-        #self.start_time = time.time()
+        # else:
+        #    with open(f"trace.csv", "w") as f:
+        #        f.write("time,tokens\n")
+        # self.start_time = time.time()
         return hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor,
@@ -495,9 +495,7 @@ class ArcticForCausalLM(nn.Module):
         logits: Optional[torch.Tensor],
         sampling_metadata: SamplingMetadata,
     ) -> Optional[SamplerOutput]:
-        #start = time.time()
         next_tokens = self.sampler(logits, sampling_metadata)
-        #print("SAMPLER", time.time() - start)
         return next_tokens
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
