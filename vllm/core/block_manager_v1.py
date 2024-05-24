@@ -226,8 +226,7 @@ class BlockSpaceManagerV1(BlockSpaceManager):
             self.block_sliding_window = sliding_window // block_size
 
         if sink_size is not None:
-            assert sink_size % block_size == 0, (sink_size,
-                                                      block_size)
+            assert sink_size % block_size == 0, (sink_size, block_size)
             self.block_sink_size = sink_size // block_size
 
         self.sink_incr = 0 if self.block_sink_size is None else self.block_sink_size
