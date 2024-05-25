@@ -182,30 +182,9 @@ class ArcticMoE(nn.Module):
             param_data[expert_id,
                        shard_size:2 * shard_size, :] = loaded_weight[shard, :]
         if weight_name.endswith("w2.weight"):
-            param.shadow_data[expert_id][:, :shard_size] = loaded_weight[:, shard]
-            self.load_completion_w2 += 1
-        if (self.load_completion_w2 == self.num_experts or self.load_completion_w1_w3 == self.num_experts * 2):
-            new_data = torch.stack(param.shadow_data).to(param.data.device)
-
-            len_sd = len(param.shadow_data)
-            for _ in range(len_sd):
-                sd = param.shadow_data.pop()
-                del sd
-            del param.shadow_data
-            
-            if self.load_completion_w2 == self.num_experts:
-                self.load_completion_w2 = 0
-            if self.load_completion_w1_w3 == self.num_experts * 2:
-                self.load_completion_w1_w3 = 0 
-            
-            if self.is_quant:
-                param.ds_quantize_(new_data)
-                del new_data
-                new_data = None
-                gc.collect()
-                torch.cuda.empty_cache()
-            else:
-                param.data.copy_(new_data)
+            param_data[expert_id, :, :] = loaded_weight[:, shard]
+        if self.is_quant:
+            param.ds_quantize_(param_data)
 
     def local_moe_fused(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
