@@ -3,12 +3,12 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import math
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
 from vllm.model_executor.utils import set_weight_attrs
-
+import gc
 
 class DeepSpeedFPConfig(QuantizationConfig):
     """Config for DeepSpeed FP quantizer. It supports fp6 and fp8.
@@ -152,32 +152,51 @@ class DeepSpeedFPParameter(nn.Parameter):
             raise ImportError("Please install deepspeed>=0.14.2 via "
                               "`pip install deepspeed>=0.14.2` to use "
                               "deepspeedfp quantizer.") from err
-        data = torch.empty((
-            orig_shape.numel() // quant_config.group_size,
-            quant_config.group_size * quant_config.weight_bits // 8 + 4,
-        ),
-                           dtype=torch.int8)
+        if len(orig_shape) == 3:
+            data = torch.empty(0, dtype=torch.uint8)
+        else:
+            data = torch.empty(orig_shape, dtype=torch.uint8)
         self = torch.Tensor._make_subclass(cls, data, data.requires_grad)
         self.orig_shape = orig_shape
         self.quant_config = quant_config
-        self.fp_quantizer = FP_Quantize(group_size=quant_config.group_size)
+        g_size = max(
+            [
+                2**i for i in range(4, int(math.log2(quant_config.group_size)+1)) \
+                if orig_shape[-1] % (2**i) == 0 
+            ]
+        )
+        self.fp_quantizer = FP_Quantize(group_size=g_size)
         self.fp_quantizer.orig_shape = orig_shape
         self.fp_quantizer.orig_dtype = params_dtype
+        self.fp_quantizer.scales = torch.empty(orig_shape.numel() // g_size, 4, 
+                                        dtype=torch.uint8, device=self.data.device)
         return self
 
     def ds_quantize_(self, tensor: torch.Tensor):
-        assert tensor.device.type == "cuda" and tensor.dtype != torch.int8
-        return self.data.copy_(
-            self.fp_quantizer.quantize(
+        assert tensor.device.type == "cuda" and tensor.dtype != torch.uint8
+        prev_data = self.data
+        q_data, _ = self.fp_quantizer.quantize(
                 tensor.data,
                 q_bits=self.quant_config.weight_bits,
-            ))
+                return_meta_tensor=True
+            )
+        del tensor
+        del prev_data
+        tensor = None
+        prev_data = None
+        gc.collect()
+        torch.cuda.empty_cache()
+        self.data = q_data
+        return self.data
+
+    def quantization_scales(self):
+        return self.fp_quantizer.get_scales()
 
     def ds_dequantize(self, fp_out=None) -> torch.Tensor:
         """
         Return a tensor containing the dequantized weights of this parameter.
         """
-        assert self.data.device.type == "cuda" and self.data.dtype == torch.int8
+        assert self.data.device.type == "cuda" and self.data.dtype == torch.uint8
         return self.fp_quantizer.dequantize(
             self.data, fp_out=fp_out, q_bits=self.quant_config.weight_bits)
 
@@ -186,7 +205,7 @@ class DeepSpeedFPParameter(nn.Parameter):
         Return a tensor where only the weights at `indices` are dequantized
         (to save HBM -> SRAM bandwidth).
         """
-        assert self.data.device.type == "cuda" and self.data.dtype == torch.int8
+        assert self.data.device.type == "cuda" and self.data.dtype == torch.uint8
         return self.fp_quantizer.selective_dequantize(
             self.data,
             indices,
