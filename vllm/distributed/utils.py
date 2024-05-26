@@ -149,7 +149,13 @@ def get_pp_indices_arctic(num_hidden_layers: int, pp_rank: int, pp_size: int) ->
     if num_hidden_layers % pp_size == 0: 
         return get_pp_indices(num_hidden_layers, pp_rank, pp_size)
 
-    num_pad_layers = pp_size - num_hidden_layers % pp_size
-    n_layers = num_pad_layers + num_hidden_layers
-    assert n_layers % pp_size == 0
-    return get_pp_indices(n_layers, pp_rank, pp_size)
+    residual = num_hidden_layers % pp_size
+    incremental1 = num_hidden_layers // pp_size + 1
+    incremental2 = num_hidden_layers // pp_size
+    if pp_rank < residual:
+        start_layer = pp_rank * incremental1
+        end_layer = start_layer + incremental1
+    else:
+        start_layer = incremental1 * residual + (pp_rank - residual) * incremental2
+        end_layer = start_layer + incremental2
+    return start_layer, end_layer

@@ -313,9 +313,15 @@ class ModelConfig:
         return self.hf_text_config.num_attention_heads // \
                     parallel_config.tensor_parallel_size
 
-    def get_num_layers(self, parallel_config: "ParallelConfig") -> int:
+    def get_num_layers(self, parallel_config: "ParallelConfig", rank=0) -> int:
         total_num_hidden_layers = self.hf_text_config.num_hidden_layers
-        return total_num_hidden_layers // parallel_config.pipeline_parallel_size
+        pp_size = parallel_config.pipeline_parallel_size
+        n_layer_per_stage = total_num_hidden_layers // pp_size
+        residual = total_num_hidden_layers - n_layer_per_stage * pp_size
+        if residual > 0:
+            if rank < residual:
+                n_layer_per_stage += 1
+        return n_layer_per_stage
 
 
 class CacheConfig:

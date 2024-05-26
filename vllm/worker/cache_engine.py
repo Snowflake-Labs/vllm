@@ -24,13 +24,14 @@ class CacheEngine:
         cache_config: CacheConfig,
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
+        pp_rank: int = 0
     ) -> None:
         self.cache_config = cache_config
         self.model_config = model_config
         self.parallel_config = parallel_config
-
+        self.pp_rank = pp_rank
         self.head_size = model_config.get_head_size()
-        self.num_layers = model_config.get_num_layers(parallel_config)
+        self.num_layers = model_config.get_num_layers(parallel_config, self.pp_rank)
         self.num_kv_heads = model_config.get_num_kv_heads(parallel_config)
 
         self.block_size = cache_config.block_size

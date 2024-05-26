@@ -11,7 +11,7 @@ from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
                          ModelConfig, ParallelConfig, SchedulerConfig,
                          VisionLanguageConfig)
 from vllm.distributed import (broadcast_tensor_dict, get_tp_src_rank_and_group,
-                              is_pipeline_model_parallel_last_rank)
+                              is_pipeline_model_parallel_last_rank, get_pipeline_model_parallel_rank)
 from vllm.distributed.communication_op import graph_capture
 from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping
@@ -135,6 +135,7 @@ class ModelRunner:
         self.lora_manager: Optional[LRUCacheWorkerLoRAManager] = None
 
     def load_model(self) -> None:
+        tik = time.time()
         with CudaMemoryProfiler() as m:
             self.model = get_model(
                 model_config=self.model_config,
@@ -146,10 +147,10 @@ class ModelRunner:
                 scheduler_config=self.scheduler_config,
                 cache_config=self.cache_config,
             )
-
+        model_load_time = time.time() - tik
         self.model_memory_usage = m.consumed_memory
-        logger.info("Loading model weights took %.4f GB",
-                    self.model_memory_usage / float(2**30))
+        logger.info("Loading model weights took %.4f GB and %.4f seconds",
+                    self.model_memory_usage / float(2**30), model_load_time)
 
         if self.lora_config:
             assert hasattr(self.model, "supported_lora_modules"
@@ -792,7 +793,8 @@ class ModelRunner:
             seqs.append(seq)
 
         # Run the model with the dummy inputs.
-        num_layers = self.model_config.get_num_layers(self.parallel_config)
+        num_layers = self.model_config.get_num_layers(self.parallel_config, 
+                                                      get_pipeline_model_parallel_rank())
         kv_caches = [None] * num_layers
         self.execute_model(seqs, kv_caches)
         torch.cuda.synchronize()

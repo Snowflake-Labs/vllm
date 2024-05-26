@@ -1,8 +1,10 @@
 """Inference-only Snowflake Arctic model."""
 from typing import Iterable, List, Optional, Tuple
+import time
 
 import torch
 from torch import nn
+import torch.distributed
 
 from vllm.attention import Attention, AttentionMetadata
 from vllm.distributed import (get_pipeline_model_parallel_rank,
@@ -199,6 +201,7 @@ class ArcticMoE(nn.Module):
                                             renormalize=do_normalize)
         # topk_ids: (num_tokens, k)
         if self.is_quant:
+            # report_memory(f"PP rank: {get_pipeline_model_parallel_rank()} before local quant")
             if 2 * num_tokens <= self.num_experts:
                 # If much fewer tokens than experts, use selective dequantize.
                 ws_dequantized = self.ws.ds_selective_dequantize(
@@ -214,6 +217,7 @@ class ArcticMoE(nn.Module):
             else:
                 ws_dequantized = self.ws.ds_dequantize()
                 w2s_dequantized = self.w2s.ds_dequantize()
+            # report_memory(f"PP rank: {get_pipeline_model_parallel_rank()} after local quant")
         final_hidden_states = fused_experts(
             hidden_states,
             ws_dequantized if self.is_quant else self.ws,
@@ -221,16 +225,19 @@ class ArcticMoE(nn.Module):
             topk_weights,
             topk_ids,
             inplace=True)
+        # report_memory(f"PP rank: {get_pipeline_model_parallel_rank()} after fused expert")
         if self.reduce_results and self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(
                 final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_size)
 
     def forward(self, hidden_states: torch.Tensor):
+        # report_memory(f"PP rank: {get_pipeline_model_parallel_rank()} before local fused_moe")
         if self.is_moe_layer:
             final_hidden_states = self.local_moe_fused(hidden_states)
         else:
             final_hidden_states = self.mlp(hidden_states)
+        # report_memory(f"PP rank: {get_pipeline_model_parallel_rank()} after local fused_moe")
         return final_hidden_states
 
 
@@ -401,15 +408,11 @@ class ArcticModel(nn.Module):
         self.start_layer, self.end_layer = get_pp_indices_arctic(
             config.num_hidden_layers, get_pipeline_model_parallel_rank(),
             get_pipeline_model_parallel_world_size())
-        # print(f"PP rank {get_pipeline_model_parallel_rank()}, start layer: {self.start_layer}, end layer: {self.end_layer}")
+        print(f"PP rank {get_pipeline_model_parallel_rank()}, start layer: {self.start_layer}, end layer: {self.end_layer}")
         layers_1 = [nn.Identity() for _ in range(self.start_layer)]
+        layers_2 = [ArcticDecoderLayer(config, layer_idx, cache_config=cache_config, quant_config=quant_config) for layer_idx in range(self.start_layer, self.end_layer)]
+        layers_3 = [nn.Identity() for _ in range(self.end_layer, config.num_hidden_layers)]
 
-        if self.end_layer < config.num_hidden_layers:
-            layers_2 = [ArcticDecoderLayer(config, layer_idx, quant_config=quant_config) for layer_idx in range(self.start_layer, self.end_layer)]
-            layers_3 = [nn.Identity() for _ in range(self.end_layer, config.num_hidden_layers)]
-        else:
-            layers_2 = [ArcticDecoderLayer(config, layer_idx, quant_config=quant_config) for layer_idx in range(self.start_layer, config.num_hidden_layers)]
-            layers_3 = [nn.Identity() for _ in range(config.num_hidden_layers, self.end_layer)]
         self.layers = nn.ModuleList(layers_1 + layers_2 + layers_3)
         self._attn_implementation = config._attn_implementation
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -421,11 +424,6 @@ class ArcticModel(nn.Module):
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        # print(f"PP rank {get_pipeline_model_parallel_rank()} TP rank {get_tensor_model_parallel_rank()}: input_ids: {input_ids}, shape {list(input_ids.size())}")
-        # if torch.distributed.get_rank() == 0:
-        #     import pdb; pdb.set_trace()
-        # else:
-        #     _sleep_infinity()
         if is_pipeline_model_parallel_first_rank():
             hidden_states = self.embed_tokens(input_ids)
         else:
@@ -439,13 +437,15 @@ class ArcticModel(nn.Module):
             #       f"shape: {hidden_states.shape}, device: {hidden_states.device}, for request with {input_ids.size()} tokens...")
 
         
-        for i in range(self.start_layer, min(self.end_layer, self.config.num_hidden_layers)):
+        for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             # print(f"PP rank {get_pipeline_model_parallel_rank()}: layer {i} to start, kv size: {len(kv_caches)}, "
-            #              f"postions: {positions.device if positions is not None else None}, hidden_states: {hidden_states.device}, kv cache devices: {[str(kv.device) if kv is not None else None for kv in kv_caches]}, "
-            #             )
+                        #  f"postions: {positions.device if positions is not None else None}, hidden_states: {hidden_states.device}, kv cache devices: {[str(kv.device) if kv is not None else None for kv in kv_caches]}, "
+                        # )
             # print(f"kv cache size: {len(kv_caches)}, index is {i - self.start_layer}")
+            # report_memory(f"PP rank: {get_pipeline_model_parallel_rank()} before layer {i}")
             hidden_states = layer(positions, hidden_states, kv_caches[i - self.start_layer], attn_metadata)
+            # report_memory(f"PP rank: {get_pipeline_model_parallel_rank()} after layer {i}")
             # print(f"PP rank {get_pipeline_model_parallel_rank()} TP rank {get_tensor_model_parallel_rank()}: layer {i} finishes...")     
             
         if is_pipeline_model_parallel_last_rank():

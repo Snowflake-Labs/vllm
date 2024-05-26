@@ -442,7 +442,7 @@ class ShardedStateLoader(BaseModelLoader):
                    cache_config: CacheConfig) -> nn.Module:
         from safetensors.torch import safe_open
 
-        from vllm.distributed import get_tensor_model_parallel_rank
+        from vllm.distributed import get_tensor_model_parallel_rank, get_pipeline_model_parallel_rank
 
         local_model_path = self._prepare_weights(model_config.model,
                                                  model_config.revision)
@@ -453,6 +453,7 @@ class ShardedStateLoader(BaseModelLoader):
                                           lora_config, vision_language_config,
                                           cache_config)
             rank = get_tensor_model_parallel_rank()
+            pp_rank = get_pipeline_model_parallel_rank()
             pattern = os.path.join(
                 local_model_path,
                 self.pattern.format(rank=rank, part="*"),
@@ -471,6 +472,12 @@ class ShardedStateLoader(BaseModelLoader):
                         # If loading with LoRA enabled, additional padding may
                         # be added to certain parameters. We only load into a
                         # narrowed view of the parameter data.
+                        if key not in state_dict:
+                            logger.warning(f"Tensor ``{key}'' is not in the model's state_dict "
+                                           f"at PP rank = {pp_rank} and TP rank = {rank}. "
+                                           f"This might be expected if you are using pipeline "
+                                           f"parallelism.")
+                            continue
                         param_data = state_dict[key].data
                         param_shape = state_dict[key].shape
                         for dim, size in enumerate(tensor.shape):

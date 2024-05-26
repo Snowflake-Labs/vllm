@@ -13,7 +13,8 @@ from vllm.distributed import (broadcast_tensor_dict,
                               ensure_model_parallel_initialized,
                               get_tp_src_rank_and_group,
                               init_distributed_environment,
-                              set_custom_all_reduce)
+                              set_custom_all_reduce,
+                              get_pipeline_model_parallel_rank)
 from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
 from vllm.sequence import ExecuteModelRequest, PoolerOutput, SamplerOutput
@@ -208,7 +209,7 @@ class Worker(WorkerBase):
         assert self.cache_config.num_gpu_blocks is not None
         self.cache_engine = [
             CacheEngine(self.cache_config, self.model_config,
-                        self.parallel_config)
+                        self.parallel_config, get_pipeline_model_parallel_rank())
             for _ in range(self.parallel_config.pipeline_parallel_size)
         ]
         self.gpu_cache = [
