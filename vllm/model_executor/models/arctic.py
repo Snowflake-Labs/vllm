@@ -228,10 +228,10 @@ class ArcticMoE(nn.Module):
             topk_weights,
             topk_ids,
             inplace=True,
-            w1_scale=self.ws.quantization_scales(),
-            w2_scale=self.w2s.quantization_scales(),
-            quantization_group_size=self.ws.fp_quantizer.group_size,
-            quantization_group_size2=self.w2s.fp_quantizer.group_size)
+            w1_scale=self.ws.quantization_scales() if self.is_quant else None,
+            w2_scale=self.w2s.quantization_scales() if self.is_quant else None,
+            quantization_group_size=self.ws.fp_quantizer.group_size if self.is_quant else 256,
+            quantization_group_size2=self.w2s.fp_quantizer.group_size if self.is_quant else 256)
         if self.reduce_results and self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(
                 final_hidden_states)
