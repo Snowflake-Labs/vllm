@@ -150,6 +150,15 @@ class NCCLLibrary:
             buffer_type, buffer_type, ctypes.c_size_t, ncclDataType_t,
             ncclRedOp_t, ncclComm_t, cudaStream_t
         ]),
+        # ncclResult_t  ncclAllGather(
+        #   const void* sendbuff, void* recvbuff, size_t sendcount,
+        #   ncclDataType_t datatype, ncclComm_t comm, cudaStream_t stream);
+        # note that cudaStream_t is a pointer type, so the last argument
+        # is a pointer
+        Function("ncclAllGather", ncclResult_t, [
+            buffer_type, buffer_type, ctypes.c_size_t, ncclDataType_t,
+            ncclComm_t, cudaStream_t
+        ]),
         # ncclResult_t  ncclSend(
         #   const void* sendbuff, size_t count, ncclDataType_t datatype, int peer,
         #   ncclComm_t comm, cudaStream_t stream);
@@ -271,6 +280,16 @@ class NCCLLibrary:
         # when we pass int to a function, it will be converted to `ctypes.c_int`
         self.NCCL_CHECK(self._funcs["ncclSend"](sendbuff, count, datatype, 
                                                 peer, comm, stream))
+        
+    def ncclAllGather(self, sendbuff: buffer_type, recvbuff: buffer_type,
+                      sendcount: int, datatype: int, comm: ncclComm_t,
+                      stream: cudaStream_t) -> None:
+        # `datatype` actually should be `ncclDataType_t`
+        # is aliases of `ctypes.c_int`
+        # when we pass int to a function, it will be converted to `ctypes.c_int`
+        self.NCCL_CHECK(self._funcs["ncclAllGather"](sendbuff, recvbuff,
+                                                     sendcount, datatype,
+                                                     comm, stream))
         
     def ncclRecv(self, recvbuff: buffer_type, count: int, datatype: int, 
                  peer: int, comm: ncclComm_t, stream: cudaStream_t) -> None:

@@ -352,8 +352,10 @@ def init_worker_distributed_environment(
     init_distributed_environment(parallel_config.world_size, rank,
                                  distributed_init_method, local_rank)
 
-    ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
-                                      parallel_config.pipeline_parallel_size)
+    ensure_model_parallel_initialized(
+        parallel_config.tensor_parallel_size,
+        parallel_config.pipeline_parallel_size,
+        pipeline_communication_method=parallel_config.pipeline_comm_method)
 
 
 def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):

@@ -538,6 +538,8 @@ class ParallelConfig:
             workers, either "ray" or "mp" (multiprocessing). If either
             pipeline_parallel_size or tensor_parallel_size is greater than 1,
             will default to "ray" if Ray is installed or "mp" otherwise.
+        pipeline_comm_method: Communication method for pipeline parallel.
+            See parallel_state.py:set_pp_communication_method for more details.
     """
 
     def __init__(
@@ -551,6 +553,7 @@ class ParallelConfig:
         ray_workers_use_nsight: bool = False,
         placement_group: Optional["PlacementGroup"] = None,
         distributed_executor_backend: Optional[str] = None,
+        pipeline_comm_method: str = "send_recv",
     ) -> None:
         self.pipeline_parallel_size = pipeline_parallel_size
         self.tensor_parallel_size = tensor_parallel_size
@@ -560,6 +563,7 @@ class ParallelConfig:
         self.tokenizer_pool_config = tokenizer_pool_config
         self.ray_workers_use_nsight = ray_workers_use_nsight
         self.placement_group = placement_group
+        self.pipeline_comm_method = pipeline_comm_method
 
         self.world_size = pipeline_parallel_size * self.tensor_parallel_size
         if worker_use_ray:

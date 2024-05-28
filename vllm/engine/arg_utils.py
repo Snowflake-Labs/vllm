@@ -36,6 +36,7 @@ class EngineArgs:
     worker_use_ray: bool = False
     distributed_executor_backend: Optional[str] = None
     pipeline_parallel_size: int = 1
+    pipeline_communication_method: str = "send_recv"
     tensor_parallel_size: int = 1
     max_parallel_loading_workers: Optional[int] = None
     block_size: int = 16
@@ -239,6 +240,10 @@ class EngineArgs:
                             type=int,
                             default=EngineArgs.pipeline_parallel_size,
                             help='Number of pipeline stages.')
+        parser.add_argument('--pipeline-communication-method',
+                            default=EngineArgs.pipeline_communication_method,
+                            help='Pipeline parallel communication method.',
+                            choices=['send_recv', 'allgather'])
         parser.add_argument('--tensor-parallel-size',
                             '-tp',
                             type=int,
@@ -571,7 +576,8 @@ class EngineArgs:
                 self.tokenizer_pool_extra_config,
             ),
             self.ray_workers_use_nsight,
-            distributed_executor_backend=self.distributed_executor_backend)
+            distributed_executor_backend=self.distributed_executor_backend,
+            pipeline_comm_method=self.pipeline_communication_method)
 
         speculative_config = SpeculativeConfig.maybe_create_spec_config(
             target_model_config=model_config,

@@ -132,7 +132,31 @@ class PyNcclCommunicator:
                                 ncclDataTypeEnum.from_torch(tensor.dtype),
                                 ncclRedOpTypeEnum.from_torch(op), self.comm,
                                 cudaStream_t(stream.cuda_stream))
-        
+
+    def all_gather(self,
+                   src_tensor: torch.Tensor,
+                   dst_tensor: torch.Tensor,
+                   stream=None):
+        if self.disabled:
+            return
+        # nccl communicator created on a specific device
+        # will only work on tensors on the same device
+        # otherwise it will cause "illegal memory access"
+        assert src_tensor.device == self.device, (
+            f"this nccl communicator is created to work on {self.device}, "
+            f"but the input tensor is on {src_tensor.device}")
+        assert dst_tensor.device == self.device, (
+            f"this nccl communicator is created to work on {self.device}, "
+            f"but the output tensor is on {dst_tensor.device}")
+        assert src_tensor.dtype == dst_tensor.dtype
+        if stream is None:
+            stream = self.stream
+        self.nccl.ncclAllGather(buffer_type(src_tensor.data_ptr()),
+                                buffer_type(dst_tensor.data_ptr()),
+                                src_tensor.numel(),
+                                ncclDataTypeEnum.from_torch(src_tensor.dtype),
+                                self.comm, cudaStream_t(stream.cuda_stream))
+
     def send(self, tensor: torch.Tensor, peer: int, stream=None):
         if self.disabled:
             return

@@ -11,7 +11,9 @@ from .parallel_state import (get_cpu_world_group,
                              get_pipeline_model_parallel_group,
                              get_pipeline_model_parallel_next_rank,
                              get_pipeline_model_parallel_prev_rank,
+                             get_pp_communication_method,
                              get_tensor_model_parallel_group,
+                             get_tensor_model_parallel_rank,
                              get_tensor_model_parallel_world_size,
                              get_tp_ca_communicator,
                              get_tp_pynccl_communicator,
@@ -331,11 +333,13 @@ def send_next_rank(tensors: List[torch.Tensor]) -> None:
     combined_tensor = torch.cat(tensors, dim=0)
     torch.cat(tensors, dim=0)
 
+    send_tensor = get_pipeline_communicate_tensor(combined_tensor, False)
+
     if (pynccl_comm is not None and not pynccl_comm.disabled):
         dst = torch.distributed.get_group_rank(get_pipeline_model_parallel_group(), get_pipeline_model_parallel_next_rank())
-        pynccl_comm.send(combined_tensor, dst)
+        pynccl_comm.send(send_tensor, dst)
     else:
-        torch.distributed.send(combined_tensor,
+        torch.distributed.send(send_tensor,
                             get_pipeline_model_parallel_next_rank(),
                             get_pipeline_model_parallel_group())
 
@@ -350,11 +354,44 @@ def recv_prev_rank(num_tensors: int, sizes: torch.Size, dtype: torch.dtype,
                                   dtype=dtype,
                                   device=device)
 
+    recv_tensor = get_pipeline_communicate_tensor(combined_tensor, True)
+
     if (pynccl_comm is not None and not pynccl_comm.disabled):
         src = torch.distributed.get_group_rank(get_pipeline_model_parallel_group(), get_pipeline_model_parallel_prev_rank())
-        pynccl_comm.recv(combined_tensor, src)
+        pynccl_comm.recv(recv_tensor, src)
     else:
-        torch.distributed.recv(combined_tensor,
-                            get_pipeline_model_parallel_prev_rank(),
-                            get_pipeline_model_parallel_group())
+        torch.distributed.recv(recv_tensor,
+                               get_pipeline_model_parallel_prev_rank(),
+                               get_pipeline_model_parallel_group())
+
+    if get_pp_communication_method() == "allgather":
+        if (pynccl_comm is not None and not pynccl_comm.disabled):
+            pynccl_comm.all_gather(recv_tensor, combined_tensor)
+        else:
+            torch.distributed.all_gather_into_tensor(
+                combined_tensor, recv_tensor, 
+                group=get_tensor_model_parallel_group()
+            )
     return torch.chunk(combined_tensor, num_tensors, dim=0)
+
+
+def get_pipeline_communicate_tensor(tensor: torch.Tensor, create_copy: bool):
+    """
+    Get the tensor to communicate between pipeline stages, based on the pipeline
+    communication method.
+    """
+    communication_method = get_pp_communication_method()
+    if communication_method == "signal":
+        communicated_tensor = tensor.reshape(-1)[0]
+    elif communication_method == "allgather":
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_tensor_model_parallel_world_size()
+        # reshape to (tp_size, size // tp_size), then send the tp_rank-th shard.
+        communicated_tensor = tensor.reshape(tp_size, -1)
+        communicated_tensor = communicated_tensor[tp_rank]
+        if create_copy:
+            communicated_tensor = torch.empty_like(communicated_tensor)
+    else:
+        assert communication_method == "send_recv"
+        communicated_tensor = tensor
+    return communicated_tensor

@@ -128,6 +128,7 @@ def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
     backend: Optional[str] = None,
+    pipeline_communication_method: str = "send_recv"
 ) -> None:
     """
     Initialize model parallel groups.
@@ -219,11 +220,16 @@ def initialize_model_parallel(
         device=_LOCAL_RANK,
     )
 
+    if pipeline_model_parallel_size > 1:
+        set_pp_communication_method(
+            pipeline_communication_method)
+
 
 def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
     pipeline_model_parallel_size: int,
     backend: Optional[str] = None,
+    pipeline_communication_method: str = "send_recv",
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
@@ -233,7 +239,8 @@ def ensure_model_parallel_initialized(
     backend = backend or torch.distributed.get_backend()
     if not model_parallel_is_initialized():
         initialize_model_parallel(tensor_model_parallel_size,
-                                  pipeline_model_parallel_size, backend)
+                                  pipeline_model_parallel_size, backend,
+                                  pipeline_communication_method)
         return
 
     assert (
@@ -395,3 +402,27 @@ def destroy_model_parallel():
     _PP_GLOBAL_RANKS = None
     global _PP_PYNCCL_COMMUNICATOR
     _PP_PYNCCL_COMMUNICATOR = None
+
+
+# Communication method for pipeline parallel. See the function above for details
+_PP_COMMUNICATION_METHOD = "send_recv"
+
+
+def set_pp_communication_method(method: str):
+    """
+    Set the communication method for pipeline parallel. Available methods are:
+    send_recv: (default) P2P send recv between workers of the same tp rank.
+    allgather: Slice tensor to tp_degree slices. Worker of tp rank i sends
+      slice i (inter-node), then receivers run an allgather (intra-node)
+    signal: debug only. This results in numerical error. Only send 1 byte for
+      pipeline data dependency.
+    """
+    global _PP_COMMUNICATION_METHOD
+    if method == "signal":
+        logger.warning("Using signal communication, which should be only used "
+                       "for debug. It will cause numerical incorrectness.")
+    _PP_COMMUNICATION_METHOD = method
+
+
+def get_pp_communication_method():
+    return _PP_COMMUNICATION_METHOD
