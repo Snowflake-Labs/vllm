@@ -110,6 +110,14 @@ class DeepSpeedFPLinearMethod(LinearMethodBase):
             "output_dim": 0,
         })
         layer.register_parameter("weight", weight)
+        orig_state_dict = layer.state_dict
+
+        def state_dict(**kwargs):
+            state_dict = orig_state_dict(**kwargs)
+            prefix = kwargs.get("prefix", "")
+            state_dict[prefix + "scales"] = weight.fp_quantizer.scales
+            return state_dict
+        layer.state_dict = state_dict
 
         def quant_weight_loader(param, loaded_weight, *args, **kwargs):
             # Calls the original weight loader (if any), quantizes the result,
@@ -152,10 +160,7 @@ class DeepSpeedFPParameter(nn.Parameter):
             raise ImportError("Please install deepspeed>=0.14.2 via "
                               "`pip install deepspeed>=0.14.2` to use "
                               "deepspeedfp quantizer.") from err
-        if len(orig_shape) == 3:
-            data = torch.empty(0, dtype=torch.uint8)
-        else:
-            data = torch.empty(orig_shape, dtype=torch.uint8)
+        data = torch.empty(orig_shape, dtype=torch.uint8)
         self = torch.Tensor._make_subclass(cls, data, data.requires_grad)
         self.orig_shape = orig_shape
         self.quant_config = quant_config
@@ -168,6 +173,7 @@ class DeepSpeedFPParameter(nn.Parameter):
         self.fp_quantizer = FP_Quantize(group_size=g_size)
         self.fp_quantizer.orig_shape = orig_shape
         self.fp_quantizer.orig_dtype = params_dtype
+        self.fp_quantizer.num_groups = self.numel() // g_size
         self.fp_quantizer.scales = torch.empty(orig_shape.numel() // g_size, 4, 
                                         dtype=torch.uint8, device=self.data.device)
         return self

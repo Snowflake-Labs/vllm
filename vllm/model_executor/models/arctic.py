@@ -176,6 +176,13 @@ class ArcticMoE(nn.Module):
         self.load_completion_w1_w3 = 0
         self.load_completion_w2 = 0
 
+    def state_dict(self, **kwargs):
+        state_dict = super().state_dict(**kwargs)
+        prefix = kwargs.get("prefix", "")
+        state_dict[prefix + "ws_scales"] = self.ws.fp_quantizer.scales
+        state_dict[prefix + "w2s_scales"] = self.w2s.fp_quantizer.scales
+        return state_dict
+
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor,
                       weight_name: str, expert_id: int):
         tp_rank = get_tensor_model_parallel_rank()
