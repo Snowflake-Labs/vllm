@@ -161,7 +161,7 @@ class FlashAttentionImpl(AttentionImpl):
 
         self.do_backup = self.sink_size is not None and self.sink_size > 0
         self.sink_attn_rotater = SinkAttentionRotaryImpl(
-            self.sink_size, self.sliding_window, self.num_kv_heads, self.head_size
+            self.sink_size, self.sliding_window[0], self.num_kv_heads, self.head_size
         )
 
     def forward(
@@ -191,6 +191,7 @@ class FlashAttentionImpl(AttentionImpl):
         query = query.view(-1, self.num_heads, self.head_size)
         key = key.view(-1, self.num_kv_heads, self.head_size)
         value = value.view(-1, self.num_kv_heads, self.head_size)
+        self.sink_attn_rotater.to(query.device)
 
         if kv_cache is not None:
             key_cache, value_cache = PagedAttention.split_kv_cache(
