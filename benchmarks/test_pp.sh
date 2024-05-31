@@ -1,7 +1,6 @@
 python benchmark_online.py \
         --prompt_length 2048 \
         --max_new_tokens 256 \
-        --min_new_tokens 256 \
         --client_num 1024 \
         -qps 32,16,8,4,2,1 \
         --framework vllm \
