@@ -178,9 +178,10 @@ class ArcticMoE(nn.Module):
 
     def state_dict(self, **kwargs):
         state_dict = super().state_dict(**kwargs)
-        prefix = kwargs.get("prefix", "")
-        state_dict[prefix + "ws_scales"] = self.ws.fp_quantizer.scales
-        state_dict[prefix + "w2s_scales"] = self.w2s.fp_quantizer.scales
+        if self.is_quant:
+            prefix = kwargs.get("prefix", "")
+            state_dict[prefix + "ws_scales"] = self.ws.fp_quantizer.scales
+            state_dict[prefix + "w2s_scales"] = self.w2s.fp_quantizer.scales
         return state_dict
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor,
