@@ -10,6 +10,8 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.utils import set_weight_attrs
 import gc
 
+from vllm.model_executor.layers.fused_fp8 import matmul_fp8
+
 class DeepSpeedFPConfig(QuantizationConfig):
     """Config for DeepSpeed FP quantizer. It supports fp6 and fp8.
     
@@ -84,7 +86,7 @@ class DeepSpeedFPLinearMethod(LinearMethodBase):
         quant_config: the DeepSpeedFP quantization config.
     """
 
-    def __init__(self, quant_config: DeepSpeedFPConfig):
+    def __init__(self, quant_config: DeepSpeedFPConfig, enable_fused_kernel=False):
         self.quant_config = quant_config
         self.weight = None
 
@@ -96,6 +98,7 @@ class DeepSpeedFPLinearMethod(LinearMethodBase):
                        output_size: int,
                        params_dtype: torch.dtype,
                        weight_loader=None,
+                       transposed=False,
                        **extra_weight_attrs):
         del output_size
         del input_size
@@ -104,6 +107,7 @@ class DeepSpeedFPLinearMethod(LinearMethodBase):
             torch.Size((output_size_per_partition, input_size_per_partition)),
             params_dtype=params_dtype,
             quant_config=self.quant_config,
+            transposed=transposed
         )
         set_weight_attrs(weight, {
             "input_dim": 1,
@@ -136,9 +140,16 @@ class DeepSpeedFPLinearMethod(LinearMethodBase):
               layer: torch.nn.Module,
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-        weight = layer.weight
-        y = weight.ds_dequantize()
-        return F.linear(x, y, bias)
+        if self.enable_fused_kernel:
+            return matmul_fp8(
+                x, layer.weight,
+                layer.weight.quantization_scales(),
+                layer.weight.fp_quantizer.group_size,
+            )
+        else:
+            weight = layer.weight
+            y = weight.ds_dequantize()
+            return F.linear(x, y, bias)
 
 
 class DeepSpeedFPParameter(nn.Parameter):
@@ -149,7 +160,7 @@ class DeepSpeedFPParameter(nn.Parameter):
     """
 
     def __new__(cls, orig_shape: torch.Size, params_dtype: torch.dtype,
-                quant_config: DeepSpeedFPConfig):
+                quant_config: DeepSpeedFPConfig, transposed=False):
         try:
             import deepspeed
             if deepspeed.__version__ < "0.14.2":
@@ -160,6 +171,10 @@ class DeepSpeedFPParameter(nn.Parameter):
             raise ImportError("Please install deepspeed>=0.14.2 via "
                               "`pip install deepspeed>=0.14.2` to use "
                               "deepspeedfp quantizer.") from err
+        reduce_dim = -1
+        if transposed:
+            orig_shape = (orig[:-2]+(orig[-1],orig[-2]))
+            reduce_dim = -2
         data = torch.empty(orig_shape, dtype=torch.uint8)
         self = torch.Tensor._make_subclass(cls, data, data.requires_grad)
         self.orig_shape = orig_shape
@@ -167,7 +182,7 @@ class DeepSpeedFPParameter(nn.Parameter):
         g_size = max(
             [
                 2**i for i in range(4, int(math.log2(quant_config.group_size)+1)) \
-                if orig_shape[-1] % (2**i) == 0 
+                if orig_shape[reduce_dim] % (2**i) == 0 
             ]
         )
         self.fp_quantizer = FP_Quantize(group_size=g_size)
