@@ -86,7 +86,7 @@ class DeepSpeedFPLinearMethod(LinearMethodBase):
         quant_config: the DeepSpeedFP quantization config.
     """
 
-    def __init__(self, quant_config: DeepSpeedFPConfig, enable_fused_kernel=False):
+    def __init__(self, quant_config: DeepSpeedFPConfig, enable_fused_kernel=True):
         self.quant_config = quant_config
         self.weight = None
         self.enable_fused_kernel = enable_fused_kernel
@@ -99,7 +99,7 @@ class DeepSpeedFPLinearMethod(LinearMethodBase):
                        output_size: int,
                        params_dtype: torch.dtype,
                        weight_loader=None,
-                       transposed=False,
+                       transposed=True,
                        **extra_weight_attrs):
         del output_size
         del input_size
