@@ -89,6 +89,7 @@ class DeepSpeedFPLinearMethod(LinearMethodBase):
     def __init__(self, quant_config: DeepSpeedFPConfig, enable_fused_kernel=False):
         self.quant_config = quant_config
         self.weight = None
+        self.enable_fused_kernel = enable_fused_kernel
 
     def create_weights(self,
                        layer: torch.nn.Module,
