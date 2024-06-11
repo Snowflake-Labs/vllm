@@ -164,9 +164,9 @@ class DeepSpeedFPParameter(nn.Parameter):
                 quant_config: DeepSpeedFPConfig, transposed=False):
         try:
             import deepspeed
-            if deepspeed.__version__ < "0.14.2":
-                raise ImportError("deepspeed version is wrong. Please "
-                                  "install deepspeed>=0.14.2.")
+            # if deepspeed.__version__ < "0.14.2":
+            #     raise ImportError("deepspeed version is wrong. Please "
+            #                       "install deepspeed>=0.14.2.")
             from deepspeed.ops.fp_quantizer import FP_Quantize
         except ImportError as err:
             raise ImportError("Please install deepspeed>=0.14.2 via "
@@ -174,7 +174,7 @@ class DeepSpeedFPParameter(nn.Parameter):
                               "deepspeedfp quantizer.") from err
         reduce_dim = -1
         if transposed:
-            orig_shape = (orig[:-2]+(orig[-1],orig[-2]))
+            orig_shape = (orig_shape[:-2]+(orig_shape[-1],orig_shape[-2]))
             reduce_dim = -2
         data = torch.empty(orig_shape, dtype=torch.uint8)
         self = torch.Tensor._make_subclass(cls, data, data.requires_grad)
