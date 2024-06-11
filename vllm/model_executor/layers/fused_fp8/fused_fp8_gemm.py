@@ -102,7 +102,7 @@ def matmul_kernel_fp8_bf16(
     key=['M', 'N', 'K'],
 )
 @triton.jit
-def matmul_kernel_fp8_f16(
+def matmul_kernel_fp8_fp16(
         a_ptr, b_ptr, c_ptr, scale_ptr,
         M, N, K,
         stride_am, stride_ak,
@@ -159,7 +159,7 @@ def matmul_fp8(a, b, scale, quantization_group_size):
     assert a.is_contiguous(), "Matrix A must be contiguous"
     M, K = a.shape
     K, N = b.shape
-    c = torch.empty((M, N), device=a.device, dtype=torch.float16)
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
     grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
     if a.dtype == torch.bfloat16:
         matmul_kernel_fp8_bf16[grid](
@@ -171,7 +171,7 @@ def matmul_fp8(a, b, scale, quantization_group_size):
             quantization_group_size=quantization_group_size
         )
     elif a.dtype == torch.float16:
-        matmul_kernel_fp8_f16[grid](
+        matmul_kernel_fp8_fp16[grid](
             a, b, c, scale,  #
             M, N, K,  #
             a.stride(0), a.stride(1),  #
