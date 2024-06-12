@@ -2,47 +2,6 @@ import torch
 import triton
 import triton.language as tl
 
-def get_autotune_config():
-    return [
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3,
-                      num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5,
-                      num_warps=2),
-        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5,
-                      num_warps=2),
-        # Good config for fp8 inputs.
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=3,
-                      num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=3,
-                      num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4,
-                      num_warps=4)
-    ]
-
-@triton.autotune(
-    configs=get_autotune_config(),
-    key=['M', 'N', 'K'],
-)
 @triton.jit
 def matmul_kernel_fp8_bf16(
         a_ptr, b_ptr, c_ptr, scale_ptr,
@@ -50,8 +9,10 @@ def matmul_kernel_fp8_bf16(
         stride_am, stride_ak,
         stride_bk, stride_bn,
         stride_cm, stride_cn,
-        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,  #
-        GROUP_SIZE_M: tl.constexpr,  #
+        BLOCK_SIZE_M: tl.constexpr, 
+        BLOCK_SIZE_N: tl.constexpr, 
+        BLOCK_SIZE_K: tl.constexpr,
+        GROUP_SIZE_M: tl.constexpr,
         quantization_group_size: tl.constexpr
 ):
     pid = tl.program_id(axis=0)
@@ -73,20 +34,21 @@ def matmul_kernel_fp8_bf16(
 
     b_ptrs_offset = offs_bn[None, :] * (stride_bn // quantization_group_size)    
 
+    b = tl.load(b_ptrs, mask=offs_k[:, None] < K, other=0.0)
+    scale = tl.load(scale_ptr + b_ptrs_offset)
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
-        scale = tl.load(scale_ptr + b_ptrs_offset)
         # Dequantize weight (fp8 -> bf16)
-        b = ((b & 0x80) << 8) | ((b & 0x7f) << 4)
-        b = (b + 0x3C00).to(tl.uint16)
-        b = (b.to(tl.bfloat16, bitcast=True) * scale).to(tl.bfloat16)
-
-        accumulator = tl.dot(a, b, accumulator)
-
+        bb = (((b & 0x80) << 8) | ((b & 0x7f) << 10)).to(tl.uint16)
+        bb = (bb + 0x3D00).to(tl.uint16)
+        bb = (bb.to(tl.bfloat16, bitcast=True) * scale).to(tl.bfloat16)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - (k + 1) * BLOCK_SIZE_K, other=0.0)
+        scale = tl.load(scale_ptr + (b_ptrs_offset + (((k + 1) * BLOCK_SIZE_K) // quantization_group_size)))
+        accumulator = tl.dot(a, bb, accumulator)
+        
         
     c = accumulator.to(tl.bfloat16)
 
@@ -97,10 +59,6 @@ def matmul_kernel_fp8_bf16(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-@triton.autotune(
-    configs=get_autotune_config(),
-    key=['M', 'N', 'K'],
-)
 @triton.jit
 def matmul_kernel_fp8_fp16(
         a_ptr, b_ptr, c_ptr, scale_ptr,
@@ -108,8 +66,10 @@ def matmul_kernel_fp8_fp16(
         stride_am, stride_ak,
         stride_bk, stride_bn,
         stride_cm, stride_cn,
-        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,  #
-        GROUP_SIZE_M: tl.constexpr,  #
+        BLOCK_SIZE_M: tl.constexpr, 
+        BLOCK_SIZE_N: tl.constexpr, 
+        BLOCK_SIZE_K: tl.constexpr,
+        GROUP_SIZE_M: tl.constexpr,
         quantization_group_size: tl.constexpr
 ):
     pid = tl.program_id(axis=0)
@@ -131,20 +91,20 @@ def matmul_kernel_fp8_fp16(
 
     b_ptrs_offset = offs_bn[None, :] * (stride_bn // quantization_group_size)    
 
+    b = tl.load(b_ptrs, mask=offs_k[:, None] < K, other=0.0)
+    scale = tl.load(scale_ptr + b_ptrs_offset)
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
-        scale = tl.load(scale_ptr + b_ptrs_offset)
         # Dequantize weight (fp8 -> bf16)
-        b = ((b & 0x80) << 8) | ((b & 0x7f) << 10)
-        b = (b + 0x2000).to(tl.uint16)
-        b = (b.to(tl.float16, bitcast=True) * scale).to(tl.float16)
-
-        accumulator = tl.dot(a, b, accumulator)
-
+        bb = (((b & 0x80) << 8) | ((b & 0x7f) << 10)).to(tl.uint16)
+        bb = (bb + 0x2000).to(tl.uint16)
+        bb = (bb.to(tl.float16, bitcast=True) * scale).to(tl.float16)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - (k + 1) * BLOCK_SIZE_K, other=0.0)
+        scale = tl.load(scale_ptr + (b_ptrs_offset + (((k + 1) * BLOCK_SIZE_K) // quantization_group_size)))
+        accumulator = tl.dot(a, bb, accumulator)
         
     c = accumulator.to(tl.float16)
 
@@ -159,6 +119,18 @@ def matmul_fp8(a, b, scale, quantization_group_size):
     assert a.is_contiguous(), "Matrix A must be contiguous"
     M, K = a.shape
     K, N = b.shape
+    BLOCK_SIZE_M = 16 if M <= 16 else 32 if M <= 32 else 64 if M <= 64 else 128
+    BLOCK_SIZE_N = 64
+    BLOCK_SIZE_K = 64
+    GROUP_SIZE_M = 8
+    num_stages = 4
+    num_warps = 4
+    if M >= 256:
+        BLOCK_SIZE_M = 256
+        BLOCK_SIZE_N = 128
+        BLOCK_SIZE_K = 128
+        num_stages = 3
+        num_warps = 8
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
     grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
     if a.dtype == torch.bfloat16:
@@ -168,7 +140,13 @@ def matmul_fp8(a, b, scale, quantization_group_size):
             a.stride(0), a.stride(1),  #
             b.stride(0), b.stride(1),  #
             c.stride(0), c.stride(1),  #
-            quantization_group_size=quantization_group_size
+            quantization_group_size=quantization_group_size,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            GROUP_SIZE_M=GROUP_SIZE_M,
+            num_stages=num_stages,
+            num_warps=num_warps
         )
     elif a.dtype == torch.float16:
         matmul_kernel_fp8_fp16[grid](
@@ -177,7 +155,13 @@ def matmul_fp8(a, b, scale, quantization_group_size):
             a.stride(0), a.stride(1),  #
             b.stride(0), b.stride(1),  #
             c.stride(0), c.stride(1),  #
-            quantization_group_size=quantization_group_size
+            quantization_group_size=quantization_group_size,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            GROUP_SIZE_M=GROUP_SIZE_M,
+            num_stages=num_stages,
+            num_warps=num_warps
         )
     else:
         assert (0),\
