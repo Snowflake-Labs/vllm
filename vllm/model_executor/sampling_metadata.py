@@ -440,6 +440,7 @@ class SamplingTensors:
                    output_tokens: List[List[int]], vocab_size: int,
                    extra_seeds_to_generate: int, device: torch.device,
                    dtype: torch.dtype, do_penalties: bool) -> "SamplingTensors":
+        do_penalties = True  # vllm main behavior
         # Note that the performance will be very bad without
         # pinned memory.
         pin_memory = is_pin_memory_available()
