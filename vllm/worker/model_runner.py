@@ -689,14 +689,12 @@ class ModelRunner:
         virtual_engine: int = 0,
     ) -> Optional[SamplerOutput]:
         if self.is_driver_worker and (os.getenv("PROFILE_SYNC") or os.getenv("PROFILE_ASYNC")):
-            if not hasattr(self, "profiles"):
-                self.profiles = []
-                self.prev_end = time.time()
-                with open("profile.jsonl", "w") as f:
-                    pass  # create empty file
             profile = {}
-            self.profiles.append(profile)
             start = time.time()
+            if hasattr(self, "prev_end"):
+                profile["outside"] = start - self.prev_end
+        else:
+            profile = None
         (input_tokens, input_positions, attn_metadata, sampling_metadata,
          lora_requests, lora_mapping, multi_modal_input
          ) = self.prepare_input_tensors(seq_group_metadata_list)
@@ -723,13 +721,13 @@ class ModelRunner:
             execute_model_kwargs.update({"image_input": multi_modal_input})
         if os.getenv("PROFILE_SYNC"):
             torch.cuda.synchronize()
-        if hasattr(self, "profiles"):
+        if profile is not None:
             profile["preforward"] = time.time() - start
             start = time.time()
         hidden_states = model_executable(**execute_model_kwargs)
         if os.getenv("PROFILE_SYNC"):
             torch.cuda.synchronize()
-        if hasattr(self, "profiles"):
+        if profile is not None:
             profile["forward"] = time.time() - start
             start = time.time()
 
@@ -752,17 +750,12 @@ class ModelRunner:
 
         if os.getenv("PROFILE_SYNC"):
             torch.cuda.synchronize()
-        if hasattr(self, "profiles"):
-            now = time.time()
-            profile["postforward"] = now - start
-            profile["iteration"] = now - self.prev_end
-            if len(self.profiles) >= 100:
-                with open("profile.jsonl", "a") as f:
-                    for prof in self.profiles:
-                        json.dump(prof, f)
-                        f.write("\n")
-                self.profiles = []
+        if profile is not None:
+            profile["postforward"] = time.time() - start
+            profile["toks"] = input_tokens.numel()
+            profile["seqs"] = len(seq_group_metadata_list)
             self.prev_end = time.time()
+            print("MODEL_RUNNER", profile)
 
         return output
 

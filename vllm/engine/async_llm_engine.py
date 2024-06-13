@@ -1,4 +1,5 @@
 import asyncio
+import os
 import time
 from functools import partial
 from typing import (AsyncIterator, Callable, Dict, Iterable, List, Optional,
@@ -211,8 +212,20 @@ class _AsyncLLMEngine(LLMEngine):
         and updates the scheduler with the model outputs. Finally, it decodes
         the sequences and returns the newly generated results.
         """
+        if os.getenv("PROFILE_SYNC") or os.getenv("PROFILE_ASYNC"):
+            profile = {}
+            start = time.time()
+            if hasattr(self, "prev_end"):
+                profile["outside"] = start - self.prev_end
+        else:
+            profile = None
+
         seq_group_metadata_list, scheduler_outputs = self.scheduler[
             virtual_engine].schedule()
+
+        if profile is not None:
+            profile["scheduler"] = time.time() - start
+            start = time.time()
 
         if not scheduler_outputs.is_empty():
             # Execute the model.
@@ -230,12 +243,26 @@ class _AsyncLLMEngine(LLMEngine):
         else:
             output = []
 
+        if profile is not None:
+            profile["execute"] = time.time() - start
+            start = time.time()
+
         request_outputs = self._process_model_outputs(
             output, scheduler_outputs.scheduled_seq_groups,
             scheduler_outputs.ignored_seq_groups, seq_group_metadata_list)
 
+        if profile is not None:
+            profile["postprocess"] = time.time() - start
+            start = time.time()
+
         # Log stats.
         self.do_log_stats(scheduler_outputs, output)
+
+        if profile is not None:
+            profile["log_stats"] = time.time() - start
+            profile["seqs"] = len(seq_group_metadata_list)
+            self.prev_end = time.time()
+            print("STEP_ASYNC", profile)
 
         return request_outputs
 
@@ -457,6 +484,13 @@ class AsyncLLMEngine:
         """Kick the engine to process the waiting requests.
 
         Returns True if there are in-progress requests."""
+        if os.getenv("PROFILE_SYNC") or os.getenv("PROFILE_ASYNC"):
+            profile = {}
+            start = time.time()
+            if hasattr(self, "prev_end"):
+                profile["outside"] = start - self.prev_end
+        else:
+            profile = None
 
         new_requests, finished_requests = (
             self._request_tracker.get_new_and_finished_requests())
@@ -481,15 +515,29 @@ class AsyncLLMEngine:
         if finished_requests:
             await self._engine_abort(finished_requests)
 
+        if profile is not None:
+            profile["preprocess"] = time.time() - start
+            start = time.time()
+
         if self.engine_use_ray:
             request_outputs = await self.engine.step.remote()  # type: ignore
         else:
             request_outputs = await self.engine.step_async(virtual_engine)
 
+        if profile is not None:
+            profile["step_async"] = time.time() - start
+            start = time.time()
+
         # Put the outputs into the corresponding streams.
         for request_output in request_outputs:
             self._request_tracker.process_request_output(
                 request_output, verbose=self.log_requests)
+
+        if profile is not None:
+            profile["postprocess"] = time.time() - start
+            profile["outputs"] = len(request_outputs)
+            self.prev_end = time.time()
+            print("ENGINE_STEP", profile)
 
         return len(request_outputs) > 0
 

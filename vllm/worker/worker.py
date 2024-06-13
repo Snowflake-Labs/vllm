@@ -1,6 +1,7 @@
 """A GPU worker class."""
 import gc
 import os
+import time
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
@@ -244,6 +245,13 @@ class Worker(WorkerBase):
         self,
         execute_model_req: Optional[ExecuteModelRequest] = None
     ) -> List[Union[SamplerOutput, PoolerOutput]]:
+        if self.is_driver_worker and (os.getenv("PROFILE_SYNC") or os.getenv("PROFILE_ASYNC")):
+            profile = {}
+            start = time.time()
+            if hasattr(self, "prev_end"):
+                profile["outside"] = start - self.prev_end
+        else:
+            profile = None
 
         if execute_model_req is None:
             seq_group_metadata_list = None
@@ -307,9 +315,23 @@ class Worker(WorkerBase):
         if num_seq_groups == 0:
             return []
 
+        if os.getenv("PROFILE_SYNC"):
+            torch.cuda.synchronize()
+        if profile is not None:
+            profile["swap"] = time.time() - start
+            start = time.time()
+
         output = self.model_runner.execute_model(
             seq_group_metadata_list, self.gpu_cache[virtual_engine],
             virtual_engine)
+
+        if os.getenv("PROFILE_SYNC"):
+            torch.cuda.synchronize()
+        if profile is not None:
+            profile["execute"] = time.time() - start
+            profile["seqs"] = len(seq_group_metadata_list)
+            self.prev_end = time.time()
+            print("WORKER", profile)
 
         # Worker only supports single-step execution. Wrap the output in a list
         # to conform to interface.
