@@ -243,6 +243,11 @@ class ArcticAttention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
 
+        self.sliding_window = getattr(self.config, "sliding_window", int(1e7))
+        if self.sliding_window is None:
+            self.sliding_window = int(1e7)
+        self.sink_size = getattr(self.config, "sink_size", 0)
+
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.scaling = self.head_dim**-0.5
@@ -269,10 +274,14 @@ class ArcticAttention(nn.Module):
             is_neox_style=True,
         )
 
-        self.attn = Attention(self.num_heads,
-                              self.head_dim,
-                              self.scaling,
-                              num_kv_heads=self.num_kv_heads)
+        self.attn = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            sliding_window=self.sliding_window,
+            sink_size=self.sink_size,
+        )
 
     def forward(
         self,
@@ -284,7 +293,7 @@ class ArcticAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+        attn_output = self.attn(q, k, v, kv_cache, attn_metadata, self.rotary_emb, positions)
         output, _ = self.o_proj(attn_output)
         return output
 

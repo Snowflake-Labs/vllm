@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, fields
-from typing import Any, Dict, Generic, List, Optional, Tuple, Type, TypeVar
+from typing import (Any, Callable, Dict, Generic, List, Optional, Tuple, Type,
+                    TypeVar)
 
 import torch
 
@@ -54,10 +55,7 @@ class AttentionMetadataPerStage:
         """Similar to dataclasses.asdict, but avoids deepcopying."""
         # Note that if we add dataclasses as fields, they will need
         # similar handling.
-        return {
-            field.name: getattr(self, field.name)
-            for field in fields(self)
-        }
+        return {field.name: getattr(self, field.name) for field in fields(self)}
 
 
 T = TypeVar("T", bound=AttentionMetadataPerStage)
@@ -66,6 +64,7 @@ T = TypeVar("T", bound=AttentionMetadataPerStage)
 @dataclass
 class AttentionMetadata(Generic[T]):
     """Attention metadata for prefill and decode batched together."""
+
     # Total number of prefill requests.
     num_prefills: int
     # Number of prefill tokens.
@@ -106,6 +105,7 @@ class AttentionImpl(ABC):
         num_kv_heads: Optional[int] = None,
         alibi_slopes: Optional[List[float]] = None,
         sliding_window: Optional[int] = None,
+        sink_size: Optional[int] = None,
     ) -> None:
         raise NotImplementedError
 
@@ -117,6 +117,8 @@ class AttentionImpl(ABC):
         value: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata[AttentionMetadataPerStage],
+        rotary_emb: Optional[Callable],
+        positions: Optional[torch.Tensor],
         kv_scale: float,
     ) -> torch.Tensor:
         raise NotImplementedError

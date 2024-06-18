@@ -205,6 +205,14 @@ class ModelConfig:
             return None
         return getattr(self.hf_text_config, "sliding_window", None)
 
+    def get_sink_size(self) -> Optional[int]:
+        """Get the sink size, or None if disabled.
+        """
+        if (hasattr(self.hf_text_config, "use_sink")
+                and not self.hf_text_config.use_sink):
+            return None
+        return getattr(self.hf_text_config, "sink_size", 0)
+
     def get_vocab_size(self) -> int:
         return self.hf_text_config.vocab_size
 
@@ -293,6 +301,7 @@ class CacheConfig:
         cache_dtype: str,
         num_gpu_blocks_override: Optional[int] = None,
         sliding_window: Optional[int] = None,
+        sink_size: Optional[int] = None,
         enable_prefix_caching: bool = False,
     ) -> None:
         self.block_size = block_size
@@ -301,6 +310,7 @@ class CacheConfig:
         self.num_gpu_blocks_override = num_gpu_blocks_override
         self.cache_dtype = cache_dtype
         self.sliding_window = sliding_window
+        self.sink_size = sink_size
         self.enable_prefix_caching = enable_prefix_caching
         self._verify_args()
         self._verify_cache_dtype()

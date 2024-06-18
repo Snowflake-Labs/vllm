@@ -7,8 +7,8 @@ import pytest
 import torch
 from PIL import Image
 from transformers import (AutoModelForCausalLM, AutoProcessor,
-                          LlavaForConditionalGeneration)
-
+                          LlavaForConditionalGeneration
+                          )
 from vllm import LLM, SamplingParams
 from vllm.config import TokenizerPoolConfig, VisionLanguageConfig
 from vllm.distributed import destroy_model_parallel

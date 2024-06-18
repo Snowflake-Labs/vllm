@@ -92,6 +92,7 @@ class LlamaAttention(nn.Module):
         linear_method: Optional[LinearMethodBase] = None,
         bias: bool = False,
         sliding_window: Optional[int] = None,
+        sink_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -116,6 +117,7 @@ class LlamaAttention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
+        self.sink_size = sink_size
         # This will be overwritten by model initialization if we are using it.
         # N.B. currently we only support per tensor scalar scaling factors
         # & only applicable to ROCm (AMD GPU).
@@ -151,7 +153,8 @@ class LlamaAttention(nn.Module):
                               self.head_dim,
                               self.scaling,
                               num_kv_heads=self.num_kv_heads,
-                              sliding_window=sliding_window)
+                              sliding_window=sliding_window,
+                              sink_size=sink_size)
 
     def forward(
         self,
@@ -163,7 +166,7 @@ class LlamaAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, kv_cache, attn_metadata,
+        attn_output = self.attn(q, k, v, kv_cache, attn_metadata, self.rotary_emb, positions,
                                 self.kv_scale)
         output, _ = self.o_proj(attn_output)
         return output
@@ -183,6 +186,7 @@ class LlamaDecoderLayer(nn.Module):
         max_position_embeddings = getattr(config, "max_position_embeddings",
                                           8192)
         sliding_window = getattr(config, "sliding_window", None)
+        sink_size = getattr(config, "sink_size", None)
         # Support abacusai/Smaug-72B-v0.1 with attention_bias
         # Support internlm/internlm-7b with bias
         attention_bias = getattr(config, "attention_bias", False) or getattr(
@@ -198,6 +202,7 @@ class LlamaDecoderLayer(nn.Module):
             linear_method=linear_method,
             bias=attention_bias,
             sliding_window=sliding_window,
+            sink_size=sink_size,
         )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,

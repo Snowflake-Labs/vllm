@@ -451,6 +451,7 @@ class EngineArgs:
                                    self.swap_space, self.kv_cache_dtype,
                                    self.num_gpu_blocks_override,
                                    model_config.get_sliding_window(),
+                                   model_config.get_sink_size(),
                                    self.enable_prefix_caching)
         parallel_config = ParallelConfig(
             self.pipeline_parallel_size, self.tensor_parallel_size,

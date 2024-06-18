@@ -208,6 +208,7 @@ class BlockSpaceManagerV1(BlockSpaceManager):
         num_cpu_blocks: int,
         watermark: float = 0.01,
         sliding_window: Optional[int] = None,
+        sink_size: Optional[int] = None,
         enable_caching: bool = False,
     ) -> None:
         self.block_size = block_size
@@ -224,6 +225,12 @@ class BlockSpaceManagerV1(BlockSpaceManager):
                                                       block_size)
             self.block_sliding_window = sliding_window // block_size
 
+        if sink_size is not None:
+            assert sink_size % block_size == 0, (sink_size, block_size)
+            self.block_sink_size = sink_size // block_size
+
+        self.sink_incr = 0 if self.block_sink_size is None else self.block_sink_size
+        self.sw_incr = int(1e7) if self.block_sliding_window is None else self.block_sliding_window
         self.watermark = watermark
         assert watermark >= 0.0
 
@@ -249,11 +256,8 @@ class BlockSpaceManagerV1(BlockSpaceManager):
         # FIXME(woosuk): Here we assume that all sequences in the group share
         # the same prompt. This may not be true for preempted sequences.
         seq = seq_group.get_seqs(status=SequenceStatus.WAITING)[0]
-        num_required_blocks = len(seq.logical_token_blocks)
-
-        if self.block_sliding_window is not None:
-            num_required_blocks = min(num_required_blocks,
-                                      self.block_sliding_window)
+        num_required_blocks = min(len(seq.logical_token_blocks),
+                                  self.sw_incr + self.sink_incr)
         num_free_gpu_blocks = self.gpu_allocator.get_num_free_blocks()
 
         # Use watermark to avoid frequent cache eviction.
@@ -272,12 +276,15 @@ class BlockSpaceManagerV1(BlockSpaceManager):
 
         # Allocate new physical token blocks that will store the prompt tokens.
         num_prompt_blocks = len(seq.logical_token_blocks)
-
         block_table: BlockTable = []
         for logical_idx in range(num_prompt_blocks):
-            if (self.block_sliding_window is not None
-                    and logical_idx >= self.block_sliding_window):
-                block = block_table[logical_idx % self.block_sliding_window]
+            if logical_idx > self.sw_incr + self.sink_incr:
+                if logical_idx > self.sink_incr:
+                    adjusted_logical_idx = self.sink_incr + ((logical_idx - self.sink_incr) % self.sw_incr)
+                else:
+                    adjusted_logical_idx = logical_idx
+
+                block = block_table[adjusted_logical_idx]
                 # Set the reference counts of the token blocks.
                 block.ref_count = seq_group.num_seqs()
             elif self.enable_caching:
@@ -384,11 +391,10 @@ class BlockSpaceManagerV1(BlockSpaceManager):
             # Currently this code only supports adding one physical block
             assert len(block_table) == len(logical_blocks) - 1
 
-            if (self.block_sliding_window
-                    and len(block_table) >= self.block_sliding_window):
+            if len(block_table) >= (self.sw_incr + self.sink_incr):
                 # reuse a block
-                block_table.append(block_table[len(block_table) %
-                                               self.block_sliding_window])
+                new_idx = self.sink_incr + ((len(block_table) - self.sink_incr) % self.block_sliding_window)
+                block_table.append(block_table[new_idx])
             else:
                 # The sequence has a new logical block.
                 # Allocate a new physical block.
@@ -524,7 +530,7 @@ class BlockSpaceManagerV1(BlockSpaceManager):
         # reuse in the block table, so we must free all blocks.
         blocks_to_free = (block_table[-self.block_sliding_window:]
                           if self.block_sliding_window is not None else
-                          block_table)
+                          block_table) + (block_table[:self.sink_incr])
         for block in set(blocks_to_free):
             if block.device == Device.GPU:
                 self.gpu_allocator.free(block)

@@ -124,6 +124,8 @@ class ModelRunner:
         # FIXME(woosuk): This is a hack to make the tests work. Refactor this.
         self.sliding_window = (model_config.get_sliding_window()
                                if model_config is not None else None)
+        self.sink_size = (model_config.get_sink_size()
+                               if model_config is not None else 0)
         self.device_config = (device_config
                               if device_config is not None else DeviceConfig())
         self.device = self.device_config.device
@@ -324,6 +326,8 @@ class ModelRunner:
             # For example, if the prompt len is 10, sliding window is 8, and
             # block size is 4, the first two tokens are masked and the slot
             # mapping will be [-1, -1, 2, 3, 4, 5, 6, 7, 0, 1].
+            # FIXME [MP] : this is untrue in vllm^ (see last two numbers)
+            # FIXME: mapping will be [-1, -1, 2, 3, 4, 5, 6, 7, 8, 9].
             start_idx = 0
             if self.sliding_window is not None:
                 assert computed_len == 0, (
@@ -332,7 +336,7 @@ class ModelRunner:
                 start_idx = max(0, prompt_len - self.sliding_window)
 
             for i in range(computed_len, prefill_end):
-                if i < start_idx:
+                if i < start_idx and i >= self.sink_size:
                     slot_mapping.append(_PAD_SLOT_ID)
                     continue
 
@@ -457,7 +461,7 @@ class ModelRunner:
                 input_positions.append(position)
 
                 context_len = seq_len if self.sliding_window is None else min(
-                    seq_len, self.sliding_window)
+                    seq_len, self.sliding_window+self.sink_size)
                 context_lens.append(context_len)
 
                 block_table = seq_group_metadata.block_tables[seq_id]
@@ -471,7 +475,13 @@ class ModelRunner:
                 if self.sliding_window is not None:
                     sliding_window_blocks = (self.sliding_window //
                                              self.block_size)
-                    block_table = block_table[-sliding_window_blocks:]
+                    sink_window_blocks = (self.sink_size //
+                                             self.block_size)
+                    # Calculate the point at which to start the sliding window to avoid overlap
+                    start_sliding_index = max(sink_window_blocks, len(block_table) - sliding_window_blocks)
+
+                    # Update the block table to include the sink blocks and the sliding window blocks
+                    block_table = block_table[:sink_window_blocks] + block_table[start_sliding_index:]
                 block_tables.append(block_table)
 
         # vLLM uses cuda graph only for decoding requests.
@@ -861,7 +871,12 @@ class ModelRunner:
     def profile_run(self) -> None:
         # Enable top-k sampling to reflect the accurate memory usage.
         sampling_params = SamplingParams(top_p=0.99, top_k=self.vocab_size - 1)
-        max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
+        if self.sliding_window is not None:     # profiling to the max usage that will be in the inference
+            cache_size = self.sliding_window + (self.sink_size or 0)
+        else:
+            cache_size = self.scheduler_config.max_num_batched_tokens
+
+        max_num_batched_tokens = min(cache_size, self.scheduler_config.max_num_batched_tokens)
         max_num_seqs = self.scheduler_config.max_num_seqs
 
         # This represents the maximum number of different requests
