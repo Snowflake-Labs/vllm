@@ -40,7 +40,7 @@ def matmul_kernel_fp8_bf16(
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
         # Dequantize weight (fp8 -> bf16)
-        bb = (((b & 0x80) << 8) | ((b & 0x7f) << 10)).to(tl.uint16)
+        bb = (((b & 0x80) << 8) | ((b & 0x7f) << 4)).to(tl.uint16)
         bb = (bb + 0x3D00).to(tl.uint16)
         bb = (bb.to(tl.bfloat16, bitcast=True) * scale).to(tl.bfloat16)
         a_ptrs += BLOCK_SIZE_K * stride_ak
