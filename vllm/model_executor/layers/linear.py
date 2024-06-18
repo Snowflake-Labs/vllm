@@ -159,7 +159,7 @@ class ReplicatedLinear(LinearBase):
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__(input_size, output_size, skip_bias_add, params_dtype,
-                         quant_config)
+                         None)#quant_config)
 
         # All the linear layer supports quant method.
         assert self.quant_method is not None
