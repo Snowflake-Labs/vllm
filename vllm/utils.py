@@ -218,6 +218,7 @@ def merge_async_iterators(
         except Exception as e:
             await queue.put(e)
         finished[i] = True
+        await queue.put(None)
 
     _tasks = [
         asyncio.create_task(producer(i, iterator))
@@ -228,6 +229,8 @@ def merge_async_iterators(
         try:
             while not all(finished) or not queue.empty():
                 item = await queue.get()
+                if item is None:
+                    continue
                 if isinstance(item, Exception):
                     raise item
                 yield item

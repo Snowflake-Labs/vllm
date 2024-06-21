@@ -7,6 +7,7 @@ from http import HTTPStatus
 from typing import Optional, Set
 
 import fastapi
+import ray
 import uvicorn
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
@@ -47,7 +48,7 @@ async def lifespan(app: fastapi.FastAPI):
     async def _force_log():
         while True:
             await asyncio.sleep(10)
-            await engine.do_log_stats()
+            await engine.do_log_stats.remote()
 
     if not engine_args.disable_log_stats:
         task = asyncio.create_task(_force_log())
@@ -81,7 +82,7 @@ async def validation_exception_handler(_, exc):
 @app.get("/health")
 async def health() -> Response:
     """Health check."""
-    await openai_serving_chat.engine.check_health()
+    await openai_serving_chat.engine.check_health.remote()
     return Response(status_code=200)
 
 
@@ -195,10 +196,10 @@ if __name__ == "__main__":
     if event_loop is not None and event_loop.is_running():
         # If the current is instanced by Ray Serve,
         # there is already a running event loop
-        model_config = event_loop.run_until_complete(engine.get_model_config())
+        model_config = ray.get(engine.get_model_config.remote())
     else:
         # When using single vLLM without engine_use_ray
-        model_config = asyncio.run(engine.get_model_config())
+        model_config = ray.get(engine.get_model_config.remote())
 
     openai_serving_chat = OpenAIServingChat(engine, model_config,
                                             served_model_names,

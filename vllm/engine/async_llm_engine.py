@@ -262,7 +262,6 @@ class _AsyncLLMEngine(LLMEngine):
             profile["log_stats"] = time.time() - start
             profile["seqs"] = len(seq_group_metadata_list)
             self.prev_end = time.time()
-            print("STEP_ASYNC", profile)
 
         return request_outputs
 
@@ -401,7 +400,7 @@ class AsyncLLMEngine:
             from vllm.executor.gpu_executor import GPUExecutorAsync
             executor_class = GPUExecutorAsync
         # Create the async LLM engine.
-        engine = cls(
+        engine = ray.remote(num_cpus=0)(cls).remote(
             distributed_executor_backend == "ray",
             engine_args.engine_use_ray,
             **engine_config.to_dict(),
@@ -537,7 +536,6 @@ class AsyncLLMEngine:
             profile["postprocess"] = time.time() - start
             profile["outputs"] = len(request_outputs)
             self.prev_end = time.time()
-            print("ENGINE_STEP", profile)
 
         return len(request_outputs) > 0
 

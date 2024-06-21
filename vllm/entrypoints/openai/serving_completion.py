@@ -2,6 +2,7 @@ import time
 from typing import (AsyncGenerator, AsyncIterator, Callable, Dict, List,
                     Optional, Tuple)
 
+import ray
 from fastapi import Request
 
 from vllm.config import ModelConfig
@@ -90,18 +91,18 @@ class OpenAIServingCompletion(OpenAIServing):
         try:
             sampling_params = request.to_sampling_params()
             lora_request = self._maybe_get_lora(request)
-            decoding_config = await self.engine.get_decoding_config()
-            guided_decoding_backend = request.guided_decoding_backend \
-                or decoding_config.guided_decoding_backend
-            guided_decode_logit_processor = (
-                await get_guided_decoding_logits_processor(
-                    guided_decoding_backend, request, await
-                    self.engine.get_tokenizer()))
-            if guided_decode_logit_processor is not None:
-                if sampling_params.logits_processors is None:
-                    sampling_params.logits_processors = []
-                sampling_params.logits_processors.append(
-                    guided_decode_logit_processor)
+            #decoding_config = await self.engine.get_decoding_config()
+            #guided_decoding_backend = request.guided_decoding_backend \
+            #    or decoding_config.guided_decoding_backend
+            #guided_decode_logit_processor = (
+            #    await get_guided_decoding_logits_processor(
+            #        guided_decoding_backend, request, await
+            #        self.engine.get_tokenizer()))
+            #if guided_decode_logit_processor is not None:
+            #    if sampling_params.logits_processors is None:
+            #        sampling_params.logits_processors = []
+            #    sampling_params.logits_processors.append(
+            #        guided_decode_logit_processor)
             prompt_is_tokens, prompts = parse_prompt_format(request.prompt)
 
             for i, prompt in enumerate(prompts):
@@ -120,11 +121,11 @@ class OpenAIServingCompletion(OpenAIServing):
                 prompt_ids, prompt_text = prompt_formats
 
                 generators.append(
-                    self.engine.generate(prompt_text,
-                                         sampling_params,
-                                         f"{request_id}-{i}",
-                                         prompt_token_ids=prompt_ids,
-                                         lora_request=lora_request))
+                    self.engine.generate.remote(prompt_text,
+                                                sampling_params,
+                                                f"{request_id}-{i}",
+                                                prompt_token_ids=prompt_ids,
+                                                lora_request=lora_request))
         except ValueError as e:
             # TODO: Use a vllm-specific Validation Error
             return self.create_error_response(str(e))
@@ -152,10 +153,11 @@ class OpenAIServingCompletion(OpenAIServing):
         # Non-streaming response
         final_res_batch: List[Optional[RequestOutput]] = [None] * len(prompts)
         try:
-            async for i, res in result_generator:
+            async for obj in result_generator:
+                i, res = ray.get(obj)
                 if await raw_request.is_disconnected():
                     # Abort the request if the client disconnects.
-                    await self.engine.abort(f"{request_id}-{i}")
+                    await self.engine.abort.remote(f"{request_id}-{i}")
                     return self.create_error_response("Client disconnected")
                 final_res_batch[i] = res
             response = self.request_output_to_completion_response(
@@ -193,11 +195,12 @@ class OpenAIServingCompletion(OpenAIServing):
         has_echoed = [False] * request.n * num_prompts
 
         try:
-            async for prompt_idx, res in result_generator:
+            async for prompt_idx, obj in result_generator:
+                res = ray.get(obj)
 
                 # Abort the request if the client disconnects.
                 if await raw_request.is_disconnected():
-                    await self.engine.abort(f"{request_id}-{prompt_idx}")
+                    await self.engine.abort.remote(f"{request_id}-{prompt_idx}")
                     raise StopAsyncIteration()
 
                 for output in res.outputs:
