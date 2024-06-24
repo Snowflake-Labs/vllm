@@ -3,11 +3,15 @@ import os
 import sys
 import time
 import traceback
+import uuid
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 import aiohttp
 from tqdm.asyncio import tqdm
+
+from vllm import AsyncLLMEngine
+from vllm.sampling_params import SamplingParams
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
@@ -21,6 +25,7 @@ class RequestFuncInput:
     model: str
     best_of: int = 1
     use_beam_search: bool = False
+    engine: AsyncLLMEngine = None
 
 
 @dataclass
@@ -370,6 +375,60 @@ async def async_request_openai_chat_completions(
     return output
 
 
+async def async_request_vllm_engine(
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm] = None,
+) -> RequestFuncOutput:
+    engine = request_func_input.engine
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        best_of=request_func_input.best_of,
+        max_tokens=request_func_input.output_len,
+    )
+
+    generator = engine.generate(
+        request_func_input.prompt,
+        sampling_params,
+        str(uuid.uuid4()),
+    )
+
+    assert not request_func_input.use_beam_search
+
+    output = RequestFuncOutput()
+    output.prompt_len = request_func_input.prompt_len
+
+    generated_text = ""
+    ttft = 0.0
+    st = time.perf_counter()
+    most_recent_timestamp = st
+    try:
+        async for out in generator:
+            assert len(out.outputs) == 1
+            timestamp = time.perf_counter()
+            # First token
+            if ttft == 0.0:
+                ttft = time.perf_counter() - st
+                output.ttft = ttft
+
+            # Decoding phase
+            output.itl.append(timestamp - most_recent_timestamp)
+
+            most_recent_timestamp = timestamp
+            generated_text += out.outputs[0].text
+
+        output.generated_text = generated_text
+        output.success = True
+        output.latency = time.perf_counter() - st
+    except Exception:
+        output.success = False
+        exc_info = sys.exc_info()
+        output.error = "".join(traceback.format_exception(*exc_info))
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
 # Since vllm must support Python 3.8, we can't use str.removeprefix(prefix)
 # introduced in Python 3.9
 def remove_prefix(text: str, prefix: str) -> str:
@@ -381,6 +440,7 @@ def remove_prefix(text: str, prefix: str) -> str:
 ASYNC_REQUEST_FUNCS = {
     "tgi": async_request_tgi,
     "vllm": async_request_openai_completions,
+    "vllm-engine": async_request_vllm_engine,
     "lmdeploy": async_request_openai_completions,
     "deepspeed-mii": async_request_deepspeed_mii,
     "openai": async_request_openai_completions,

@@ -39,6 +39,7 @@ from backend_request_func import (ASYNC_REQUEST_FUNCS, RequestFuncInput,
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
+from vllm import AsyncEngineArgs, AsyncLLMEngine
 from vllm.transformers_utils.tokenizer import get_tokenizer
 
 
@@ -250,6 +251,22 @@ async def benchmark(
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
+    if backend == "vllm-engine":
+        engine_args = AsyncEngineArgs(
+            model=model_id,
+            tensor_parallel_size=8,
+            gpu_memory_utilization=0.95,
+            max_num_seqs=8192,
+            max_num_batched_tokens=16384,
+            enable_chunked_prefill=True,
+            disable_log_requests=True,
+            enforce_eager=True,
+            tokenizer_pool_size=16,
+        )
+        engine = AsyncLLMEngine.from_engine_args(engine_args)
+    else:
+        engine = None
+
     print(f"Traffic request rate: {request_rate}")
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
@@ -266,6 +283,7 @@ async def benchmark(
             output_len=output_len,
             best_of=best_of,
             use_beam_search=use_beam_search,
+            engine=engine,
         )
         tasks.append(
             asyncio.create_task(
