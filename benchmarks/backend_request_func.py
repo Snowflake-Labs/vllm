@@ -414,9 +414,8 @@ async def async_request_vllm_engine(
             output.itl.append(timestamp - most_recent_timestamp)
 
             most_recent_timestamp = timestamp
-            generated_text += out.outputs[0].text
 
-        output.generated_text = generated_text
+        output.generated_text = out.outputs[0].text
         output.success = True
         output.latency = time.perf_counter() - st
     except Exception:
