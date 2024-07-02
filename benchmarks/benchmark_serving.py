@@ -255,13 +255,18 @@ async def benchmark(
         engine_args = AsyncEngineArgs(
             model=model_id,
             tensor_parallel_size=8,
-            gpu_memory_utilization=0.95,
-            max_num_seqs=8192,
-            max_num_batched_tokens=16384,
-            enable_chunked_prefill=True,
+            #pipeline_parallel_size=2,
+            #gpu_memory_utilization=0.95,
+            max_num_seqs=32,
+            #max_num_batched_tokens=128,
+            #enable_chunked_prefill=True,
             disable_log_requests=True,
-            enforce_eager=True,
-            tokenizer_pool_size=16,
+            load_format="dummy",
+            #quantization="deepspeedfp",
+            #load_format="sharded_state",
+            #engine_use_ray=True,
+            #enforce_eager=True,
+            #tokenizer_pool_size=16,
         )
         engine = AsyncLLMEngine.from_engine_args(engine_args)
     else:

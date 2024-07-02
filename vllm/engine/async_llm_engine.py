@@ -400,7 +400,8 @@ class AsyncLLMEngine:
             from vllm.executor.gpu_executor import GPUExecutorAsync
             executor_class = GPUExecutorAsync
         # Create the async LLM engine.
-        engine = ray.remote(num_cpus=0)(cls).remote(
+        #engine = ray.remote(num_cpus=0)(cls).remote(
+        engine = cls(
             distributed_executor_backend == "ray",
             engine_args.engine_use_ray,
             **engine_config.to_dict(),
