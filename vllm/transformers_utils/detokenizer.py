@@ -47,8 +47,10 @@ class Detokenizer:
         next_iter_tokens = []
         prev_tokens = None
 
+        start_token_position = (1 if seq_group.prompt_logprobs is None
+                                else len(seq_group.prompt_logprobs))
         for token_position, prompt_logprobs_for_token in enumerate(
-                prompt_logprobs):
+                prompt_logprobs, start=start_token_position):
             if not prompt_logprobs_for_token:
                 continue
             for token_id, sample_logprob in prompt_logprobs_for_token.items():
