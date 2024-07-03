@@ -33,7 +33,11 @@ _BATCH_SIZE_ALIGNMENT = 8
 _BATCH_SIZES_TO_CAPTURE = [1, 2, 4] + [
     _BATCH_SIZE_ALIGNMENT * i for i in range(1, 33)
 ]
-
+start_event = None
+compute_logits_event = None
+prepare_event = None
+model_forward_event = None
+sample_event = None
 
 class ModelInput(NamedTuple):
     input_tokens: torch.Tensor
@@ -652,10 +656,21 @@ class ModelRunner:
         seq_group_metadata_list: List[SequenceGroupMetadata],
         kv_caches: List[torch.Tensor],
     ) -> Optional[SamplerOutput]:
+        global start_event, prepare_event, model_forward_event, compute_logits_event, sample_event
+        if start_event is None:
+            start_event = torch.cuda.Event(enable_timing=True)
+            prepare_event = torch.cuda.Event(enable_timing=True)
+            model_forward_event = torch.cuda.Event(enable_timing=True)
+            compute_logits_event = torch.cuda.Event(enable_timing=True)
+            sample_event = torch.cuda.Event(enable_timing=True)
+
+        start_event.record()
+        t0 = time.time()
         (input_tokens, input_positions, attn_metadata, sampling_metadata,
          lora_requests, lora_mapping, multi_modal_input
          ) = self.prepare_input_tensors(seq_group_metadata_list)
-
+        prepare_event.record()
+        t1 = time.time()
         if self.lora_config:
             self.set_active_loras(lora_requests, lora_mapping)
 
@@ -675,22 +690,41 @@ class ModelRunner:
         }
         if self.vision_language_config:
             execute_model_kwargs.update({"image_input": multi_modal_input})
+
+        # t0 = time.time()
         hidden_states = model_executable(**execute_model_kwargs)
+        # t1 = time.time()
+        # fwd_time = t1 - t0
+        model_forward_event.record()
+        t2 = time.time()
 
         # Compute the logits.
         logits = self.model.compute_logits(hidden_states, sampling_metadata)
-
+        compute_logits_event.record()
+        t3 = time.time()
         # Only perform sampling in the driver worker.
         if not self.is_driver_worker:
             return None
 
+        # t1 = time.time()
         # Sample the next token.
         output = self.model.sample(
             logits=logits,
             sampling_metadata=sampling_metadata,
         )
-
-        return output
+        sample_event.record()
+        t4 = time.time()
+        torch.cuda.synchronize()
+        # total_time = time.time() - t0
+        prepare_input_latency = start_event.elapsed_time(prepare_event)
+        model_forward_latency = prepare_event.elapsed_time(model_forward_event)
+        compute_logits_latency = model_forward_event.elapsed_time(compute_logits_event)
+        sample_latency = compute_logits_event.elapsed_time(sample_event)
+        # print(f'total_time {total_time*1000:.3f} prepare_input {prepare_input_latency:.3f} : {(t1-t0) * 1000:.3f} model_forward {model_forward_latency:.3f} : {(t2-t1) * 1000:.3f} compute_logits {compute_logits_latency:.3f} : {(t3-t2) * 1000:.3f} sample {sample_latency:.3f} : {(t4-t3) * 1000:.3f}')
+        return (output, {'prepare_input': (prepare_input_latency, (t1-t0)*1000), 
+                         'model_forward': (model_forward_latency, (t2-t1)*1000), 
+                         'compute_logits': (compute_logits_latency, (t3-t2)*1000), 
+                         'sample': (sample_latency, (t4-t3)*1000)})
 
     @torch.inference_mode()
     def profile_run(self) -> None:

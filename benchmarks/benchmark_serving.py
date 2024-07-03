@@ -17,6 +17,10 @@ On the client side, run:
         --dataset-path <path to dataset> \
         --request-rate <request_rate> \ # By default <request_rate> is inf
         --num-prompts <num_prompts> # By default <num_prompts> is 1000
+        
+    when using tgi backend, add
+        --endpoint /generate_stream
+    to the end of the command above.
 """
 import argparse
 import asyncio
@@ -35,9 +39,49 @@ from backend_request_func import (ASYNC_REQUEST_FUNCS, RequestFuncInput,
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
+from vllm import AsyncEngineArgs, AsyncLLMEngine
+from vllm.engine.async_llm_engine import _AsyncLLMEngine
 from vllm.transformers_utils.tokenizer import get_tokenizer
 
 
+
+def print_latency(gpu_latency_set, cpu_latency_set, title=""):
+    # 10 warmup queries
+    
+    gpu_latency_set = gpu_latency_set[10:]
+    cpu_latency_set = cpu_latency_set[10:]
+    count = len(gpu_latency_set)
+    if count > 0:
+        gpu_latency_set.sort()
+        cpu_latency_set.sort()
+        n50 = (count - 1) * 0.5 + 1
+        n90 = (count - 1) * 0.9 + 1
+        n95 = (count - 1) * 0.95 + 1
+        n99 = (count - 1) * 0.99 + 1
+        n999 = (count - 1) * 0.999 + 1
+
+        avg = sum(gpu_latency_set) / count
+        p50 = gpu_latency_set[int(n50) - 1]
+        p90 = gpu_latency_set[int(n90) - 1]
+        p95 = gpu_latency_set[int(n95) - 1]
+        p99 = gpu_latency_set[int(n99) - 1]
+        p999 = gpu_latency_set[int(n999) - 1]
+
+        cpu_avg = sum(cpu_latency_set) / count
+        cpu_p50 = cpu_latency_set[int(n50) - 1]
+        cpu_p90 = cpu_latency_set[int(n90) - 1]
+        cpu_p95 = cpu_latency_set[int(n95) - 1]
+        cpu_p99 = cpu_latency_set[int(n99) - 1]
+        cpu_p999 = cpu_latency_set[int(n999) - 1]
+
+        print("====== latency stats {0} ======", title)
+        print("\tAvg Latency: ({0:8.2f}: {1:8.2f}) ms".format(avg, cpu_avg))
+        print("\tP50 Latency: ({0:8.2f}: {1:8.2f}) ms".format(p50, cpu_p50))
+        print("\tP90 Latency: ({0:8.2f}: {1:8.2f}) ms".format(p90, cpu_p90))
+        print("\tP95 Latency: ({0:8.2f}: {1:8.2f}) ms".format(p95, cpu_p95))
+        print("\tP99 Latency: ({0:8.2f}: {1:8.2f}) ms".format(p99, cpu_p99))
+        print("\t999 Latency: ({0:8.2f}: {1:8.2f}) ms".format(p999, cpu_p999))
+    
 @dataclass
 class BenchmarkMetrics:
     completed: int
@@ -246,6 +290,27 @@ async def benchmark(
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
+    if backend == "vllm-engine":
+        engine_args = AsyncEngineArgs(
+            model=model_id,
+            tensor_parallel_size=8,
+            #pipeline_parallel_size=2,
+            #gpu_memory_utilization=0.95,
+            max_num_seqs=32,
+            max_num_batched_tokens=256,
+            enable_chunked_prefill=True,
+            disable_log_requests=True,
+            load_format="dummy",
+            #quantization="deepspeedfp",
+            #load_format="sharded_state",
+            #engine_use_ray=True,
+            enforce_eager=True,
+            #tokenizer_pool_size=16,
+        )
+        engine = AsyncLLMEngine.from_engine_args(engine_args)
+    else:
+        engine = None
+
     print(f"Traffic request rate: {request_rate}")
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
@@ -262,6 +327,7 @@ async def benchmark(
             output_len=output_len,
             best_of=best_of,
             use_beam_search=use_beam_search,
+            engine=engine,
         )
         tasks.append(
             asyncio.create_task(
@@ -274,6 +340,12 @@ async def benchmark(
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
+    for key in _AsyncLLMEngine.gpu_latencies:
+        print(f'-'*50)
+        print_latency(_AsyncLLMEngine.gpu_latencies[key], _AsyncLLMEngine.cpu_latencies[key], key)
+        print(f'-'*50)
+    # print(_AsyncLLMEngine.all_latencies)
+    # exit()
     metrics, actual_output_lens = calculate_metrics(
         input_requests=input_requests,
         outputs=outputs,

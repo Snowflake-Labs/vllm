@@ -5,7 +5,7 @@ from typing import (AsyncIterator, Callable, Dict, Iterable, List, Optional,
                     Set, Tuple, Type, Union)
 
 from transformers import PreTrainedTokenizer
-
+import torch
 import vllm.envs as envs
 from vllm.config import DecodingConfig, ModelConfig
 from vllm.core.scheduler import SchedulerOutputs
@@ -198,7 +198,18 @@ class RequestTracker:
 
 class _AsyncLLMEngine(LLMEngine):
     """Extension of LLMEngine to add async methods."""
-
+    gpu_latencies = {'scheduling': [], 
+                         'prepare_input': [], 
+                         'model_forward': [], 
+                         'compute_logits': [], 
+                         'sample': [],
+                         'process_outputs': []}
+    cpu_latencies = {'scheduling': [], 
+                         'prepare_input': [], 
+                         'model_forward': [], 
+                         'compute_logits': [], 
+                         'sample': [],
+                         'process_outputs': []}
     async def step_async(
             self) -> List[Union[RequestOutput, EmbeddingRequestOutput]]:
         """Performs one decoding iteration and returns newly generated results.
@@ -210,8 +221,16 @@ class _AsyncLLMEngine(LLMEngine):
         and updates the scheduler with the model outputs. Finally, it decodes
         the sequences and returns the newly generated results.
         """
-        seq_group_metadata_list, scheduler_outputs = self.scheduler.schedule()
 
+        start_event = torch.cuda.Event(enable_timing=True)
+        schedule_event = torch.cuda.Event(enable_timing=True)
+        new_event = torch.cuda.Event(enable_timing=True)
+        process_outputs_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        t0 = time.time()
+        seq_group_metadata_list, scheduler_outputs = self.scheduler.schedule()
+        t1 = time.time()
+        schedule_event.record()
         if not scheduler_outputs.is_empty():
             # Execute the model.
             execute_model_req = ExecuteModelRequest(
@@ -224,16 +243,31 @@ class _AsyncLLMEngine(LLMEngine):
             )
             output = await self.model_executor.execute_model_async(
                 execute_model_req)
+            latencies = output[0][-1]
+            output = [output[0][0]]
         else:
             output = []
-
+            latencies = {}
+        new_event.record()
+        t2 = time.time()
         request_outputs = self._process_model_outputs(
             output, scheduler_outputs.scheduled_seq_groups,
             scheduler_outputs.ignored_seq_groups, seq_group_metadata_list)
-
+        t3 = time.time()
+        process_outputs_event.record()
         # Log stats.
         self.do_log_stats(scheduler_outputs, output)
-
+        torch.cuda.synchronize()
+        schedule_time = start_event.elapsed_time(schedule_event)
+        process_outputs_time = new_event.elapsed_time(process_outputs_event)
+        _AsyncLLMEngine.gpu_latencies['scheduling'].append(schedule_time)
+        _AsyncLLMEngine.cpu_latencies['scheduling'].append((t1 - t0)*1000)
+        _AsyncLLMEngine.gpu_latencies['process_outputs'].append(process_outputs_time)
+        _AsyncLLMEngine.cpu_latencies['process_outputs'].append((t3 - t2)*1000)
+        for key in latencies:
+            _AsyncLLMEngine.gpu_latencies[key].append(latencies[key][0])
+            _AsyncLLMEngine.cpu_latencies[key].append(latencies[key][1])
+        # print(f'{[_AsyncLLMEngine.all_latencies[key][-1] for key in _AsyncLLMEngine.all_latencies]}')
         return request_outputs
 
     async def encode_request_async(
@@ -326,7 +360,6 @@ class AsyncLLMEngine:
         self.log_requests = log_requests
         self.max_log_len = max_log_len
         self.engine = self._init_engine(*args, **kwargs)
-
         self.background_loop: Optional[asyncio.Future] = None
         # We need to keep a reference to unshielded
         # task as well to prevent it from being garbage
@@ -481,7 +514,6 @@ class AsyncLLMEngine:
             request_outputs = await self.engine.step.remote()  # type: ignore
         else:
             request_outputs = await self.engine.step_async()
-
         # Put the outputs into the corresponding streams.
         for request_output in request_outputs:
             self._request_tracker.process_request_output(
