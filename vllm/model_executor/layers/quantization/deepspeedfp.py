@@ -125,7 +125,7 @@ class DeepSpeedFPLinearMethod(LinearMethodBase):
         def state_dict(**kwargs):
             state_dict = orig_state_dict(**kwargs)
             prefix = kwargs.get("prefix", "")
-            state_dict[prefix + "scales"] = weight.fp_quantizer.scales
+            state_dict[prefix + "scales"] = weight.fp_quantizer.scale
             return state_dict
         layer.state_dict = state_dict
 
