@@ -10,9 +10,9 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.utils import set_weight_attrs
 import gc
 
+from vllm.model_executor.layers.fused_fp8 import matmul_fp8
 from vllm.distributed import get_tensor_model_parallel_world_size
 
-g_matmul_fp8 = None
 
 class DeepSpeedFPConfig(QuantizationConfig):
     """Config for DeepSpeed FP quantizer. It supports fp6 and fp8.
@@ -153,7 +153,7 @@ class DeepSpeedFPLinearMethod(LinearMethodBase):
         weight = layer.weight
         if self.enable_fused_kernel:
             scale = weight.fp_quantizer.get_scales()
-            y = g_matmul_fp8(x, weight, scale, weight.fp_quantizer.group_size)
+            y = matmul_fp8(x, weight, scale, weight.fp_quantizer.group_size)
             return y if bias is None else (y + bias)
         else:
             weight = layer.weight
@@ -171,10 +171,7 @@ class DeepSpeedFPParameter(nn.Parameter):
     def __new__(cls, orig_shape: torch.Size, params_dtype: torch.dtype,
                 quant_config: DeepSpeedFPConfig):
         try:
-            global g_matmul_fp8
             import deepspeed
-            from deepspeed.ops.fp_quantizer import FP_Quantize, matmul_fp8
-            g_matmul_fp8 = matmul_fp8
         except ImportError as err:
             raise ImportError("Please install deepspeed>=0.14.2 via "
                               "`pip install deepspeed>=0.14.2` to use "
