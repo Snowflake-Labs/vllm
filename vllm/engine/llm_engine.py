@@ -259,6 +259,7 @@ class LLMEngine:
             speculative_config=speculative_config,
             load_config=load_config,
             prompt_adapter_config=prompt_adapter_config,
+            observability_config=self.observability_config,
         )
 
         if not self.model_config.embedding_mode:
@@ -1215,6 +1216,9 @@ class LLMEngine:
             seq_span.set_attribute(
                 SpanAttributes.LLM_LATENCY_TIME_TO_FIRST_TOKEN, ttft)
             seq_span.set_attribute(SpanAttributes.LLM_LATENCY_E2E, e2e_time)
-            seq_span.set_attribute(SpanAttributes.LLM_LATENCY_TIME_IN_SCHEDULER, metrics.scheduler_time)
-            seq_span.set_attribute(SpanAttributes.LLM_LATENCY_TIME_IN_MODEL_FORWARD, metrics.model_forward_time)
-            seq_span.set_attribute(SpanAttributes.LLM_LATENCY_TIME_IN_MODEL_EXECUTE, metrics.model_execute_time)
+            if metrics.scheduler_time is not None:
+                seq_span.set_attribute(SpanAttributes.LLM_LATENCY_TIME_IN_SCHEDULER, metrics.scheduler_time)
+            if metrics.model_forward_time is not None:
+                seq_span.set_attribute(SpanAttributes.LLM_LATENCY_TIME_IN_MODEL_FORWARD, metrics.model_forward_time / 1000.0)
+            if metrics.model_execute_time is not None:
+                seq_span.set_attribute(SpanAttributes.LLM_LATENCY_TIME_IN_MODEL_EXECUTE, metrics.model_execute_time)
