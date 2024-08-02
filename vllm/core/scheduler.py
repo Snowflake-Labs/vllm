@@ -1054,7 +1054,10 @@ class Scheduler:
         # swapped out. This is not added to the ones waiting on the queue and never scheduled.
         # This will help estimate if the scheduler is a significant component in the e2e latency.
         for seq_group in self.running + self.swapped:
-            seq_group.metrics.scheduler_time += scheduler_time
+            if seq_group.metrics.scheduler_time is not None:
+                seq_group.metrics.scheduler_time += scheduler_time
+            else:
+                seq_group.metrics.scheduler_time = scheduler_time
     
         return seq_group_metadata_list, scheduler_outputs
 
