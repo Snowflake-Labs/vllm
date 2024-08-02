@@ -128,6 +128,13 @@ class ModelRunnerInputBuilderBase(ABC, Generic[T]):
         """Build metadata with on-device tensors."""
         raise NotImplementedError
 
+class ModelRunnerOutput:
+    """
+      Model runner output that is used to collect the outputs and stats together.
+    """
+    sampler_output: List[SamplerOutput] = []
+    intermediate_tensors: IntermediateTensors = None
+    forward_time_ms: float = 0
 
 class ModelRunnerBase(ABC, Generic[T]):
     """
