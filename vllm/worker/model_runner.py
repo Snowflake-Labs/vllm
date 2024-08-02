@@ -1342,6 +1342,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             sampling_metadata=model_input.sampling_metadata,
         )
         if self.observability_config.collect_model_forward_time:
+            model_forward_end.synchronize()
             model_forward_time = model_forward_start.elapsed_time(model_forward_end)    
             # If there are multiple workers, we are still tracking the latency from the start time
             # of the driver worker to the end time of the driver worker. The model forward time wil
