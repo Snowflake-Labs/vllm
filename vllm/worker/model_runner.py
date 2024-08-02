@@ -1323,7 +1323,6 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             **multi_modal_kwargs,
             **seqlen_agnostic_kwargs)
         model_forward_end.record()
-        model_forward_time = model_forward_start.elapsed_time(model_forward_end)
         
         # Compute the logits in the last pipeline stage.
         if not get_pp_group().is_last_rank:
@@ -1335,13 +1334,12 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         if not self.is_driver_worker:
             return []
 
-        sampler_start = time.time()
         # Sample the next token.
         output: SamplerOutput = self.model.sample(
             logits=logits,
             sampling_metadata=model_input.sampling_metadata,
         )
-        output.sampler_time = time.time() - sampler_start
+        model_forward_time = model_forward_start.elapsed_time(model_forward_end)    
         # If there are multiple workers, we are still tracking the latency from the start time
         # of the driver worker to the end time of the driver worker. The model forward time wil
         # then end up covering the communication time as well.

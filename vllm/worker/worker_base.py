@@ -2,6 +2,7 @@ import dataclasses
 import importlib
 import os
 from abc import ABC, abstractmethod
+import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union
 
 import torch
@@ -217,6 +218,7 @@ class LocalOrDistributedWorkerBase(WorkerBase):
         self,
         execute_model_req: Optional[ExecuteModelRequest] = None
     ) -> Optional[List[SamplerOutput]]:
+        start_time = time.time()
         """Executes at least one model step on the given sequences, unless no
         sequences are provided."""
         if self.is_driver_worker:
@@ -268,12 +270,12 @@ class LocalOrDistributedWorkerBase(WorkerBase):
         if not get_pp_group().is_first_rank:
             intermediate_tensors = IntermediateTensors(
                 get_pp_group().recv_tensor_dict())
-
+    
         output = self.model_runner.execute_model(
             model_input, self.kv_cache[worker_input.virtual_engine]
             if self.kv_cache is not None else None, intermediate_tensors,
             num_steps)
-
+        output[0].model_execute_time = time.time() - start_time
         if not get_pp_group().is_last_rank:
             # output is IntermediateTensors
             get_pp_group().send_tensor_dict(output.tensors)

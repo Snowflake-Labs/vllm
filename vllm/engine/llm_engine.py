@@ -814,9 +814,9 @@ class LLMEngine:
             seq_group = scheduled_seq_group.seq_group
             seq_group.update_num_computed_tokens(
                 scheduled_seq_group.token_chunk_size)
-            for o in outputs
+            for o in outputs:
                 seq_group.metrics.model_forward_time += o.model_forward_time
-                seq_group.metrics.sampler_time += o.sampler_time
+                seq_group.metrics.model_execute_time += o.model_execute_time
             if self.model_config.embedding_mode:
                 self._process_sequence_group_outputs(seq_group, outputs)
                 continue
@@ -1210,4 +1210,4 @@ class LLMEngine:
             seq_span.set_attribute(SpanAttributes.LLM_LATENCY_E2E, e2e_time)
             seq_span.set_attribute(SpanAttributes.LLM_LATENCY_TIME_IN_SCHEDULER, metrics.scheduler_time)
             seq_span.set_attribute(SpanAttributes.LLM_LATENCY_TIME_IN_MODEL_FORWARD, metrics.model_forward_time)
-            seq_span.set_attribute(SpanAttributes.LLM_LATENCY_TIME_IN_SAMPLER, metrics.sampler_time)
+            seq_span.set_attribute(SpanAttributes.LLM_LATENCY_TIME_IN_MODEL_EXECUTE, metrics.model_execute_time)

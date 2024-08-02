@@ -94,7 +94,7 @@ class SpanAttributes(BaseSpanAttributes):
     LLM_LATENCY_E2E = "gen_ai.latency.e2e"
     LLM_LATENCY_TIME_IN_SCHEDULER = "gen_ai.latency.time_in_scheduler"
     LLM_LATENCY_TIME_IN_MODEL_FORWARD = "gen_ai.latency.time_in_model_forward"
-    LLM_LATENCY_TIME_IN_SAMPLER = "gen_ai.latency.time_in_sampler"
+    LLM_LATENCY_TIME_IN_MODEL_EXECUTE = "gen_ai.latency.time_in_model_execute"
 
 def contains_trace_headers(headers: Mapping[str, str]) -> bool:
     return any(h in headers for h in TRACE_HEADERS)

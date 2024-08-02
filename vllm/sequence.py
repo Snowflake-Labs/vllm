@@ -102,7 +102,7 @@ class RequestMetrics:
     finished_time: Optional[float] = None
     scheduler_time: Optional[float] = None
     model_forward_time: Optional[float] = None
-    sampler_time: Optional[float] = None
+    model_execute_time: Optional[float] = None
 
 
 class SequenceData:
@@ -871,8 +871,9 @@ class SamplerOutput:
     # Total time spent in the forward pass for this across all workers
     model_forward_time: Optional[float] = None
 
-    # Total time spent in the sampler.
-    sampler_time: Optional[float] = None
+    # Total time spent in the model execute function. This will include model forward,
+    #  block/sync across workers, cpu-gpu sync time and sampling time.
+    model_execute_time: Optional[float] = None
 
     def __getitem__(self, idx: int):
         return self.outputs[idx]
