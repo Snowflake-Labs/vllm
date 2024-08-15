@@ -1,13 +1,13 @@
 """Inference-only Snowflake Arctic model."""
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
 
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import CacheConfig
-from vllm.distributed import (get_tensor_model_parallel_rank,
-                              get_tensor_model_parallel_world_size,
+from vllm.distributed import (get_tensor_model_parallel_rank, get_pp_group,
+                              get_tensor_model_parallel_world_size, get_pp_indices,
                               tensor_model_parallel_all_reduce)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -31,6 +31,7 @@ from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.sequence import IntermediateTensors, SamplerOutput
 from vllm.transformers_utils.configs.arctic import ArcticConfig
+from .utils import is_pp_missing_parameter, make_layers, PPMissingLayer
 
 logger = init_logger(__name__)
 
@@ -372,17 +373,18 @@ class ArcticModel(nn.Module):
             self.vocab_size,
             config.hidden_size,
             org_num_embeddings=self.vocab_size)
-        self.layers = nn.ModuleList([
-            ArcticDecoderLayer(config,
-                               layer_idx,
-                               cache_config,
-                               quant_config=quant_config)
-            for layer_idx in range(config.num_hidden_layers)
-        ])
+        self.start_layer, self.end_layer = get_pp_indices(config.num_hidden_layers,
+                                                          get_pp_group().rank_in_group,
+                                                          get_pp_group().world_size)
+        print(f"start layer: {self.start_layer} end layer: {self.end_layer}")
+        self.layers = nn.ModuleList(
+            [PPMissingLayer() for _ in range(self.start_layer)] +
+            [ArcticDecoderLayer(config, layer_idx, cache_config, quant_config=quant_config) for layer_idx in range(self.start_layer, self.end_layer)] +
+            [PPMissingLayer() for _ in range(self.end_layer, config.num_hidden_layers)])
         self._attn_implementation = config._attn_implementation
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(
+    def forward_old(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
@@ -394,6 +396,29 @@ class ArcticModel(nn.Module):
             layer = self.layers[i]
             hidden_states = layer(positions, hidden_states, kv_caches[i],
                                   attn_metadata)
+        hidden_states = self.norm(hidden_states)
+        return hidden_states
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        kv_caches: List[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        intermediate_tensors: Optional[IntermediateTensors],
+    ) -> Union[torch.Tensor, IntermediateTensors]:
+        if get_pp_group().is_first_rank:
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+        for i in range(self.start_layer, self.end_layer):
+            layer = self.layers[i]
+            hidden_states = layer(positions, hidden_states, kv_caches[i - self.start_layer], attn_metadata)
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors({
+                "hidden_states": hidden_states
+            })
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
@@ -430,7 +455,7 @@ class ArcticForCausalLM(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, kv_caches,
-                                   attn_metadata)
+                                   attn_metadata, intermediate_tensors)
         return hidden_states
 
     def compute_logits(
@@ -449,6 +474,16 @@ class ArcticForCausalLM(nn.Module):
     ) -> Optional[SamplerOutput]:
         next_tokens = self.sampler(logits, sampling_metadata)
         return next_tokens
+
+    def make_empty_intermediate_tensors(
+            self, batch_size: int, dtype: torch.dtype,
+            device: torch.device) -> IntermediateTensors:
+        return IntermediateTensors({
+            "hidden_states":
+            torch.zeros((batch_size, self.config.hidden_size),
+                        dtype=dtype,
+                        device=device),
+        })
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
