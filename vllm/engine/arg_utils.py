@@ -179,6 +179,7 @@ class EngineArgs:
     override_neuron_config: Optional[Dict[str, Any]] = None
     mm_processor_kwargs: Optional[Dict[str, Any]] = None
     scheduling_policy: Literal["fcfs", "priority"] = "fcfs"
+    split_last_prefill: Optional[bool] = None
 
     def __post_init__(self):
         if self.tokenizer is None:
@@ -823,6 +824,15 @@ class EngineArgs:
             'priority (lower value means earlier handling) and time of '
             'arrival deciding any ties).')
 
+        parser.add_argument(
+            '--split-last-prefill',
+            action=StoreBoolean,
+            default=EngineArgs.split_last_prefill,
+            nargs="?",
+            const="True",
+            help='If set, the last prompt token will be prefilled in its own '
+            'chunk. Only used when --enable-chunked-prefill is set.')
+
         return parser
 
     @classmethod
@@ -1034,6 +1044,7 @@ class EngineArgs:
             send_delta_data=(envs.VLLM_USE_RAY_SPMD_WORKER
                              and parallel_config.use_ray),
             policy=self.scheduling_policy,
+            split_last_prefill=self.split_last_prefill,
         )
         lora_config = LoRAConfig(
             max_lora_rank=self.max_lora_rank,

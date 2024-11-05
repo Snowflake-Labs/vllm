@@ -1605,6 +1605,11 @@ class Scheduler:
         seqs = seq_group.get_seqs(status=status)
         for seq in seqs:
             num_new_tokens += seq.get_num_new_tokens()
+        if seq_group.is_prefill() and self.scheduler_config.split_last_prefill:
+            # Prefill has only 1 sequence.
+            assert len(seqs) == 1
+            if num_new_tokens > 1:
+                num_new_tokens -= 1
         assert num_new_tokens > 0
         # Chunk if a running request cannot fit in the given budget.
         # If number of seq > 1, it means it is doing beam search
