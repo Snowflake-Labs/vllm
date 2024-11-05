@@ -8,6 +8,7 @@ from vllm.transformers_utils.configs.exaone import ExaoneConfig
 from vllm.transformers_utils.configs.falcon import RWConfig
 from vllm.transformers_utils.configs.internvl import InternVLChatConfig
 from vllm.transformers_utils.configs.jais import JAISConfig
+from vllm.transformers_utils.configs.llama_swiftkv import LlamaSwiftKVConfig
 from vllm.transformers_utils.configs.medusa import MedusaConfig
 from vllm.transformers_utils.configs.mllama import MllamaConfig
 from vllm.transformers_utils.configs.mlp_speculator import MLPSpeculatorConfig
@@ -26,6 +27,7 @@ __all__ = [
     "RWConfig",
     "InternVLChatConfig",
     "JAISConfig",
+    "LlamaSwiftKVConfig",
     "MedusaConfig",
     "EAGLEConfig",
     "ExaoneConfig",

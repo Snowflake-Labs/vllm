@@ -598,7 +598,9 @@ class Sequence:
         """
         if self.data.stage == SequenceStage.DECODE:
             return 1
-        return self.data.get_num_uncomputed_tokens()
+        num_tokens = self.data.get_num_uncomputed_tokens()
+        return num_tokens - 1 if num_tokens > 1 else 1
+        #return self.data.get_num_uncomputed_tokens()
 
     def is_prefill(self) -> bool:
         return self.data.stage == SequenceStage.PREFILL
