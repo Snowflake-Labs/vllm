@@ -376,7 +376,8 @@ class LlamaSwiftKVModel(nn.Module):
         sampling_metadata: Optional[SamplingMetadata] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         sampling_indices = sampling_metadata.selected_token_indices
-        if not (kv_caches[0] is None or not sampling_indices.numel()):
+        if kv_caches[0].numel() and sampling_indices.numel():
+            print(attn_metadata.query_start_loc.tolist(), sampling_indices.tolist())
             seq_ids = torch.nonzero(
                 torch.sum(
                     attn_metadata.query_start_loc == sampling_indices.unsqueeze(1),
@@ -413,17 +414,18 @@ class LlamaSwiftKVModel(nn.Module):
             kv_states, _ = self_attn.kv_proj_swiftkv(swiftkv_hidden_states)
             k_states, v_states = kv_states.split(self_attn.kv_size, dim=-1)
             kv_states_dict[layer_idx] = (k_states, v_states)
-            if kv_caches[layer_idx] is not None:
-                torch.ops.vllm.reshape_and_cache_flash(
+            if kv_caches[layer_idx].numel():
+                torch.ops._C_cache_ops.reshape_and_cache_flash(
                     k_states,
                     v_states,
-                    kv_caches[layer_idx],
+                    kv_caches[layer_idx][0],
+                    kv_caches[layer_idx][1],
                     attn_metadata.slot_mapping.flatten(),
                     self_attn.attn.kv_cache_dtype,
                     1.0, 1.0,
                 )
 
-        if kv_caches[0] is None or not sampling_indices.numel():
+        if not (kv_caches[0].numel() and sampling_indices.numel()):
             return hidden_states
         orig_hidden_states = hidden_states
 
