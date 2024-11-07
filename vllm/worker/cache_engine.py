@@ -74,8 +74,7 @@ class CacheEngine:
             num_blocks, self.block_size, self.num_kv_heads, self.head_size)
         pin_memory = is_pin_memory_available() if device == "cpu" else False
         kv_cache: List[torch.Tensor] = []
-        hf_config = self.model_config.hf_config
-        for _ in range(hf_config.num_key_value_layers):
+        for _ in range(self.num_attention_layers):
             # null block in CpuGpuBlockAllocator requires at least that
             # block to be zeroed-out.
             # We zero-out everything for simplicity.
@@ -84,16 +83,6 @@ class CacheEngine:
                             dtype=self.dtype,
                             pin_memory=pin_memory,
                             device=device))
-        num_fanout = len(range(hf_config.num_key_value_layers,
-                               hf_config.num_hidden_layers,
-                               hf_config.key_value_group_size))
-        swiftkv_shape = list(kv_cache_shape)
-        swiftkv_shape[-2] *= num_fanout
-        kv_cache.append(
-            torch.zeros(swiftkv_shape,
-                        dtype=self.dtype,
-                        pin_memory=pin_memory,
-                        device=device))
         return kv_cache
 
     def swap_in(self, src_to_dst: torch.Tensor) -> None:
@@ -117,12 +106,8 @@ class CacheEngine:
     ) -> int:
         head_size = model_config.get_head_size()
         num_heads = model_config.get_num_kv_heads(parallel_config)
-        hf_config = model_config.hf_config
-        num_attention_layers = hf_config.num_key_value_layers + len(
-            range(hf_config.num_key_value_layers,
-                  hf_config.num_hidden_layers,
-                  hf_config.key_value_group_size)
-        )
+        num_attention_layers = model_config.get_num_attention_layers(
+            parallel_config)
 
         key_cache_block = cache_config.block_size * num_heads * head_size
         value_cache_block = key_cache_block

@@ -32,6 +32,7 @@ from vllm.distributed import (divide, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
+                                               QKVParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import (
@@ -186,6 +187,15 @@ class LlamaSwiftKVAttention(nn.Module):
             gather_output=False,
             quant_config=quant_config,
             prefix=f"{prefix}.q_proj_swiftkv",
+        )
+        self.kv_proj_swiftkv = QKVParallelLinear(
+            hidden_size=hidden_size,
+            head_size=self.head_dim,
+            total_num_heads=0,
+            total_num_kv_heads=self.total_num_kv_heads,
+            bias=bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.kv_proj_swiftkv",
         )
         self.o_proj = RowParallelLinear(
             input_size=self.total_num_heads * self.head_dim,
@@ -351,18 +361,6 @@ class LlamaSwiftKVModel(nn.Module):
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.norm_swiftkv = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.kv_fanout = KVFanoutLinear(
-            num_fanout=(config.num_hidden_layers - config.num_key_value_layers) // config.key_value_group_size,
-            hidden_size=config.hidden_size,
-            head_size=self.layers[0].self_attn.head_dim,
-            total_num_heads=self.layers[0].self_attn.total_num_heads,
-            total_num_kv_heads=self.layers[0].self_attn.total_num_kv_heads,
-            bias=(getattr(config, "bias", False) or
-                  getattr(config, "attention_bias", False)),
-            quant_config=quant_config,
-            prefix=f"{prefix}.kv_fanout",
-        )
-        self.kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "auto"
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -378,8 +376,7 @@ class LlamaSwiftKVModel(nn.Module):
         sampling_metadata: Optional[SamplingMetadata] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         sampling_indices = sampling_metadata.selected_token_indices
-        swiftkv_kv_cache = kv_caches[self.config.num_key_value_layers]
-        if not (swiftkv_kv_cache is None or not sampling_indices.numel()):
+        if not (kv_caches[0] is None or not sampling_indices.numel()):
             seq_ids = torch.nonzero(
                 torch.sum(
                     attn_metadata.query_start_loc == sampling_indices.unsqueeze(1),
@@ -397,7 +394,6 @@ class LlamaSwiftKVModel(nn.Module):
             hidden_states = self.get_input_embeddings(input_ids)
         residual = None
 
-        swiftkv_hidden_states = None
         for layer_idx in range(self.config.num_key_value_layers):
             layer = self.layers[layer_idx]
             hidden_states, residual = layer(
@@ -408,35 +404,26 @@ class LlamaSwiftKVModel(nn.Module):
                 residual,
             )
 
-        num_fanout = self.kv_fanout.num_fanout
-        num_kv_heads = layer.self_attn.num_kv_heads
-        head_dim = layer.self_attn.head_dim
-
-        # KV projection of all the remaining layers
+        # KV projection and cache of all the remaining layers
+        kv_states_dict = {}
         swiftkv_hidden_states = self.norm_swiftkv(hidden_states + residual)
-        kv_states, _ = self.kv_fanout(swiftkv_hidden_states)
+        for layer_idx in range(self.config.num_key_value_layers,
+                               self.config.num_hidden_layers):
+            self_attn = self.layers[layer_idx].self_attn
+            kv_states, _ = self_attn.kv_proj_swiftkv(swiftkv_hidden_states)
+            k_states, v_states = kv_states.split(self_attn.kv_size, dim=-1)
+            kv_states_dict[layer_idx] = (k_states, v_states)
+            if kv_caches[layer_idx] is not None:
+                torch.ops.vllm.reshape_and_cache_flash(
+                    k_states,
+                    v_states,
+                    kv_caches[layer_idx],
+                    attn_metadata.slot_mapping.flatten(),
+                    self_attn.attn.kv_cache_dtype,
+                    1.0, 1.0,
+                )
 
-        # Update the KV cache of all the remaining layers. We concatenate all
-        # the heads together to run it as a batch.
-        q_cat = hidden_states.repeat(1, num_fanout)  # Just temporary buffer
-        k_cat, v_cat = kv_states.split(kv_states.size(-1) // 2, dim=-1)
-        _, k_cat = layer.self_attn.rotary_emb(positions, q_cat, k_cat)
-        k_cat = k_cat.view(-1, num_kv_heads * num_fanout, head_dim)
-        v_cat = v_cat.view(-1, num_kv_heads * num_fanout, head_dim)
-        if swiftkv_kv_cache is not None:
-            torch.ops.vllm.reshape_and_cache_flash(
-                k_cat,
-                v_cat,
-                swiftkv_kv_cache,
-                attn_metadata.slot_mapping.flatten(),
-                self.kv_cache_dtype,
-                1.0, 1.0,
-            )
-
-        k_states = k_cat.split(num_kv_heads, dim=-2)
-        v_states = v_cat.split(num_kv_heads, dim=-2)
-
-        if swiftkv_kv_cache is None or not sampling_indices.numel():
+        if kv_caches[0] is None or not sampling_indices.numel():
             return hidden_states
         orig_hidden_states = hidden_states
 
@@ -459,17 +446,16 @@ class LlamaSwiftKVModel(nn.Module):
         attn_metadata.num_prefill_tokens = len(sampling_indices) - attn_metadata.num_decode_tokens
         attn_metadata.num_prefills = attn_metadata.num_prefill_tokens
 
-        swiftkv_kv_caches = swiftkv_kv_cache.split(layer.self_attn.num_kv_heads, dim=-2)
-        for i, layer_idx in enumerate(range(self.config.num_key_value_layers,
-                                            self.config.num_hidden_layers)):
-            fanout_idx = i // self.config.key_value_group_size
+        for layer_idx in range(self.config.num_key_value_layers,
+                               self.config.num_hidden_layers):
             layer = self.layers[layer_idx]
+            k_states, v_states = kv_states_dict[layer_idx]
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
-                k_states[fanout_idx].index_select(0, sampling_indices),
-                v_states[fanout_idx].index_select(0, sampling_indices),
-                swiftkv_kv_caches[fanout_idx],
+                k_states.index_select(0, sampling_indices),
+                v_states.index_select(0, sampling_indices),
+                kv_caches[layer_idx],
                 attn_metadata,
                 residual,
             )
@@ -577,12 +563,11 @@ class LlamaSwiftKVForCausalLM(nn.Module):
                 (f".{layer_idx}.self_attn.qkv_proj", f".{layer_idx}.self_attn.k_proj", "k"),
                 (f".{layer_idx}.self_attn.qkv_proj", f".{layer_idx}.self_attn.v_proj", "v"),
             ])
-        for i, layer_idx in enumerate(range(self.config.num_key_value_layers,
-                                            self.config.num_hidden_layers,
-                                            self.config.key_value_group_size)):
+        for layer_idx in range(self.config.num_key_value_layers,
+                               self.config.num_hidden_layers):
             stacked_params_mapping.extend([
-                (f".kv_fanout", f".layers.{layer_idx}.self_attn.k_proj_swiftkv", (i, "k")),
-                (f".kv_fanout", f".layers.{layer_idx}.self_attn.v_proj_swiftkv", (i, "v")),
+                (f".{layer_idx}.self_attn.kv_proj_swiftkv", f".{layer_idx}.self_attn.k_proj_swiftkv", "k"),
+                (f".{layer_idx}.self_attn.kv_proj_swiftkv", f".{layer_idx}.self_attn.v_proj_swiftkv", "v"),
             ])
 
         params_dict = dict(self.named_parameters())
