@@ -377,7 +377,6 @@ class LlamaSwiftKVModel(nn.Module):
     ) -> Union[torch.Tensor, IntermediateTensors]:
         sampling_indices = sampling_metadata.selected_token_indices
         if kv_caches[0].numel() and sampling_indices.numel():
-            print(attn_metadata.query_start_loc.tolist(), sampling_indices.tolist())
             seq_ids = torch.nonzero(
                 torch.sum(
                     attn_metadata.query_start_loc == sampling_indices.unsqueeze(1),
@@ -416,8 +415,8 @@ class LlamaSwiftKVModel(nn.Module):
             kv_states_dict[layer_idx] = (k_states, v_states)
             if kv_caches[layer_idx].numel():
                 torch.ops._C_cache_ops.reshape_and_cache_flash(
-                    k_states,
-                    v_states,
+                    k_states.view(-1, self_attn.num_kv_heads, self_attn.head_dim),
+                    v_states.view(-1, self_attn.num_kv_heads, self_attn.head_dim),
                     kv_caches[layer_idx][0],
                     kv_caches[layer_idx][1],
                     attn_metadata.slot_mapping.flatten(),
