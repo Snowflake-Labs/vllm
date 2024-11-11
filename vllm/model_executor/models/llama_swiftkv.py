@@ -46,97 +46,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, kv_cache_scales_loader, maybe_remap_kv_scale_name)
 from vllm.model_executor.models.llama import LlamaDecoderLayer, LlamaMLP
+from vllm.model_executor.models.utils import (
+    AutoWeightsLoader, is_pp_missing_parameter)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs import LlamaSwiftKVConfig
 from vllm.utils import is_hip
-
-
-class KVFanoutLinear(ColumnParallelLinear):
-
-    # 1  2  3  4 | 5  6  7  8 | 9 10 11 12 | 13 14 15 16 | 17 18 19 20 | 21 22 23 24 | 25 26 27 28 | 29 30 31 32
-    # 1  1  1  1 | 2  2  2  2 | 3  3  3  3 |  4  4  4  4 |  5  5  5  5 |  6  6  6  6 |  7  7  7  7 |  8  8  8  8
-
-    def __init__(self,
-                 num_fanout: int,
-                 hidden_size: int,
-                 head_size: int,
-                 total_num_heads: int,
-                 total_num_kv_heads: Optional[int] = None,
-                 bias: bool = True,
-                 skip_bias_add: bool = False,
-                 params_dtype: Optional[torch.dtype] = None,
-                 quant_config: Optional[QuantizationConfig] = None,
-                 prefix: str = ""):
-        self.num_fanout = num_fanout
-        self.hidden_size = hidden_size
-        self.head_size = head_size
-        self.total_num_heads = total_num_heads
-        if total_num_kv_heads is None:
-            total_num_kv_heads = total_num_heads
-        self.total_num_kv_heads = total_num_kv_heads
-        # Divide the weight matrix along the last dimension.
-        tp_size = get_tensor_model_parallel_world_size()
-        self.num_heads = divide(self.total_num_heads, tp_size)
-        if tp_size >= self.total_num_kv_heads:
-            self.num_kv_heads = 1
-            self.num_kv_head_replicas = divide(tp_size,
-                                               self.total_num_kv_heads)
-        else:
-            self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
-            self.num_kv_head_replicas = 1
-        input_size = self.hidden_size
-        output_size = (2 * self.num_kv_heads) * tp_size * self.head_size * self.num_fanout
-        self.output_sizes = [
-            self.num_kv_heads * self.head_size * tp_size,  # k_proj
-            self.num_kv_heads * self.head_size * tp_size,  # v_proj
-        ] * self.num_fanout
-
-        super().__init__(input_size=input_size,
-                         output_size=output_size,
-                         bias=bias,
-                         gather_output=False,
-                         skip_bias_add=skip_bias_add,
-                         params_dtype=params_dtype,
-                         quant_config=quant_config,
-                         prefix=prefix)
-
-    def _get_shard_offset_mapping(self, loaded_shard_id: Tuple[int, str]):
-        chunk = self.num_kv_heads * self.head_size
-        shard_offset_mapping = {
-            "k": chunk * loaded_shard_id[0],
-            "v": chunk * self.num_fanout + chunk * loaded_shard_id[0],
-            "total": 2 * chunk * self.num_fanout,
-        }
-        return shard_offset_mapping.get(loaded_shard_id[1])
-
-    def _get_shard_size_mapping(self, loaded_shard_id: Tuple[int, str]):
-        shard_size_mapping = {
-            "k": self.num_kv_heads * self.head_size,
-            "v": self.num_kv_heads * self.head_size,
-        }
-        return shard_size_mapping.get(loaded_shard_id[1])
-
-    def weight_loader(self,
-                      param: torch.nn.Parameter,
-                      loaded_weight: torch.Tensor,
-                      loaded_shard_id: Tuple[int, str]):
-        param_data = param.data
-        output_dim = param.output_dim
-
-        tp_rank = get_tensor_model_parallel_rank()
-        assert loaded_shard_id[1] in ["k", "v"]
-
-        shard_offset = self._get_shard_offset_mapping(loaded_shard_id)
-        shard_size = self._get_shard_size_mapping(loaded_shard_id)
-
-        param_data = param_data.narrow(output_dim, shard_offset, shard_size)
-        shard_id = tp_rank // self.num_kv_head_replicas
-        start_idx = shard_id * shard_size
-        loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
-
-        assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
 
 
 class LlamaSwiftKVAttention(nn.Module):
@@ -465,8 +380,147 @@ class LlamaSwiftKVModel(nn.Module):
         orig_hidden_states.index_copy_(0, sampling_indices, hidden_states)
         return orig_hidden_states
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
+        ]
+        for layer_idx in range(self.config.num_key_value_layers):
+            prefix = f".{layer_idx}.self_attn"
+            stacked_params_mapping.extend([
+                (f"{prefix}.qkv_proj", f"{prefix}.q_proj", "q"),
+                (f"{prefix}.qkv_proj", f"{prefix}.k_proj", "k"),
+                (f"{prefix}.qkv_proj", f"{prefix}.v_proj", "v"),
+            ])
+        for layer_idx in range(self.config.num_key_value_layers,
+                               self.config.num_hidden_layers):
+            prefix = f".{layer_idx}.self_attn"
+            stacked_params_mapping.extend([
+                (f"{prefix}.kv_proj_swiftkv", f"{prefix}.k_proj_swiftkv", "k"),
+                (f"{prefix}.kv_proj_swiftkv", f"{prefix}.v_proj_swiftkv", "v"),
+            ])
+        params_dict = dict(self.named_parameters())
+        for name, loaded_weight in weights:
+            orig_name = name
+            if "rotary_emb.inv_freq" in name:
+                continue
+            if ("rotary_emb.cos_cached" in name
+                    or "rotary_emb.sin_cached" in name):
+                # Models trained using ColossalAI may include these tensors in
+                # the checkpoint. Skip them.
+                continue
+            if scale_name := get_compressed_tensors_cache_scale(name):
+                # Loading kv cache scales for compressed-tensors quantization
+                param = params_dict[scale_name]
+                weight_loader = getattr(param, "weight_loader",
+                                        default_weight_loader)
+                loaded_weight = loaded_weight[0]
+                weight_loader(param, loaded_weight)
+                continue
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+
+                if is_pp_missing_parameter(name, self):
+                    continue
+
+                if name not in params_dict:
+                    print(f"Skip loading {orig_name}")
+                    continue
+
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+
+                break
+            else:
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                # Remapping the name of FP8 kv-scale.
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
+
+                if is_pp_missing_parameter(name, self):
+                    continue
+
+                if name not in params_dict:
+                    print(f"Skip loading {orig_name}")
+                    continue
+
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader",
+                                        default_weight_loader)
+                weight_loader(param, loaded_weight)
+
+    # If this function is called, it should always initialize KV cache scale
+    # factors (or else raise an exception). Thus, handled exceptions should
+    # make sure to leave KV cache scale factors in a known good (dummy) state
+    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+        for layer_idx, scaling_factor in kv_cache_scales_loader(
+                quantization_param_path, tp_rank, tp_size,
+                self.config.num_hidden_layers,
+                self.config.__class__.model_type):
+            if not isinstance(self.layers[layer_idx], nn.Identity):
+                layer_self_attn = self.layers[layer_idx].self_attn
+
+            if is_hip():
+                # The scaling factor convention we are assuming is
+                # quantized_value * scaling_factor ~= true_value
+                # which is consistent with the practice of setting
+                # scaling_factor = tensor_amax / FPtype_max
+                scaling_factor *= 2
+            if hasattr(layer_self_attn, "kv_scale"):
+                layer_self_attn.attn._kv_scale = scaling_factor
+            else:
+                raise RuntimeError("Self attention has no KV cache scaling "
+                                   "factor attribute!")
+
 
 class LlamaSwiftKVForCausalLM(nn.Module):
+    packed_modules_mapping = {
+        "kv_proj_swiftkv": ["k_proj_swiftkv", "v_proj_swiftkv"],
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
+    # BitandBytes specific attributes
+    default_bitsandbytes_target_modules = [
+        ".gate_proj.",
+        ".down_proj.",
+        ".up_proj.",
+        ".q_proj.",
+        ".k_proj.",
+        ".v_proj.",
+        ".o_proj.",
+        ".k_proj_swiftkv.",
+        ".v_proj_swiftkv.",
+    ]
+
+    # in TP, these weights are partitioned along the column dimension (dim=-1)
+    column_parallel_weights_modules = [
+        ".q_proj_swiftkv.",
+        ".down_proj.",
+        ".o_proj.",
+    ]
+    bitsandbytes_stacked_params_mapping = {
+        # shard_name, weight_name, index
+        "k_proj_swiftkv": ("kv_proj_swiftkv", 1),
+        "v_proj_swiftkv": ("kv_proj_swiftkv", 2),
+        "q_proj": ("qkv_proj", 0),
+        "k_proj": ("qkv_proj", 1),
+        "v_proj": ("qkv_proj", 2),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+    }
 
     def __init__(
         self,
@@ -538,114 +592,13 @@ class LlamaSwiftKVForCausalLM(nn.Module):
         next_tokens = self.sampler(logits, sampling_metadata)
         return next_tokens
 
-    def make_empty_intermediate_tensors(
-            self, batch_size: int, dtype: torch.dtype,
-            device: torch.device) -> IntermediateTensors:
-        return IntermediateTensors({
-            "hidden_states":
-            torch.zeros((batch_size, self.config.hidden_size),
-                        dtype=dtype,
-                        device=device),
-            "residual":
-            torch.zeros((batch_size, self.config.hidden_size),
-                        dtype=dtype,
-                        device=device),
-        })
-
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
-        for layer_idx in range(self.config.num_key_value_layers):
-            stacked_params_mapping.extend([
-                (f".{layer_idx}.self_attn.qkv_proj", f".{layer_idx}.self_attn.q_proj", "q"),
-                (f".{layer_idx}.self_attn.qkv_proj", f".{layer_idx}.self_attn.k_proj", "k"),
-                (f".{layer_idx}.self_attn.qkv_proj", f".{layer_idx}.self_attn.v_proj", "v"),
-            ])
-        for layer_idx in range(self.config.num_key_value_layers,
-                               self.config.num_hidden_layers):
-            stacked_params_mapping.extend([
-                (f".{layer_idx}.self_attn.kv_proj_swiftkv", f".{layer_idx}.self_attn.k_proj_swiftkv", "k"),
-                (f".{layer_idx}.self_attn.kv_proj_swiftkv", f".{layer_idx}.self_attn.v_proj_swiftkv", "v"),
-            ])
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=(["lm_head."]
+                           if self.config.tie_word_embeddings else None),
+        )
+        loader.load_weights(weights)
 
-        params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-
-            if "rotary_emb.inv_freq" in name:
-                continue
-            if ("rotary_emb.cos_cached" in name
-                    or "rotary_emb.sin_cached" in name):
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
-                continue
-            # With tie_word_embeddings, we can skip lm_head.weight
-            # The weight might appear unnecessarily in the files if the model is
-            # processed with quantization, LoRA, fine-tuning, etc.
-            if self.config.tie_word_embeddings and "lm_head.weight" in name:
-                continue
-            if scale_name := get_compressed_tensors_cache_scale(name):
-                # Loading kv cache scales for compressed-tensors quantization
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
-                loaded_weight = loaded_weight[0]
-                weight_loader(param, loaded_weight)
-                continue
-            for (param_name, weight_name, shard_id) in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                # Remapping the name of FP8 kv-scale.
-                name = maybe_remap_kv_scale_name(name, params_dict)
-                if name is None:
-                    continue
-
-                if name not in params_dict:
-                    print("Skipping loading", name)
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
-                weight_loader(param, loaded_weight)
-
-    # If this function is called, it should always initialize KV cache scale
-    # factors (or else raise an exception). Thus, handled exceptions should
-    # make sure to leave KV cache scale factors in a known good (dummy) state
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
-        for layer_idx, scaling_factor in kv_cache_scales_loader(
-                quantization_param_path, tp_rank, tp_size,
-                self.config.num_hidden_layers,
-                self.config.__class__.model_type):
-            if not isinstance(self.model.layers[layer_idx], nn.Identity):
-                layer_self_attn = self.model.layers[layer_idx].self_attn
-
-            if is_hip():
-                # The scaling factor convention we are assuming is
-                # quantized_value * scaling_factor ~= true_value
-                # which is consistent with the practice of setting
-                # scaling_factor = tensor_amax / FPtype_max
-                scaling_factor *= 2
-            if hasattr(layer_self_attn, "kv_scale"):
-                layer_self_attn.attn._kv_scale = scaling_factor
-            else:
-                raise RuntimeError("Self attention has no KV cache scaling "
-                                   "factor attribute!")
+        self.model.load_kv_cache_scales(quantization_param_path)

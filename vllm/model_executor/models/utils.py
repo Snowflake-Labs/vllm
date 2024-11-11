@@ -142,6 +142,7 @@ class AutoWeightsLoader:
             weight_loader = getattr(param, "weight_loader",
                                     default_weight_loader)
             weight_loader(param, weight_data)
+            print("load", base_prefix, "into", weight_name)
 
     def _load_module(
         self,
