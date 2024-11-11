@@ -379,7 +379,7 @@ class LlamaSwiftKVModel(nn.Module):
     ) -> Union[torch.Tensor, IntermediateTensors]:
         sampling_indices = sampling_metadata.selected_token_indices
         swiftkv_kv_cache = kv_caches[self.config.num_key_value_layers]
-        if not (swiftkv_kv_cache is None or not sampling_indices.numel()):
+        if not (swiftkv_kv_cache.numel() == 0 or not sampling_indices.numel()):
             seq_ids = torch.nonzero(
                 torch.sum(
                     attn_metadata.query_start_loc == sampling_indices.unsqueeze(1),
@@ -423,11 +423,12 @@ class LlamaSwiftKVModel(nn.Module):
         _, k_cat = layer.self_attn.rotary_emb(positions, q_cat, k_cat)
         k_cat = k_cat.view(-1, num_kv_heads * num_fanout, head_dim)
         v_cat = v_cat.view(-1, num_kv_heads * num_fanout, head_dim)
-        if swiftkv_kv_cache is not None:
-            torch.ops.vllm.reshape_and_cache_flash(
+        if swiftkv_kv_cache.numel():
+            torch.ops._C_cache_ops.reshape_and_cache_flash(
                 k_cat,
                 v_cat,
-                swiftkv_kv_cache,
+                swiftkv_kv_cache[0],
+                swiftkv_kv_cache[1],
                 attn_metadata.slot_mapping.flatten(),
                 self.kv_cache_dtype,
                 1.0, 1.0,
@@ -436,7 +437,7 @@ class LlamaSwiftKVModel(nn.Module):
         k_states = k_cat.split(num_kv_heads, dim=-2)
         v_states = v_cat.split(num_kv_heads, dim=-2)
 
-        if swiftkv_kv_cache is None or not sampling_indices.numel():
+        if swiftkv_kv_cache.numel() == 0 or not sampling_indices.numel():
             return hidden_states
         orig_hidden_states = hidden_states
 
