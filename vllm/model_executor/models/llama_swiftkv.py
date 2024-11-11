@@ -327,6 +327,8 @@ class LlamaSwiftKVModel(nn.Module):
             self_attn = self.layers[layer_idx].self_attn
             kv_states, _ = self_attn.kv_proj_swiftkv(swiftkv_hidden_states)
             k_states, v_states = kv_states.split(self_attn.kv_size, dim=-1)
+            q_states = torch.empty_like(hidden_states)  # Just temporary buffer
+            _, k_states = self_attn.rotary_emb(positions, q_states, k_states)
             kv_states_dict[layer_idx] = (k_states, v_states)
             if kv_caches[layer_idx].numel():
                 torch.ops._C_cache_ops.reshape_and_cache_flash(
