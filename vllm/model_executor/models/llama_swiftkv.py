@@ -536,6 +536,7 @@ class LlamaSwiftKVForCausalLM(nn.Module):
         self.config = config
         self.lora_config = lora_config
 
+        self.preallocate_memory()
         self.model = LlamaSwiftKVModel(config,
                                 cache_config,
                                 quant_config,
@@ -604,3 +605,31 @@ class LlamaSwiftKVForCausalLM(nn.Module):
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)
+
+    def preallocate_memory(self, device=None):
+        from vllm.logger import init_logger
+        logger = init_logger(__name__)
+
+        model_size_in_bytes = 429127684096
+
+        model_size_in_bytes_per_shard = model_size_in_bytes // get_tensor_model_parallel_world_size()
+
+        total_gpu_memory = torch.cuda.get_device_properties(device).total_memory
+        reserved_memory = torch.cuda.memory_reserved()
+
+        one_gb_in_bytes = 1073741824.0
+
+        # Estimated pre-allocated memory size with 0.5GB reserved memory for buffering.
+        alloc_size_in_bytes = total_gpu_memory - reserved_memory - model_size_in_bytes_per_shard - 0.5 * one_gb_in_bytes
+
+        if alloc_size_in_bytes <= 0.0:
+            exit()
+
+        if device is None:
+            device = torch.cuda.current_device()
+
+        size_in_gb = alloc_size_in_bytes / one_gb_in_bytes
+        logger.info(f"Llama model initialization: preallocating memory with size: {size_in_gb} GB")
+
+        dummy_tensor = torch.empty(int(alloc_size_in_bytes), device=device, dtype=torch.uint8)
+        del dummy_tensor
