@@ -55,6 +55,7 @@ _TEXT_GENERATION_MODELS = {
     "LLaMAForCausalLM": ("llama", "LlamaForCausalLM"),
     "MambaForCausalLM": ("mamba", "MambaForCausalLM"),
     "MistralForCausalLM": ("llama", "LlamaForCausalLM"),
+    "MistralSwiftKVForCausalLM": ("llama_swiftkv", "LlamaSwiftKVForCausalLM"),
     "MixtralForCausalLM": ("mixtral", "MixtralForCausalLM"),
     "QuantMixtralForCausalLM": ("mixtral_quant", "MixtralForCausalLM"),
     # transformers's mpt class has lower case
