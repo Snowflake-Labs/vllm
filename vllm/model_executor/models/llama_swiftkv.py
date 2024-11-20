@@ -310,6 +310,9 @@ class LlamaSwiftKVModel(nn.Module):
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
         lora_config = vllm_config.lora_config
+        self.kv_cache_dtype = (
+            cache_config.cache_dtype if cache_config is not None else "auto"
+        )
 
         self.config = config
         self.padding_idx = config.pad_token_id
@@ -398,7 +401,7 @@ class LlamaSwiftKVModel(nn.Module):
                     kv_caches[layer_idx][0],
                     kv_caches[layer_idx][1],
                     attn_metadata.slot_mapping.flatten(),
-                    self_attn.attn.kv_cache_dtype,
+                    self.kv_cache_dtype,
                     1.0, 1.0,
                 )
 
