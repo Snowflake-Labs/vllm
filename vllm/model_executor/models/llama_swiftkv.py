@@ -288,8 +288,8 @@ class LlamaSwiftKVDecoderLayer(nn.Module):
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
-            k_states=k_states,
-            v_states=v_states,
+            key=k_states,
+            value=v_states,
             kv_cache=kv_cache,
             attn_metadata=attn_metadata,
         )
