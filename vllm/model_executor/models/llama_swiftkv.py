@@ -189,7 +189,6 @@ class LlamaSwiftKVAttention(nn.Module):
             )
         else:
             # prefix-enabled attention
-            assert attn_metadata.seq_lens is not None
             attn_output = flash_attn_varlen_func(  # noqa
                 q=query,
                 k=key_cache,
@@ -355,7 +354,6 @@ class LlamaSwiftKVModel(nn.Module):
                     dim=0,
                 )
             ).squeeze(1).tolist()
-            seq_lens_tensor = attn_metadata.seq_lens_tensor[seq_ids]
             seq_lens = attn_metadata.seq_lens_tensor.tolist()
             seq_start_loc = attn_metadata.seq_start_loc[seq_ids + [seq_ids[-1] + 1]]
             block_tables = attn_metadata.block_tables[seq_ids]
