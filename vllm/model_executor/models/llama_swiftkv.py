@@ -191,7 +191,7 @@ class LlamaSwiftKVAttention(nn.Module):
                 causal=True,
                 window_size=(-1, -1),
                 alibi_slopes=None,
-                softcap=None,
+                softcap=0,
             )
         else:
             # prefix-enabled attention
@@ -210,7 +210,7 @@ class LlamaSwiftKVAttention(nn.Module):
                 window_size=(-1, -1),
                 alibi_slopes=None,
                 block_table=attn_metadata.block_tables,
-                softcap=None,
+                softcap=0,
             )
 
         output = attn_output.view(num_tokens, hidden_size)
