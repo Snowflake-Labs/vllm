@@ -27,9 +27,13 @@ import torch
 from torch import nn
 
 from vllm.attention import Attention, AttentionMetadata
+from vllm.attention.backends.flash_attn import (
+    FlashAttentionMetadata, flash_attn_varlen_func,
+)
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (divide, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size)
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                QKVParallelLinear,
@@ -131,27 +135,86 @@ class LlamaSwiftKVAttention(nn.Module):
             rope_scaling=rope_scaling,
             is_neox_style=is_neox_style,
         )
-        self.attn = Attention(self.num_heads,
-                              self.head_dim,
-                              self.scaling,
-                              num_kv_heads=self.num_kv_heads,
-                              cache_config=cache_config,
-                              quant_config=quant_config)
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        k_states: torch.Tensor,
-        v_states: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        q, _ = self.q_proj_swiftkv(hidden_states)
-        q, _ = self.rotary_emb(positions, q, torch.empty_like(k_states))
-        attn_output = self.attn(q, k_states, v_states, kv_cache,
-                                attn_metadata, write_cache=False)
-        output, _ = self.o_proj(attn_output)
+        query, _ = self.q_proj_swiftkv(hidden_states)
+        query, _ = self.rotary_emb(positions, query, torch.empty_like(key))
+        key_cache = kv_cache[0]
+        value_cache = kv_cache[1]
+
+        current_metadata = get_forward_context()
+        assert current_metadata is not None
+        assert isinstance(current_metadata, FlashAttentionMetadata)
+        attn_metadata: FlashAttentionMetadata = current_metadata
+
+        num_tokens, hidden_size = query.shape
+
+        # Reshape the query, key, and value tensors.
+        query = query.view(-1, self.num_heads, self.head_dim)
+        if (key is not None) and (value is not None):
+            key = key.view(-1, self.num_kv_heads, self.head_dim)
+            value = value.view(-1, self.num_kv_heads, self.head_dim)
+
+        #(num_prefill_query_tokens, num_prefill_kv_tokens,
+        #num_decode_query_tokens) = \
+        #    get_num_prefill_decode_query_kv_tokens(attn_metadata, attn_type)
+        #decode_query = query[num_prefill_query_tokens:]
+        # QKV for prefill.
+        #query = query[:num_prefill_query_tokens]
+        #assert query.shape[0] == num_prefill_query_tokens
+        #assert decode_query.shape[0] == num_decode_query_tokens
+
+        # Prompt run.
+        if (kv_cache.numel() == 0 or attn_metadata.block_tables is None
+                or attn_metadata.block_tables.numel() == 0):
+            # normal attention
+            # When block_tables are not filled, it means q and k are the
+            # prompt, and they have the same length.
+            max_seq_len = max(attn_metadata.seq_lens)
+            attn_output = flash_attn_varlen_func(
+                q=query,
+                k=key,
+                v=value,
+                cu_seqlens_q=attn_metadata.seq_start_loc,
+                cu_seqlens_k=attn_metadata.seq_start_loc,
+                max_seqlen_q=max_seq_len,
+                max_seqlen_k=max_seq_len,
+                softmax_scale=self.scaling,
+                causal=True,
+                window_size=(-1, -1),
+                alibi_slopes=None,
+                softcap=None,
+            )
+        else:
+            # prefix-enabled attention
+            assert attn_metadata.seq_lens is not None
+            max_seq_len = max(attn_metadata.seq_lens)
+            attn_output = flash_attn_varlen_func(  # noqa
+                q=query,
+                k=key_cache,
+                v=value_cache,
+                cu_seqlens_q=attn_metadata.query_start_loc,
+                max_seqlen_q=attn_metadata.max_query_len,
+                cu_seqlens_k=attn_metadata.seq_start_loc,
+                max_seqlen_k=max_seq_len,
+                softmax_scale=self.scaling,
+                causal=True,
+                window_size=(-1, -1),
+                alibi_slopes=None,
+                block_table=attn_metadata.block_tables,
+                softcap=None,
+            )
+
+        output = attn_output.view(num_tokens, hidden_size)
+        output, _ = self.o_proj(output)
         return output
 
 
