@@ -21,6 +21,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only LLaMA model compatible with HuggingFace weights."""
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -55,6 +56,15 @@ from vllm.model_executor.models.utils import (
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs import LlamaSwiftKVConfig
+
+
+@dataclass
+class SwiftKVAttentionMetadata:
+    query_start_loc: torch.Tensor
+    seq_start_loc: torch.Tensor
+    max_query_len: int
+    max_seq_len: int
+    block_tables: Optional[torch.Tensor]
 
 
 class LlamaSwiftKVAttention(nn.Module):
@@ -143,17 +153,12 @@ class LlamaSwiftKVAttention(nn.Module):
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
+        attn_metadata: SwiftKVAttentionMetadata,
     ) -> torch.Tensor:
         query, _ = self.q_proj_swiftkv(hidden_states)
         query, _ = self.rotary_emb(positions, query, torch.empty_like(key))
         key_cache = kv_cache[0]
         value_cache = kv_cache[1]
-
-        current_metadata = get_forward_context()
-        assert current_metadata is not None
-        assert isinstance(current_metadata, FlashAttentionMetadata)
-        attn_metadata: FlashAttentionMetadata = current_metadata
 
         num_tokens, hidden_size = query.shape
 
@@ -163,30 +168,19 @@ class LlamaSwiftKVAttention(nn.Module):
             key = key.view(-1, self.num_kv_heads, self.head_dim)
             value = value.view(-1, self.num_kv_heads, self.head_dim)
 
-        #(num_prefill_query_tokens, num_prefill_kv_tokens,
-        #num_decode_query_tokens) = \
-        #    get_num_prefill_decode_query_kv_tokens(attn_metadata, attn_type)
-        #decode_query = query[num_prefill_query_tokens:]
-        # QKV for prefill.
-        #query = query[:num_prefill_query_tokens]
-        #assert query.shape[0] == num_prefill_query_tokens
-        #assert decode_query.shape[0] == num_decode_query_tokens
-
-        # Prompt run.
         if (kv_cache.numel() == 0 or attn_metadata.block_tables is None
                 or attn_metadata.block_tables.numel() == 0):
             # normal attention
             # When block_tables are not filled, it means q and k are the
             # prompt, and they have the same length.
-            max_seq_len = max(attn_metadata.seq_lens)
             attn_output = flash_attn_varlen_func(
                 q=query,
                 k=key,
                 v=value,
                 cu_seqlens_q=attn_metadata.seq_start_loc,
                 cu_seqlens_k=attn_metadata.seq_start_loc,
-                max_seqlen_q=max_seq_len,
-                max_seqlen_k=max_seq_len,
+                max_seqlen_q=attn_metadata.max_seq_len,
+                max_seqlen_k=attn_metadata.max_seq_len,
                 softmax_scale=self.scaling,
                 causal=True,
                 window_size=(-1, -1),
@@ -196,15 +190,14 @@ class LlamaSwiftKVAttention(nn.Module):
         else:
             # prefix-enabled attention
             assert attn_metadata.seq_lens is not None
-            max_seq_len = max(attn_metadata.seq_lens)
             attn_output = flash_attn_varlen_func(  # noqa
                 q=query,
                 k=key_cache,
                 v=value_cache,
                 cu_seqlens_q=attn_metadata.query_start_loc,
-                max_seqlen_q=attn_metadata.max_query_len,
                 cu_seqlens_k=attn_metadata.seq_start_loc,
-                max_seqlen_k=max_seq_len,
+                max_seqlen_q=attn_metadata.max_query_len,
+                max_seqlen_k=attn_metadata.max_seq_len,
                 softmax_scale=self.scaling,
                 causal=True,
                 window_size=(-1, -1),
@@ -333,9 +326,9 @@ class LlamaSwiftKVModel(nn.Module):
                               prefix=f"{prefix}.layers.{idx}")
             if idx < config.num_key_value_layers
             else LlamaSwiftKVDecoderLayer(config=config,
-                                        cache_config=cache_config,
-                                        quant_config=quant_config,
-                                        prefix=f"{prefix}.layers.{idx}")
+                                          cache_config=cache_config,
+                                          quant_config=quant_config,
+                                          prefix=f"{prefix}.layers.{idx}")
             for idx in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -413,20 +406,17 @@ class LlamaSwiftKVModel(nn.Module):
         residual = residual.index_select(0, sampling_indices)
         positions = positions.index_select(0, sampling_indices)
 
-        attn_metadata._cached_prefill_metadata = None
-        attn_metadata._cached_decode_metadata = None
-        attn_metadata.seq_lens_tensor = seq_lens_tensor
-        attn_metadata.seq_lens = seq_lens
-        attn_metadata.seq_start_loc = seq_start_loc
-        attn_metadata.query_start_loc = torch.arange(
-            len(seq_ids) + 1,
-            device=attn_metadata.query_start_loc.device,
-            dtype=attn_metadata.query_start_loc.dtype,
+        swiftkv_attn_metadata = SwiftKVAttentionMetadata(
+            query_start_loc=torch.arange(
+                len(seq_ids) + 1,
+                device=attn_metadata.query_start_loc.device,
+                dtype=attn_metadata.query_start_loc.dtype,
+            ),
+            seq_start_loc=seq_start_loc,
+            max_query_len=1,
+            max_seq_len=max(seq_lens),
+            block_tables=block_tables,
         )
-        attn_metadata.block_tables = block_tables
-        attn_metadata.max_query_len = 1
-        attn_metadata.num_prefill_tokens = len(sampling_indices) - attn_metadata.num_decode_tokens
-        attn_metadata.num_prefills = attn_metadata.num_prefill_tokens
 
         for layer_idx in range(self.config.num_key_value_layers,
                                self.config.num_hidden_layers):
@@ -438,7 +428,7 @@ class LlamaSwiftKVModel(nn.Module):
                 k_states.index_select(0, sampling_indices),
                 v_states.index_select(0, sampling_indices),
                 kv_caches[layer_idx],
-                attn_metadata,
+                swiftkv_attn_metadata,
                 residual,
             )
 
