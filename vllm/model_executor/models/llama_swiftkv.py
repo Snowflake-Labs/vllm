@@ -403,8 +403,13 @@ class LlamaSwiftKVModel(nn.Module):
                 swiftkv_indices.extend(indices)
                 swiftkv_query_lens.append(len(indices))
                 swiftkv_seq_lens.append(attn_metadata.seq_lens[seq_id])
+
+        assert min(swiftkv_indices) > 0
+        assert max(swiftkv_indices) < hidden_states.size(0)
+
         swiftkv_indices = torch.tensor(swiftkv_indices,
-                                       device=hidden_states.device)
+                                       device=sampling_indices.device,
+                                       dtype=sampling_indices.dtype)
 
         swiftkv_attn_metadata = SwiftKVAttentionMetadata(
             query_start_loc=torch.tensor(
