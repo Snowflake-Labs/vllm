@@ -406,14 +406,16 @@ class LlamaSwiftKVModel(nn.Module):
         swiftkv_indices = torch.tensor(swiftkv_indices,
                                        device=hidden_states.device)
 
-        device = attn_metadata.query_start_loc.device
-        dtype = attn_metadata.query_start_loc.dtype
         swiftkv_attn_metadata = SwiftKVAttentionMetadata(
             query_start_loc=torch.tensor(
-                [0] + swiftkv_query_lens, device=device, dtype=dtype,
+                [0] + swiftkv_query_lens,
+                device=attn_metadata.query_start_loc.device,
+                dtype=attn_metadata.query_start_loc.dtype,
             ).cumsum(dim=0),
             seq_start_loc=torch.tensor(
-                [0] + swiftkv_seq_lens, device=device, dtype=dtype,
+                [0] + swiftkv_seq_lens,
+                device=attn_metadata.seq_start_loc.device,
+                dtype=attn_metadata.seq_start_loc.dtype,
             ).cumsum(dim=0),
             max_query_len=max(swiftkv_query_lens),
             max_seq_len=max(swiftkv_seq_lens),
