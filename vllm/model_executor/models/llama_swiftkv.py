@@ -397,8 +397,11 @@ class LlamaSwiftKVModel(nn.Module):
         for seq_id in range(len(query_start_loc) - 1):
             seq_begin = query_start_loc[seq_id]
             seq_end = query_start_loc[seq_id + 1]
-            while sampling_indices[idx] < seq_begin:
+            while (idx < len(sampling_indices) and 
+                   sampling_indices[idx] < seq_begin):
                 idx += 1
+            if idx >= len(sampling_indices):
+                break
             if sampling_indices[idx] < seq_end:
                 indices = list(range(sampling_indices[idx], seq_end))
                 swiftkv_indices.extend(indices)
