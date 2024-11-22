@@ -410,9 +410,9 @@ class LlamaSwiftKVModel(nn.Module):
         dtype = attn_metadata.query_start_loc.dtype
         swiftkv_attn_metadata = SwiftKVAttentionMetadata(
             query_start_loc=torch.tensor(
-                [0] + query_lens, device=device, dtype=dtype).cumsum(),
+                [0] + query_lens, device=device, dtype=dtype).cumsum(dim=0),
             seq_start_loc=torch.tensor(
-                [0] + seq_lens, device=device, dtype=dtype).cumsum(),
+                [0] + seq_lens, device=device, dtype=dtype).cumsum(dim=0),
             max_query_len=max(query_lens),
             max_seq_len=max(seq_lens),
             block_tables=attn_metadata.block_tables[swiftkv_indices],
