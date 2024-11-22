@@ -346,18 +346,6 @@ class LlamaSwiftKVModel(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         sampling_metadata: Optional[SamplingMetadata] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        sampling_indices = sampling_metadata.selected_token_indices
-        if kv_caches[0].numel() and sampling_indices.numel():
-            seq_ids = torch.nonzero(
-                torch.sum(
-                    attn_metadata.query_start_loc == sampling_indices.unsqueeze(1),
-                    dim=0,
-                )
-            ).squeeze(1).tolist()
-            seq_lens = attn_metadata.seq_lens_tensor.tolist()
-            seq_start_loc = attn_metadata.seq_start_loc[seq_ids + [seq_ids[-1] + 1]]
-            block_tables = attn_metadata.block_tables[seq_ids]
-
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
@@ -396,25 +384,44 @@ class LlamaSwiftKVModel(nn.Module):
                     1.0, 1.0,
                 )
 
-        if not (kv_caches[0].numel() and sampling_indices.numel()):
+        sampling_indices = sampling_metadata.selected_token_indices.tolist()
+        if not kv_caches[0].numel() or not sampling_indices:
             return hidden_states
-        orig_hidden_states = hidden_states
 
-        hidden_states = hidden_states.index_select(0, sampling_indices)
-        residual = residual.index_select(0, sampling_indices)
-        positions = positions.index_select(0, sampling_indices)
+        query_start_loc = attn_metadata.query_start_loc.tolist()
+        swiftkv_indices = []
+        swiftkv_seq_ids = []
+        query_lens = []
+        seq_lens = []
+        idx = 0
+        for seq_id in range(len(query_start_loc) - 1):
+            seq_begin = query_start_loc[seq_id]
+            seq_end = query_start_loc[seq_id + 1]
+            while sampling_indices[idx] < seq_begin:
+                idx += 1
+            if sampling_indices[idx] < seq_end:
+                indices = list(range(sampling_indices[idx], seq_end))
+                swiftkv_seq_ids.append(seq_id)
+                swiftkv_indices.extend(indices)
+                query_lens.append(len(indices))
+                seq_lens.append(attn_metadata.seq_lens[seq_id])
 
+        device = attn_metadata.query_start_loc.device
+        dtype = attn_metadata.query_start_loc.dtype
         swiftkv_attn_metadata = SwiftKVAttentionMetadata(
-            query_start_loc=torch.arange(
-                len(seq_ids) + 1,
-                device=attn_metadata.query_start_loc.device,
-                dtype=attn_metadata.query_start_loc.dtype,
-            ),
-            seq_start_loc=seq_start_loc,
-            max_query_len=1,
+            query_start_loc=torch.tensor(
+                [0] + query_lens, device=device, dtype=dtype).cumsum(),
+            seq_start_loc=torch.tensor(
+                [0] + seq_lens, device=device, dtype=dtype).cumsum(),
+            max_query_len=max(query_lens),
             max_seq_len=max(seq_lens),
-            block_tables=block_tables,
+            block_tables=attn_metadata.block_tables[swiftkv_indices],
         )
+
+        orig_hidden_states = hidden_states
+        hidden_states = hidden_states.index_select(0, swiftkv_indices)
+        residual = residual.index_select(0, swiftkv_indices)
+        positions = positions.index_select(0, swiftkv_indices)
 
         for layer_idx in range(self.config.num_key_value_layers,
                                self.config.num_hidden_layers):
@@ -423,15 +430,15 @@ class LlamaSwiftKVModel(nn.Module):
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
-                k_states.index_select(0, sampling_indices),
-                v_states.index_select(0, sampling_indices),
+                k_states.index_select(0, swiftkv_indices),
+                v_states.index_select(0, swiftkv_indices),
                 kv_caches[layer_idx],
                 swiftkv_attn_metadata,
                 residual,
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
-        orig_hidden_states.index_copy_(0, sampling_indices, hidden_states)
+        orig_hidden_states.index_copy_(0, swiftkv_indices, hidden_states)
         return orig_hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
