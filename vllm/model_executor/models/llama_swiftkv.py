@@ -407,9 +407,11 @@ class LlamaSwiftKVModel(nn.Module):
         assert min(swiftkv_indices) > 0
         assert max(swiftkv_indices) < hidden_states.size(0)
 
-        swiftkv_indices = torch.tensor(swiftkv_indices,
-                                       device=sampling_indices.device,
-                                       dtype=sampling_indices.dtype)
+        swiftkv_indices = torch.tensor(
+            swiftkv_indices,
+            device=sampling_metadata.selected_token_indices.device,
+            dtype=sampling_metadata.selected_token_indices.dtype,
+        )
 
         swiftkv_attn_metadata = SwiftKVAttentionMetadata(
             query_start_loc=torch.tensor(
