@@ -390,9 +390,8 @@ class LlamaSwiftKVModel(nn.Module):
 
         query_start_loc = attn_metadata.query_start_loc.tolist()
         swiftkv_indices = []
-        swiftkv_seq_ids = []
-        query_lens = []
-        seq_lens = []
+        swiftkv_query_lens = []
+        swiftkv_seq_lens = []
         idx = 0
         for seq_id in range(len(query_start_loc) - 1):
             seq_begin = query_start_loc[seq_id]
@@ -401,20 +400,23 @@ class LlamaSwiftKVModel(nn.Module):
                 idx += 1
             if sampling_indices[idx] < seq_end:
                 indices = list(range(sampling_indices[idx], seq_end))
-                swiftkv_seq_ids.append(seq_id)
                 swiftkv_indices.extend(indices)
-                query_lens.append(len(indices))
-                seq_lens.append(attn_metadata.seq_lens[seq_id])
+                swiftkv_query_lens.append(len(indices))
+                swiftkv_seq_lens.append(attn_metadata.seq_lens[seq_id])
+        swiftkv_indices = torch.tensor(swiftkv_indices,
+                                       device=hidden_states.device)
 
         device = attn_metadata.query_start_loc.device
         dtype = attn_metadata.query_start_loc.dtype
         swiftkv_attn_metadata = SwiftKVAttentionMetadata(
             query_start_loc=torch.tensor(
-                [0] + query_lens, device=device, dtype=dtype).cumsum(dim=0),
+                [0] + swiftkv_query_lens, device=device, dtype=dtype,
+            ).cumsum(dim=0),
             seq_start_loc=torch.tensor(
-                [0] + seq_lens, device=device, dtype=dtype).cumsum(dim=0),
-            max_query_len=max(query_lens),
-            max_seq_len=max(seq_lens),
+                [0] + swiftkv_seq_lens, device=device, dtype=dtype,
+            ).cumsum(dim=0),
+            max_query_len=max(swiftkv_query_lens),
+            max_seq_len=max(swiftkv_seq_lens),
             block_tables=attn_metadata.block_tables[swiftkv_indices],
         )
 
