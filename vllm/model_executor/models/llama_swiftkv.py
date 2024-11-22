@@ -390,6 +390,7 @@ class LlamaSwiftKVModel(nn.Module):
 
         query_start_loc = attn_metadata.query_start_loc.tolist()
         swiftkv_indices = []
+        swiftkv_seq_ids = []
         swiftkv_query_lens = []
         swiftkv_seq_lens = []
         idx = 0
@@ -401,6 +402,7 @@ class LlamaSwiftKVModel(nn.Module):
             if sampling_indices[idx] < seq_end:
                 indices = list(range(sampling_indices[idx], seq_end))
                 swiftkv_indices.extend(indices)
+                swiftkv_seq_ids.append(seq_id)
                 swiftkv_query_lens.append(len(indices))
                 swiftkv_seq_lens.append(attn_metadata.seq_lens[seq_id])
 
@@ -415,7 +417,7 @@ class LlamaSwiftKVModel(nn.Module):
             ).cumsum(dim=0, dtype=torch.int32),
             max_query_len=max(swiftkv_query_lens),
             max_seq_len=max(swiftkv_seq_lens),
-            block_tables=attn_metadata.block_tables[swiftkv_indices],
+            block_tables=attn_metadata.block_tables[swiftkv_seq_ids],
         )
 
         orig_hidden_states = hidden_states
