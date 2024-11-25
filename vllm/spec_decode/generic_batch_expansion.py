@@ -88,6 +88,15 @@ class GenericBatchExpansionTop1Scorer(SpeculativeScorer):
         assert len(target_sampler_output) == 1, "expected single-step output"
         target_sampler_output = target_sampler_output[0]
 
+        # Spec Dec is disabled with LoRA request, but if the engine is created with LoRA,
+        # the output will have a different vocab size even if the request does not use LoRA.
+        # We need to truncate it to the original vocab size.
+        sampled_token_probs = target_sampler_output.sampled_token_probs
+        if self._scorer_worker.lora_config is not None \
+            and sampled_token_probs.shape[-1] is not self._vocab_size:
+                target_sampler_output.sampled_token_probs = sampled_token_probs[:,:self._vocab_size] 
+                target_sampler_output.logprobs = target_sampler_output.logprobs[:,:self._vocab_size] 
+
         if not non_spec_indices and not prefill_indices:
             # All sequence groups in batch have spec decoding enabled
             contracted = self._contract_batch_all_spec(

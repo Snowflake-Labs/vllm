@@ -429,7 +429,9 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
             sgm.is_prompt for sgm in execute_model_req.seq_group_metadata_list
         ) or num_lookahead_slots == 0 or disable_all_speculation or all(
             sgm.num_speculative_tokens == 0
-            for sgm in execute_model_req.seq_group_metadata_list)
+            for sgm in execute_model_req.seq_group_metadata_list) or any(
+                sgm.lora_request is not None
+                for sgm in execute_model_req.seq_group_metadata_list)
 
         # Broadcast how many lookahead slots are scheduled for this step, and
         # whether all speculation is disabled, to all non-driver workers.

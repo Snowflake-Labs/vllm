@@ -262,6 +262,12 @@ def _supports_pp_inspect(model: Union[Type[object], object]) -> bool:
 
     return supports_kw(model_forward, "intermediate_tensors")
 
+@runtime_checkable
+class LoRAExemptionForSpeculator(Protocol):
+      lora_exemption: ClassVar[Literal[True]] = True
+
+def supports_lora_exemption_for_speculator(model: object) -> TypeIs[LoRAExemptionForSpeculator]:
+    return isinstance(model, LoRAExemptionForSpeculator)
 
 @runtime_checkable
 class HasInnerState(Protocol):
