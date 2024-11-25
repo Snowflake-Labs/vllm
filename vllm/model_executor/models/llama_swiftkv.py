@@ -267,7 +267,7 @@ class LlamaSwiftKVDecoderLayer(nn.Module):
         k_states: torch.Tensor,
         v_states: torch.Tensor,
         kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
+        attn_metadata: SwiftKVAttentionMetadata,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
@@ -336,6 +336,51 @@ class LlamaSwiftKVModel(nn.Module):
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def _get_swiftkv_attn_metadata(
+        self,
+        sampling_indices: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+    ) -> Tuple[Optional[SwiftKVAttentionMetadata], Optional[torch.Tensor]]:
+        if sampling_indices.numel():
+            sampling_indices = sampling_indices.tolist()
+        else:
+            return None, None
+        swiftkv_indices = []
+        swiftkv_seq_ids = []
+        swiftkv_query_lens = []
+        swiftkv_seq_lens = []
+        idx = 0
+        query_start_loc = attn_metadata.query_start_loc.tolist()
+        for seq_id in range(len(query_start_loc) - 1):
+            seq_begin = query_start_loc[seq_id]
+            seq_end = query_start_loc[seq_id + 1]
+            while (idx < len(sampling_indices) and 
+                sampling_indices[idx] < seq_begin):
+                idx += 1
+            if idx >= len(sampling_indices):
+                break
+            if sampling_indices[idx] < seq_end:
+                indices = list(range(sampling_indices[idx], seq_end))
+                swiftkv_indices.extend(indices)
+                swiftkv_seq_ids.append(seq_id)
+                swiftkv_query_lens.append(len(indices))
+                swiftkv_seq_lens.append(attn_metadata.seq_lens[seq_id])
+        if not swiftkv_indices:
+            return None, None
+        device = attn_metadata.query_start_loc.device
+        swiftkv_indices = torch.tensor(swiftkv_indices, device=device)
+        return SwiftKVAttentionMetadata(
+            query_start_loc=torch.tensor(
+                [0] + swiftkv_query_lens, device=device, dtype=torch.int32,
+            ).cumsum(dim=0, dtype=torch.int32),
+            seq_start_loc=torch.tensor(
+                [0] + swiftkv_seq_lens, device=device, dtype=torch.int32,
+            ).cumsum(dim=0, dtype=torch.int32),
+            max_query_len=max(swiftkv_query_lens),
+            max_seq_len=max(swiftkv_seq_lens),
+            block_tables=attn_metadata.block_tables[swiftkv_seq_ids],
+        ), swiftkv_indices
+
     def forward(
         self,
         input_ids: Optional[torch.Tensor],
@@ -346,6 +391,10 @@ class LlamaSwiftKVModel(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         sampling_metadata: Optional[SamplingMetadata] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+        swiftkv_attn_metadata, swiftkv_indices = (
+            self._get_swiftkv_attn_metadata(
+                sampling_metadata.selected_token_indices, attn_metadata)
+        )
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
@@ -361,7 +410,7 @@ class LlamaSwiftKVModel(nn.Module):
                 attn_metadata,
                 residual,
             )
-
+        
         # KV projection and cache of all the remaining layers
         kv_states_dict = {}
         swiftkv_hidden_states = self.norm_swiftkv(hidden_states + residual)
@@ -384,49 +433,18 @@ class LlamaSwiftKVModel(nn.Module):
                     1.0, 1.0,
                 )
 
-        sampling_indices = sampling_metadata.selected_token_indices.tolist()
-        if not kv_caches[0].numel() or not sampling_indices:
+        if not kv_caches[0].numel() or swiftkv_indices is None:
             return hidden_states
-
-        query_start_loc = attn_metadata.query_start_loc.tolist()
-        swiftkv_indices = []
-        swiftkv_seq_ids = []
-        swiftkv_query_lens = []
-        swiftkv_seq_lens = []
-        idx = 0
-        for seq_id in range(len(query_start_loc) - 1):
-            seq_begin = query_start_loc[seq_id]
-            seq_end = query_start_loc[seq_id + 1]
-            while (idx < len(sampling_indices) and 
-                   sampling_indices[idx] < seq_begin):
-                idx += 1
-            if idx >= len(sampling_indices):
-                break
-            if sampling_indices[idx] < seq_end:
-                indices = list(range(sampling_indices[idx], seq_end))
-                swiftkv_indices.extend(indices)
-                swiftkv_seq_ids.append(seq_id)
-                swiftkv_query_lens.append(len(indices))
-                swiftkv_seq_lens.append(attn_metadata.seq_lens[seq_id])
-
-        device = hidden_states.device
-        swiftkv_indices = torch.tensor(swiftkv_indices, device=device)
-        swiftkv_attn_metadata = SwiftKVAttentionMetadata(
-            query_start_loc=torch.tensor(
-                [0] + swiftkv_query_lens, device=device, dtype=torch.int32,
-            ).cumsum(dim=0, dtype=torch.int32),
-            seq_start_loc=torch.tensor(
-                [0] + swiftkv_seq_lens, device=device, dtype=torch.int32,
-            ).cumsum(dim=0, dtype=torch.int32),
-            max_query_len=max(swiftkv_query_lens),
-            max_seq_len=max(swiftkv_seq_lens),
-            block_tables=attn_metadata.block_tables[swiftkv_seq_ids],
-        )
 
         orig_hidden_states = hidden_states
         hidden_states = hidden_states.index_select(0, swiftkv_indices)
         residual = residual.index_select(0, swiftkv_indices)
         positions = positions.index_select(0, swiftkv_indices)
+        kv_states_dict = {
+            layer_idx: (k_states.index_select(0, swiftkv_indices),
+                        v_states.index_select(0, swiftkv_indices))
+            for layer_idx, (k_states, v_states) in kv_states_dict.items()
+        }
 
         for layer_idx in range(self.config.num_key_value_layers,
                                self.config.num_hidden_layers):
@@ -435,8 +453,8 @@ class LlamaSwiftKVModel(nn.Module):
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
-                k_states.index_select(0, swiftkv_indices),
-                v_states.index_select(0, swiftkv_indices),
+                k_states,
+                v_states,
                 kv_caches[layer_idx],
                 swiftkv_attn_metadata,
                 residual,
