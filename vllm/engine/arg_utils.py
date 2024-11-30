@@ -187,7 +187,6 @@ class EngineArgs:
     collect_detailed_traces: Optional[str] = None
     disable_async_output_proc: bool = False
     scheduling_policy: Literal["fcfs", "priority"] = "fcfs"
-    split_last_prefill: Optional[bool] = None
 
     override_neuron_config: Optional[Dict[str, Any]] = None
     override_pooler_config: Optional[PoolerConfig] = None
@@ -871,22 +870,12 @@ class EngineArgs:
             default=None,
             help="Override or set neuron device configuration. "
             "e.g. {\"cast_logits_dtype\": \"bloat16\"}.'")
-
         parser.add_argument(
             '--override-pooler-config',
             type=PoolerConfig.from_json,
             default=None,
             help="Override or set the pooling method in the embedding model. "
             "e.g. {\"pooling_type\": \"mean\", \"normalize\": false}.'")
-
-        parser.add_argument(
-            '--split-last-prefill',
-            action=StoreBoolean,
-            default=EngineArgs.split_last_prefill,
-            nargs="?",
-            const="True",
-            help='If set, the last prompt token will be prefilled in its own '
-            'chunk. Only used when --enable-chunked-prefill is set.')
 
         return parser
 
@@ -1106,9 +1095,7 @@ class EngineArgs:
             multi_step_stream_outputs=self.multi_step_stream_outputs,
             send_delta_data=(envs.VLLM_USE_RAY_SPMD_WORKER
                              and parallel_config.use_ray),
-            policy=self.scheduling_policy,
-            split_last_prefill=self.split_last_prefill,
-        )
+            policy=self.scheduling_policy)
         lora_config = LoRAConfig(
             bias_enabled=self.enable_lora_bias,
             max_lora_rank=self.max_lora_rank,

@@ -640,7 +640,6 @@ class FlashAttentionImpl(AttentionImpl):
         k_scale: float = 1.0,
         v_scale: float = 1.0,
         attn_type: AttentionType = AttentionType.DECODER,
-        write_cache: bool = True,
     ) -> torch.Tensor:
         """Forward pass with FlashAttention.
 
@@ -685,7 +684,6 @@ class FlashAttentionImpl(AttentionImpl):
             self.sliding_window,
             self.alibi_slopes,
             self.logits_soft_cap,
-            write_cache,
         )
 
         return output
@@ -790,7 +788,6 @@ def unified_flash_attention(
     window_size: Optional[List[int]] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     logits_soft_cap: Optional[float] = None,
-    write_cache: bool = True,
 ) -> torch.Tensor:
 
     # Convert integer attn_type to enum
@@ -832,7 +829,6 @@ def unified_flash_attention(
                 # Update self-attention KV cache (prefill/decode)
                 updated_slot_mapping = attn_metadata.slot_mapping
 
-        if write_cache:
             # Reshape the input keys and values and store them in the cache.
             # If kv_cache is not provided, the new key and value tensors are
             # not cached. This happens during the initial memory profiling run.
