@@ -367,22 +367,35 @@ class LlamaSwiftKVModel(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.norm_swiftkv = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # Cuda graph inputs/outputs
-        kv_size = self.layers[0].self_attn.num_kv_heads * self.layers[0].self_attn.head_dim
+        # Cuda graph inputs/output tensors
+        num_kv_heads = self.layers[0].self_attn.num_kv_heads
+        head_dim = self.layers[0].self_attn.head_dim
+        kv_size = num_kv_heads * head_dim
         self.cuda_graphs = {}
-        self.cuda_graph_max_size = 256
-        self.cuda_graph_max_blocks = 2048
-        self.cuda_graph_inputs = {
-            "positions": torch.empty(self.cuda_graph_max_size, dtype=torch.long),
-            "hidden_states": torch.empty((self.cuda_graph_max_size, config.hidden_size)),
-            "residual": torch.empty((self.cuda_graph_max_size, config.hidden_size)),
+        self.cuda_graph_max_batch_size = 256
+        self.cuda_graph_max_num_blocks = 2048
+        self.cuda_graph_tensors = {
+            "positions": torch.empty(self.cuda_graph_max_batch_size,
+                                     dtype=torch.long),
+            "hidden_states": torch.empty(self.cuda_graph_max_batch_size,
+                                         config.hidden_size),
+            "residual": torch.empty(self.cuda_graph_max_batch_size,
+                                    config.hidden_size),
             "kv_states": {
-                layer_idx: (torch.empty((self.cuda_graph_max_size, kv_size)),
-                            torch.empty((self.cuda_graph_max_size, kv_size)))
-                for layer_idx in range(config.num_key_value_layers, config.num_hidden_layers)
+                layer_idx: (torch.empty(self.cuda_graph_max_batch_size, kv_size),
+                            torch.empty(self.cuda_graph_max_batch_size, kv_size))
+                for layer_idx in range(config.num_key_value_layers,
+                                       config.num_hidden_layers)
             },
-            "seq_lens": torch.empty(self.cuda_graph_max_size, dtype=torch.int32),
-            "block_tables": torch.empty((self.cuda_graph_max_size, self.cuda_graph_max_blocks), dtype=torch.int32),
+            "metadata": SwiftKVMetadata(
+                use_varlen=False,
+                indices=None,
+                seq_lens=torch.empty(self.cuda_graph_max_batch_size,
+                                     dtype=torch.int32),
+                block_tables=torch.empty(self.cuda_graph_max_batch_size,
+                                         self.cuda_graph_max_num_blocks,
+                                         dtype=torch.int32),
+            ),
         }
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -454,6 +467,72 @@ class LlamaSwiftKVModel(nn.Module):
             seq_lens=attn_metadata.seq_lens_tensor,
         )
 
+    def _prepare_cuda_graph_inputs(
+        self,
+        size: int,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        kv_states: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
+        swiftkv_metadata: SwiftKVMetadata,
+    ):
+        self.cuda_graph_tensors["positions"][:size].copy_(positions)
+        self.cuda_graph_tensors["hidden_states"][:size].copy_(hidden_states)
+        self.cuda_graph_tensors["residual"][:size].copy_(residual)
+        cuda_graph_kv_states = self.cuda_graph_tensors["kv_states"]
+        for layer_idx, (k, v) in kv_states.items():
+            cuda_graph_kv_states[layer_idx][0][:size].copy_(k)
+            cuda_graph_kv_states[layer_idx][1][:size].copy_(v)
+        cuda_graph_metadata = self.cuda_graph_tensors["metadata"]
+        cuda_graph_metadata.seq_lens[:size].copy_(swiftkv_metadata.seq_lens)
+        num_blocks = min(self.cuda_graph_max_num_blocks,
+                         swiftkv_metadata.block_tables.size(1))
+        cuda_graph_metadata.block_tables[:size, :num_blocks].copy_(
+            swiftkv_metadata.block_tables[:, :num_blocks])
+        # Pad to next power of 2
+        padded_size = 1 << (size - 1).bit_length()
+        positions = self.cuda_graph_tensors["positions"][:padded_size]
+        hidden_states = self.cuda_graph_tensors["hidden_states"][:padded_size]
+        residual = self.cuda_graph_tensors["residual"][:padded_size]
+        for layer_idx in kv_states:
+            kv_states[layer_idx] = (
+                cuda_graph_kv_states[layer_idx][0][:padded_size],
+                cuda_graph_kv_states[layer_idx][1][:padded_size],
+            )
+        swiftkv_metadata = SwiftKVMetadata(
+            use_varlen=swiftkv_metadata.use_varlen,
+            indices=swiftkv_metadata.indices,
+            seq_lens=cuda_graph_metadata.seq_lens[:padded_size],
+            block_tables=cuda_graph_metadata.block_tables[:padded_size],
+        )
+        return (padded_size, positions, hidden_states, residual, kv_states,
+                swiftkv_metadata)
+
+    def _run_swiftkv_layers(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        kv_states: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
+        kv_caches: List[torch.Tensor],
+        swiftkv_metadata: SwiftKVMetadata,
+    ) -> torch.Tensor:
+        for layer_idx in range(self.config.num_key_value_layers,
+                               self.config.num_hidden_layers):
+            layer = self.layers[layer_idx]
+            k_states, v_states = kv_states[layer_idx]
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                k_states,
+                v_states,
+                kv_caches[layer_idx],
+                swiftkv_metadata,
+                residual,
+            )
+        hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states
+
     def forward(
         self,
         input_ids: Optional[torch.Tensor],
@@ -487,20 +566,20 @@ class LlamaSwiftKVModel(nn.Module):
             )
 
         # KV projection and cache of all the remaining layers
-        kv_states_dict = {}
+        kv_states = {}
         swiftkv_hidden_states = self.norm_swiftkv(hidden_states + residual)
         for layer_idx in range(self.config.num_key_value_layers,
                                self.config.num_hidden_layers):
             self_attn = self.layers[layer_idx].self_attn
-            kv_states, _ = self_attn.kv_proj_swiftkv(swiftkv_hidden_states)
-            k_states, v_states = kv_states.split(self_attn.kv_size, dim=-1)
-            q_states = torch.empty_like(hidden_states)  # Just temporary buffer
-            _, k_states = self_attn.rotary_emb(positions, q_states, k_states)
-            kv_states_dict[layer_idx] = (k_states, v_states)
+            kv, _ = self_attn.kv_proj_swiftkv(swiftkv_hidden_states)
+            k, v = kv.split(self_attn.kv_size, dim=-1)
+            q = torch.empty_like(hidden_states)  # Just temporary buffer
+            _, k = self_attn.rotary_emb(positions, q, k)
+            kv_states[layer_idx] = (k, v)
             if kv_caches[layer_idx].numel():
                 torch.ops._C_cache_ops.reshape_and_cache_flash(
-                    k_states.view(-1, self_attn.num_kv_heads, self_attn.head_dim),
-                    v_states.view(-1, self_attn.num_kv_heads, self_attn.head_dim),
+                    k.view(-1, self_attn.num_kv_heads, self_attn.head_dim),
+                    v.view(-1, self_attn.num_kv_heads, self_attn.head_dim),
                     kv_caches[layer_idx][0],
                     kv_caches[layer_idx][1],
                     attn_metadata.slot_mapping.flatten(),
@@ -515,77 +594,67 @@ class LlamaSwiftKVModel(nn.Module):
             hidden_states = hidden_states[swiftkv_metadata.indices]
             residual = residual[swiftkv_metadata.indices]
             positions = positions[swiftkv_metadata.indices]
-            kv_states_dict = {
-                layer_idx: (k_states[swiftkv_metadata.indices],
-                            v_states[swiftkv_metadata.indices])
-                for layer_idx, (k_states, v_states) in kv_states_dict.items()
+            kv_states = {
+                layer_idx: (k[swiftkv_metadata.indices],
+                            v[swiftkv_metadata.indices])
+                for layer_idx, (k, v) in kv_states.items()
             }
 
+        batch_size = hidden_states.size(0)
         if (not attn_metadata.use_cuda_graph
             and not swiftkv_metadata.use_varlen and kv_caches[0].numel()
-            and hidden_states.size(0) <= self.cuda_graph_max_size
+            and batch_size <= self.cuda_graph_max_batch_size
+            and swiftkv_metadata.block_tables.size(1) <=
+                self.cuda_graph_max_num_blocks
         ):
-            size = hidden_states.size(0)
-            padded_size = 1 << (size - 1).bit_length()
+            # We implement our own (JIT-captured) cuda graph for the second
+            # half of the model (layers skipped for prefill tokens).
+            (
+                padded_size,
+                positions,
+                hidden_states,
+                residual,
+                kv_states,
+                swiftkv_metadata,
+            ) = self._prepare_cuda_graph_inputs(
+                batch_size,
+                positions,
+                hidden_states,
+                residual,
+                kv_states,
+                swiftkv_metadata,
+            )
             g = self.cuda_graphs.get(padded_size)
-            self.cuda_graph_inputs["positions"][:size].copy_(positions)
-            self.cuda_graph_inputs["hidden_states"][:size].copy_(hidden_states)
-            self.cuda_graph_inputs["residual"][:size].copy_(residual)
-            for layer_idx, (k_states, v_states) in kv_states_dict.items():
-                self.cuda_graph_inputs["kv_states"][layer_idx][0][:size].copy_(k_states)
-                self.cuda_graph_inputs["kv_states"][layer_idx][1][:size].copy_(v_states)
-            self.cuda_graph_inputs["seq_lens"][:size].copy_(swiftkv_metadata.seq_lens)
-            num_blocks = min(self.cuda_graph_max_blocks, swiftkv_metadata.block_tables.size(1))
-            self.cuda_graph_inputs["block_tables"][:size, :num_blocks].copy_(swiftkv_metadata.block_tables[:, :num_blocks])
+            cuda_graph_hidden_states = self.cuda_graph_tensors["hidden_states"]
             if g is None:
-                print(f"Creating CUDA graph for size {padded_size}")
-                positions = self.cuda_graph_inputs["positions"][:padded_size]
-                hidden_states = self.cuda_graph_inputs["hidden_states"][:padded_size]
-                residual = self.cuda_graph_inputs["residual"][:padded_size]
-                for layer_idx in kv_states_dict:
-                    kv_states_dict[layer_idx] = (
-                        self.cuda_graph_inputs["kv_states"][layer_idx][0][:padded_size],
-                        self.cuda_graph_inputs["kv_states"][layer_idx][1][:padded_size],
-                    )
-                swiftkv_metadata.seq_lens = self.cuda_graph_inputs["seq_lens"][:padded_size]
-                swiftkv_metadata.block_tables = self.cuda_graph_inputs["block_tables"][:padded_size]
-                with graph_capture() as graph_capture_context:
+                print("JIT-capture SwiftKV CUDA graph for batch size",
+                      padded_size)
+                with graph_capture() as capture_context:
                     g = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(g, stream=graph_capture_context.stream):
-                        for layer_idx in range(self.config.num_key_value_layers,
-                                            self.config.num_hidden_layers):
-                            layer = self.layers[layer_idx]
-                            k_states, v_states = kv_states_dict[layer_idx]
-                            hidden_states, residual = layer(
-                                positions,
-                                hidden_states,
-                                k_states,
-                                v_states,
-                                kv_caches[layer_idx],
-                                swiftkv_metadata,
-                                residual,
-                            )
-                        hidden_states, _ = self.norm(hidden_states, residual)
-                        self.cuda_graph_inputs["hidden_states"][:padded_size].copy_(hidden_states)
+                    with torch.cuda.graph(g, stream=capture_context.stream):
+                        hidden_states = self._run_swiftkv_layers(
+                            positions,
+                            hidden_states,
+                            residual,
+                            kv_states,
+                            kv_caches,
+                            swiftkv_metadata,
+                        )
+                        cuda_graph_hidden_states[:padded_size].copy_(
+                            hidden_states)
                 self.cuda_graphs[padded_size] = g
             else:
                 g.replay()
-            hidden_states = self.cuda_graph_inputs["hidden_states"][:size]
+            hidden_states = cuda_graph_hidden_states[:batch_size]
         else:
-            for layer_idx in range(self.config.num_key_value_layers,
-                                   self.config.num_hidden_layers):
-                layer = self.layers[layer_idx]
-                k_states, v_states = kv_states_dict[layer_idx]
-                hidden_states, residual = layer(
-                    positions,
-                    hidden_states,
-                    k_states,
-                    v_states,
-                    kv_caches[layer_idx],
-                    swiftkv_metadata,
-                    residual,
-                )
-            hidden_states, _ = self.norm(hidden_states, residual)
+            hidden_states = self._run_swiftkv_layers(
+                positions,
+                hidden_states,
+                residual,
+                kv_states,
+                kv_caches,
+                swiftkv_metadata,
+            )
         if swiftkv_metadata.indices is None:
             return hidden_states
         orig_hidden_states[swiftkv_metadata.indices] = hidden_states
