@@ -28,12 +28,16 @@ import torch
 from torch import nn
 
 from vllm.attention import Attention, AttentionMetadata
-from vllm.attention.backends.flash_attn import (
-    FlashAttentionMetadata, flash_attn_varlen_func,
+from vllm.attention.backends.flash_attn import FlashAttentionMetadata
+from vllm.vllm_flash_attn import (
+    flash_attn_func,
+    flash_attn_varlen_func,
+    flash_attn_with_kvcache,
 )
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (divide, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size)
+from vllm.distributed.parallel_state import graph_capture
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
@@ -60,12 +64,18 @@ from vllm.transformers_utils.configs import LlamaSwiftKVConfig
 
 @dataclass
 class SwiftKVMetadata:
-    query_start_loc: torch.Tensor
-    seq_start_loc: torch.Tensor
-    max_query_len: int
-    max_seq_len: int
-    block_tables: Optional[torch.Tensor]
+    use_varlen: bool
     indices: Optional[torch.Tensor]
+    block_table: Optional[torch.Tensor]
+
+    # non-varlen args
+    seq_lens: Optional[torch.Tensor] = None
+
+    # varlen args
+    query_start_loc: Optional[torch.Tensor] = None
+    seq_start_loc: Optional[torch.Tensor] = None
+    max_query_len: Optional[int] = None
+    max_seq_len: Optional[int] = None
 
 
 class LlamaSwiftKVAttention(nn.Module):
@@ -166,43 +176,69 @@ class LlamaSwiftKVAttention(nn.Module):
             key = key.view(-1, self.num_kv_heads, self.head_dim)
             value = value.view(-1, self.num_kv_heads, self.head_dim)
 
-        if (kv_cache.numel() == 0 or attn_metadata.block_tables is None
-                or attn_metadata.block_tables.numel() == 0):
-            # normal attention
-            # When block_tables are not filled, it means q and k are the
-            # prompt, and they have the same length.
-            attn_output = flash_attn_varlen_func(
-                q=query,
-                k=key,
-                v=value,
-                cu_seqlens_q=attn_metadata.seq_start_loc,
-                cu_seqlens_k=attn_metadata.seq_start_loc,
-                max_seqlen_q=attn_metadata.max_seq_len,
-                max_seqlen_k=attn_metadata.max_seq_len,
-                softmax_scale=self.scaling,
-                causal=True,
-                window_size=(-1, -1),
-                alibi_slopes=None,
-                softcap=0,
-            )
+        if attn_metadata.use_varlen:
+            if (kv_cache.numel() == 0 or attn_metadata.block_tables is None
+                    or attn_metadata.block_tables.numel() == 0):
+                # normal attention
+                # When block_tables are not filled, it means q and k are the
+                # prompt, and they have the same length.
+                attn_output = flash_attn_varlen_func(
+                    q=query,
+                    k=key,
+                    v=value,
+                    cu_seqlens_q=attn_metadata.seq_start_loc,
+                    cu_seqlens_k=attn_metadata.seq_start_loc,
+                    max_seqlen_q=attn_metadata.max_seq_len,
+                    max_seqlen_k=attn_metadata.max_seq_len,
+                    softmax_scale=self.scaling,
+                    causal=True,
+                    window_size=(-1, -1),
+                    alibi_slopes=None,
+                    softcap=0,
+                )
+            else:
+                # prefix-enabled attention
+                attn_output = flash_attn_varlen_func(  # noqa
+                    q=query,
+                    k=kv_cache[0],
+                    v=kv_cache[1],
+                    cu_seqlens_q=attn_metadata.query_start_loc,
+                    cu_seqlens_k=attn_metadata.seq_start_loc,
+                    max_seqlen_q=attn_metadata.max_query_len,
+                    max_seqlen_k=attn_metadata.max_seq_len,
+                    softmax_scale=self.scaling,
+                    causal=True,
+                    window_size=(-1, -1),
+                    alibi_slopes=None,
+                    block_table=attn_metadata.block_table,
+                    softcap=0,
+                )
         else:
-            # prefix-enabled attention
-            attn_output = flash_attn_varlen_func(  # noqa
-                q=query,
-                k=kv_cache[0],
-                v=kv_cache[1],
-                cu_seqlens_q=attn_metadata.query_start_loc,
-                cu_seqlens_k=attn_metadata.seq_start_loc,
-                max_seqlen_q=attn_metadata.max_query_len,
-                max_seqlen_k=attn_metadata.max_seq_len,
-                softmax_scale=self.scaling,
-                causal=True,
-                window_size=(-1, -1),
-                alibi_slopes=None,
-                block_table=attn_metadata.block_tables,
-                softcap=0,
-            )
-
+            assert attn_metadata.seq_lens.numel() == num_tokens
+            if kv_cache.numel():
+                attn_output = flash_attn_with_kvcache(
+                    q=query.unsqueeze(1),
+                    k_cache=kv_cache[0],
+                    v_cache=kv_cache[1],
+                    block_table=attn_metadata.block_table,
+                    cache_seqlens=attn_metadata.seq_lens,
+                    softmax_scale=self.scaling,
+                    causal=True,
+                    window_size=(-1, -1),
+                    alibi_slopes=None,
+                    softcap=0,
+                ).squeeze(1)
+            else:
+                attn_output = flash_attn_func(
+                    q=query.unsqueeze(1),
+                    k=key.unsqueeze(1),
+                    v=value.unsqueeze(1),
+                    softmax_scale=self.scaling,
+                    causal=True,
+                    window_size=(-1, -1),
+                    alibi_slopes=None,
+                    softcap=0,
+                ).squeeze(1)
         output = attn_output.view(num_tokens, hidden_size)
         output, _ = self.o_proj(output)
         return output
@@ -331,6 +367,24 @@ class LlamaSwiftKVModel(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.norm_swiftkv = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # Cuda graph inputs/outputs
+        kv_size = self.layers[0].self_attn.num_kv_heads * self.layers[0].self_attn.head_dim
+        self.cuda_graphs = {}
+        self.cuda_graph_max_size = 256
+        self.cuda_graph_max_blocks = 2048
+        self.cuda_graph_inputs = {
+            "positions": torch.empty(self.cuda_graph_max_size, dtype=torch.long),
+            "hidden_states": torch.empty((self.cuda_graph_max_size, config.hidden_size)),
+            "residual": torch.empty((self.cuda_graph_max_size, config.hidden_size)),
+            "kv_states": {
+                layer_idx: (torch.empty((self.cuda_graph_max_size, kv_size)),
+                            torch.empty((self.cuda_graph_max_size, kv_size)))
+                for layer_idx in range(config.num_key_value_layers, config.num_hidden_layers)
+            },
+            "seq_lens": torch.empty(self.cuda_graph_max_size, dtype=torch.int32),
+            "block_table": torch.empty((self.cuda_graph_max_size, self.cuda_graph_max_blocks), dtype=torch.int32),
+        }
+
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -361,17 +415,43 @@ class LlamaSwiftKVModel(nn.Module):
                 swiftkv_query_lens.append(len(indices))
                 swiftkv_seq_lens.append(attn_metadata.seq_lens[seq_id])
         device = attn_metadata.query_start_loc.device
+        max_query_len = max(swiftkv_query_lens, default=0)
+        max_seq_len = max(swiftkv_seq_lens, default=0)
+        if max_query_len <= 1:
+            assert len(swiftkv_indices) == len(swiftkv_seq_ids)
+            return SwiftKVMetadata(
+                use_varlen=False,
+                indices=torch.tensor(swiftkv_indices, device=device),
+                block_table=attn_metadata.block_tables[swiftkv_seq_ids],
+                seq_lens=torch.tensor(swiftkv_seq_lens, device=device,
+                                             dtype=torch.int32),
+            )
+        else:
+            return SwiftKVMetadata(
+                use_varlen=True,
+                indices=torch.tensor(swiftkv_indices, device=device),
+                block_tables=attn_metadata.block_tables[swiftkv_seq_ids],
+                query_start_loc=torch.tensor(
+                    [0] + swiftkv_query_lens, device=device,
+                ).cumsum(dim=0).to(torch.int32),
+                seq_start_loc=torch.tensor(
+                    [0] + swiftkv_seq_lens, device=device,
+                ).cumsum(dim=0).to(torch.int32),
+                max_query_len=max_query_len,
+                max_seq_len=max_seq_len,
+            )
+
+    def _get_swiftkv_metadata_for_cuda_graph(
+        self,
+        attn_metadata: FlashAttentionMetadata,
+    ) -> SwiftKVMetadata:
+        assert (attn_metadata.num_prefills == 0 and
+                attn_metadata.max_decode_query_len == 1)
         return SwiftKVMetadata(
-            query_start_loc=torch.tensor(
-                [0] + swiftkv_query_lens, device=device, dtype=torch.int32,
-            ).cumsum(dim=0, dtype=torch.int32),
-            seq_start_loc=torch.tensor(
-                [0] + swiftkv_seq_lens, device=device, dtype=torch.int32,
-            ).cumsum(dim=0, dtype=torch.int32),
-            max_query_len=max(swiftkv_query_lens, default=0),
-            max_seq_len=max(swiftkv_seq_lens, default=0),
-            block_tables=attn_metadata.block_tables[swiftkv_seq_ids],
-            indices=torch.tensor(swiftkv_indices, device=device),
+            use_varlen=False,
+            indices=None,
+            block_table=attn_metadata.block_tables,
+            seq_lens=attn_metadata.seq_lens_tensor,
         )
 
     def forward(
@@ -384,26 +464,12 @@ class LlamaSwiftKVModel(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         sampling_metadata: Optional[SamplingMetadata] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        if sampling_metadata is None:
-            # Probably cuda graph capture forward pass. This should be all
-            # decode tokens so we can skip the swiftkv optimization.
-            assert attn_metadata.query_start_loc is None
-            seq_start_loc = torch.cat([
-                torch.zeros(1, dtype=torch.int32, device=positions.device),
-                attn_metadata.seq_lens_tensor.cumsum(dim=0),
-            ])
-            query_start_loc = torch.ones_like(seq_start_loc).cumsum(dim=0) - 1
-            swiftkv_metadata = SwiftKVMetadata(
-                query_start_loc=query_start_loc.to(torch.int32),
-                seq_start_loc=seq_start_loc.to(torch.int32),
-                max_query_len=attn_metadata.max_query_len,
-                max_seq_len=attn_metadata.max_decode_seq_len,
-                block_tables=attn_metadata.block_tables,
-                indices=None,
-            )
-        else:
-            swiftkv_metadata = self._get_swiftkv_metadata(attn_metadata,
-                                                          sampling_metadata)
+        swiftkv_metadata = (
+            self._get_swiftkv_metadata(attn_metadata, sampling_metadata)
+            if not attn_metadata.use_cuda_graph
+            else self._get_swiftkv_metadata_for_cuda_graph(attn_metadata)
+        )
+
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
@@ -419,7 +485,7 @@ class LlamaSwiftKVModel(nn.Module):
                 attn_metadata,
                 residual,
             )
-        
+
         # KV projection and cache of all the remaining layers
         kv_states_dict = {}
         swiftkv_hidden_states = self.norm_swiftkv(hidden_states + residual)
@@ -455,21 +521,71 @@ class LlamaSwiftKVModel(nn.Module):
                 for layer_idx, (k_states, v_states) in kv_states_dict.items()
             }
 
-        for layer_idx in range(self.config.num_key_value_layers,
-                               self.config.num_hidden_layers):
-            layer = self.layers[layer_idx]
-            k_states, v_states = kv_states_dict[layer_idx]
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                k_states,
-                v_states,
-                kv_caches[layer_idx],
-                swiftkv_metadata,
-                residual,
-            )
-
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if (not attn_metadata.use_cuda_graph
+            and not swiftkv_metadata.use_varlen and kv_caches[0].numel()
+            and hidden_states.size(0) <= self.cuda_graph_max_size
+        ):
+            size = hidden_states.size(0)
+            padded_size = 1 << (size - 1).bit_length()
+            g = self.cuda_graphs.get(padded_size)
+            self.cuda_graph_inputs["positions"][:size].copy_(positions)
+            self.cuda_graph_inputs["hidden_states"][:size].copy_(hidden_states)
+            self.cuda_graph_inputs["residual"][:size].copy_(residual)
+            for layer_idx, (k_states, v_states) in kv_states_dict.items():
+                self.cuda_graph_inputs["kv_states"][layer_idx][0][:size].copy_(k_states)
+                self.cuda_graph_inputs["kv_states"][layer_idx][1][:size].copy_(v_states)
+            self.cuda_graph_inputs["seq_lens"][:size].copy_(swiftkv_metadata.seq_lens)
+            num_blocks = min(self.cuda_graph_max_blocks, swiftkv_metadata.block_table.size(1))
+            self.cuda_graph_inputs["block_table"][:size, :num_blocks].copy_(swiftkv_metadata.block_table[:, :num_blocks])
+            if g is None:
+                print(f"Creating CUDA graph for size {padded_size}")
+                positions = self.cuda_graph_inputs["positions"][:padded_size]
+                hidden_states = self.cuda_graph_inputs["hidden_states"][:padded_size]
+                residual = self.cuda_graph_inputs["residual"][:padded_size]
+                for layer_idx in kv_states_dict:
+                    kv_states_dict[layer_idx] = (
+                        self.cuda_graph_inputs["kv_states"][layer_idx][0][:padded_size],
+                        self.cuda_graph_inputs["kv_states"][layer_idx][1][:padded_size],
+                    )
+                swiftkv_metadata.seq_lens = self.cuda_graph_inputs["seq_lens"][:padded_size]
+                swiftkv_metadata.block_table = self.cuda_graph_inputs["block_table"][:padded_size]
+                with graph_capture() as graph_capture_context:
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g, stream=graph_capture_context.stream):
+                        for layer_idx in range(self.config.num_key_value_layers,
+                                            self.config.num_hidden_layers):
+                            layer = self.layers[layer_idx]
+                            k_states, v_states = kv_states_dict[layer_idx]
+                            hidden_states, residual = layer(
+                                positions,
+                                hidden_states,
+                                k_states,
+                                v_states,
+                                kv_caches[layer_idx],
+                                swiftkv_metadata,
+                                residual,
+                            )
+                        hidden_states, _ = self.norm(hidden_states, residual)
+                        self.cuda_graph_inputs["hidden_states"][:padded_size].copy_(hidden_states)
+                self.cuda_graphs[padded_size] = g
+            else:
+                g.replay()
+            hidden_states = self.cuda_graph_inputs["hidden_states"][:size]
+        else:
+            for layer_idx in range(self.config.num_key_value_layers,
+                                   self.config.num_hidden_layers):
+                layer = self.layers[layer_idx]
+                k_states, v_states = kv_states_dict[layer_idx]
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    k_states,
+                    v_states,
+                    kv_caches[layer_idx],
+                    swiftkv_metadata,
+                    residual,
+                )
+            hidden_states, _ = self.norm(hidden_states, residual)
         if swiftkv_metadata.indices is None:
             return hidden_states
         orig_hidden_states[swiftkv_metadata.indices] = hidden_states
