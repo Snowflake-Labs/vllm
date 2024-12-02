@@ -66,7 +66,7 @@ from vllm.transformers_utils.configs import LlamaSwiftKVConfig
 class SwiftKVMetadata:
     use_varlen: bool
     indices: Optional[torch.Tensor]
-    block_table: Optional[torch.Tensor]
+    block_tables: Optional[torch.Tensor]
 
     # non-varlen args
     seq_lens: Optional[torch.Tensor] = None
@@ -210,7 +210,7 @@ class LlamaSwiftKVAttention(nn.Module):
                     causal=True,
                     window_size=(-1, -1),
                     alibi_slopes=None,
-                    block_table=attn_metadata.block_table,
+                    block_table=attn_metadata.block_tables,
                     softcap=0,
                 )
         else:
@@ -220,7 +220,7 @@ class LlamaSwiftKVAttention(nn.Module):
                     q=query.unsqueeze(1),
                     k_cache=kv_cache[0],
                     v_cache=kv_cache[1],
-                    block_table=attn_metadata.block_table,
+                    block_table=attn_metadata.block_tables,
                     cache_seqlens=attn_metadata.seq_lens,
                     softmax_scale=self.scaling,
                     causal=True,
@@ -382,7 +382,7 @@ class LlamaSwiftKVModel(nn.Module):
                 for layer_idx in range(config.num_key_value_layers, config.num_hidden_layers)
             },
             "seq_lens": torch.empty(self.cuda_graph_max_size, dtype=torch.int32),
-            "block_table": torch.empty((self.cuda_graph_max_size, self.cuda_graph_max_blocks), dtype=torch.int32),
+            "block_tables": torch.empty((self.cuda_graph_max_size, self.cuda_graph_max_blocks), dtype=torch.int32),
         }
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -422,7 +422,7 @@ class LlamaSwiftKVModel(nn.Module):
             return SwiftKVMetadata(
                 use_varlen=False,
                 indices=torch.tensor(swiftkv_indices, device=device),
-                block_table=attn_metadata.block_tables[swiftkv_seq_ids],
+                block_tables=attn_metadata.block_tables[swiftkv_seq_ids],
                 seq_lens=torch.tensor(swiftkv_seq_lens, device=device,
                                              dtype=torch.int32),
             )
@@ -450,7 +450,7 @@ class LlamaSwiftKVModel(nn.Module):
         return SwiftKVMetadata(
             use_varlen=False,
             indices=None,
-            block_table=attn_metadata.block_tables,
+            block_tables=attn_metadata.block_tables,
             seq_lens=attn_metadata.seq_lens_tensor,
         )
 
@@ -535,8 +535,8 @@ class LlamaSwiftKVModel(nn.Module):
                 self.cuda_graph_inputs["kv_states"][layer_idx][0][:size].copy_(k_states)
                 self.cuda_graph_inputs["kv_states"][layer_idx][1][:size].copy_(v_states)
             self.cuda_graph_inputs["seq_lens"][:size].copy_(swiftkv_metadata.seq_lens)
-            num_blocks = min(self.cuda_graph_max_blocks, swiftkv_metadata.block_table.size(1))
-            self.cuda_graph_inputs["block_table"][:size, :num_blocks].copy_(swiftkv_metadata.block_table[:, :num_blocks])
+            num_blocks = min(self.cuda_graph_max_blocks, swiftkv_metadata.block_tables.size(1))
+            self.cuda_graph_inputs["block_tables"][:size, :num_blocks].copy_(swiftkv_metadata.block_tables[:, :num_blocks])
             if g is None:
                 print(f"Creating CUDA graph for size {padded_size}")
                 positions = self.cuda_graph_inputs["positions"][:padded_size]
@@ -548,7 +548,7 @@ class LlamaSwiftKVModel(nn.Module):
                         self.cuda_graph_inputs["kv_states"][layer_idx][1][:padded_size],
                     )
                 swiftkv_metadata.seq_lens = self.cuda_graph_inputs["seq_lens"][:padded_size]
-                swiftkv_metadata.block_table = self.cuda_graph_inputs["block_table"][:padded_size]
+                swiftkv_metadata.block_tables = self.cuda_graph_inputs["block_tables"][:padded_size]
                 with graph_capture() as graph_capture_context:
                     g = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(g, stream=graph_capture_context.stream):
