@@ -1370,6 +1370,13 @@ class SpeculativeConfig:
             )
 
             draft_hf_config = draft_model_config.hf_config
+            
+            if enable_chunked_prefill and \
+                not draft_hf_config.model_type in 'mlp_speculator':
+                
+                raise ValueError(
+                    "Speculative decoding and chunked prefill are currently "
+                    f"mutually exclusive ({enable_chunked_prefill=}).")
 
             if (num_speculative_tokens is not None
                     and hasattr(draft_hf_config, "num_lookahead_tokens")):
