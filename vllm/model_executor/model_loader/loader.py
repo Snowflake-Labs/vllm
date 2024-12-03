@@ -32,6 +32,7 @@ from vllm.model_executor.layers.linear import (ReplicatedLinear,
 from vllm.model_executor.model_loader.tensorizer import (
     TensorizerConfig, is_vllm_tensorized, load_with_tensorizer,
     serialize_vllm_model, tensorizer_weights_iterator)
+from vllm.model_executor.models.interfaces import supports_lora_exemption_for_speculator
 from vllm.model_executor.model_loader.utils import (get_model_architecture,
                                                     set_default_torch_dtype)
 from vllm.model_executor.model_loader.weight_utils import (
@@ -119,6 +120,10 @@ def _initialize_model(vllm_config: VllmConfig, prefix: str = "") -> nn.Module:
         kwargs["quant_config"] = vllm_config.quant_config
     if "lora_config" in all_params:
         kwargs["lora_config"] = vllm_config.lora_config
+        if supports_lora_exemption_for_speculator(model_class):
+            logger.warning(f"Model {model_class} does not support LoRA and" 
+                            "speculator will be turned off dynamically if input request" 
+                            "requires LoRA. ")
     if "scheduler_config" in all_params:
         kwargs["scheduler_config"] = vllm_config.scheduler_config
     return model_class(**kwargs)

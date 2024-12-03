@@ -19,6 +19,7 @@ from vllm.sequence import (VLLM_INVALID_TOKEN_ID,
                            HiddenStates, SequenceGroupMetadata,
                            get_all_seq_ids_and_request_ids)
 from vllm.spec_decode.batch_expansion import BatchExpansionTop1Scorer
+from vllm.spec_decode.generic_batch_expansion import GenericBatchExpansionTop1Scorer
 from vllm.spec_decode.draft_model_runner import TP1DraftModelRunner
 from vllm.spec_decode.interfaces import (SpeculativeProposals,
                                          SpeculativeScorer, SpeculativeScores)
@@ -309,9 +310,14 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         self._metrics.init_gpu_tensors(self.rank)
         self.spec_decode_sampler.init_gpu_tensors(self.rank)
 
+        def _use_generic_batch_expansion():
+            return self.scorer_worker.scheduler_config.chunked_prefill_enabled
+
         scorer_cls: Type[SpeculativeScorer]
         if self.disable_mqa_scorer:
-            scorer_cls = BatchExpansionTop1Scorer
+            scorer_cls = BatchExpansionTop1Scorer \
+                         if not _use_generic_batch_expansion() \
+                         else GenericBatchExpansionTop1Scorer
             logger.info("[Speculative Decoding] Use batch "
                         "expansion for scoring proposals.")
         else:
@@ -423,7 +429,9 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
             sgm.is_prompt for sgm in execute_model_req.seq_group_metadata_list
         ) or num_lookahead_slots == 0 or disable_all_speculation or all(
             sgm.num_speculative_tokens == 0
-            for sgm in execute_model_req.seq_group_metadata_list)
+            for sgm in execute_model_req.seq_group_metadata_list) or any(
+                sgm.lora_request is not None
+                for sgm in execute_model_req.seq_group_metadata_list)
 
         # Broadcast how many lookahead slots are scheduled for this step, and
         # whether all speculation is disabled, to all non-driver workers.
@@ -808,6 +816,10 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
 
             accepted_index = accepted_token_ids + 1  # Convert -1 to 0
             accepted_index = accepted_index.count_nonzero(dim=1).add_(-1)
+
+            # avoid out of bounds for prefill with no accepted tokens
+            accepted_index = accepted_index.clamp(min=0) 
+
             index = accepted_index[:, None, None].expand(-1, 1, hs_size)
             second_last_token_hidden_states = hidden_states[:, -2]  # b x d
             hidden_states = hidden_states.gather(1, index).squeeze(1)  # b x d
@@ -868,8 +880,11 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
         # i.e mixed-batch [[-1, 1576], [-1, 29884], [-1, -1], [-1, -1]]
         sampler_output_list: List[SamplerOutput] = []
         for step_index in range(num_steps):
+            # Break if none of the tokens are accepted. However, if no token has been
+            # generated, produce sample output with -1 as the llm engine expects the sample output
+            # to be not empty
             if all(token_id == -1
-                   for token_id in accepted_token_ids_by_step[step_index]):
+                   for token_id in accepted_token_ids_by_step[step_index]) and step_index > 0:
                 break
 
             step_output_token_ids: List[CompletionSequenceGroupOutput] = []
@@ -900,7 +915,7 @@ class SpecDecodeWorker(LoraNotSupportedWorkerBase):
                                                 accepted_token_ids_by_step)
         maybe_rejsample_metrics = (
             self._metrics.maybe_collect_rejsample_metrics(k))
-        if maybe_rejsample_metrics is not None:
+        if maybe_rejsample_metrics is not None and sampler_output_list:
             sampler_output_list[
                 0].spec_decode_worker_metrics = maybe_rejsample_metrics
 

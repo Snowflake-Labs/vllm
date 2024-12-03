@@ -35,7 +35,9 @@ from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
-from vllm.model_executor.models import supports_lora, supports_multimodal
+from vllm.model_executor.models import (supports_lora, 
+                                        supports_multimodal, 
+                                        supports_lora_exemption_for_speculator)
 from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
 from vllm.multimodal import (MULTIMODAL_REGISTRY, BatchedTensorInputs,
                              MultiModalKwargs, MultiModalPlaceholderMap,
@@ -1077,7 +1079,8 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         logger.info("Loading model weights took %.4f GB",
                     self.model_memory_usage / float(2**30))
 
-        if self.lora_config:
+        if self.lora_config and \
+            not supports_lora_exemption_for_speculator(self.model):
             assert supports_lora(
                 self.model
             ), f"{self.model.__class__.__name__} does not support LoRA yet."
