@@ -152,7 +152,6 @@ class AutoWeightsLoader:
             weight_loader = getattr(param, "weight_loader",
                                     default_weight_loader)
             weight_loader(param, weight_data)
-            print("load", base_prefix, "into", weight_name)
 
             logger.debug("Loaded weight %s with shape %s", weight_qualname,
                          param.shape)
