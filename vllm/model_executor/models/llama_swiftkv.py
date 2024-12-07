@@ -58,6 +58,7 @@ from vllm.model_executor.models.llama import LlamaDecoderLayer, LlamaMLP
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader, is_pp_missing_parameter, maybe_prefix)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs import LlamaSwiftKVConfig
 
@@ -177,48 +178,26 @@ class LlamaSwiftKVAttention(nn.Module):
             value = value.view(-1, self.num_kv_heads, self.head_dim)
 
         if attn_metadata.use_varlen:
-            if (kv_cache.numel() == 0 or attn_metadata.block_tables is None
-                    or attn_metadata.block_tables.numel() == 0):
-                # normal attention
-                # When block_tables are not filled, it means q and k are the
-                # prompt, and they have the same length.
-                attn_output = flash_attn_varlen_func(
-                    q=query,
-                    k=key,
-                    v=value,
-                    cu_seqlens_q=attn_metadata.seq_start_loc,
-                    cu_seqlens_k=attn_metadata.seq_start_loc,
-                    max_seqlen_q=attn_metadata.max_seq_len,
-                    max_seqlen_k=attn_metadata.max_seq_len,
-                    softmax_scale=self.scaling,
-                    causal=True,
-                    window_size=(-1, -1),
-                    alibi_slopes=None,
-                    softcap=0,
-                )
-            else:
-                # prefix-enabled attention
-                attn_output = flash_attn_varlen_func(  # noqa
-                    q=query,
-                    k=kv_cache[0],
-                    v=kv_cache[1],
-                    cu_seqlens_q=attn_metadata.query_start_loc,
-                    cu_seqlens_k=attn_metadata.seq_start_loc,
-                    max_seqlen_q=attn_metadata.max_query_len,
-                    max_seqlen_k=attn_metadata.max_seq_len,
-                    softmax_scale=self.scaling,
-                    causal=True,
-                    window_size=(-1, -1),
-                    alibi_slopes=None,
-                    block_table=attn_metadata.block_tables,
-                    softcap=0,
-                )
+            # Should be neither capture nor profile run.
+            assert kv_cache.numel() and attn_metadata.block_tables.numel()
+            attn_output = flash_attn_varlen_func(  # noqa
+                q=query,
+                k=kv_cache[0],
+                v=kv_cache[1],
+                cu_seqlens_q=attn_metadata.query_start_loc,
+                cu_seqlens_k=attn_metadata.seq_start_loc,
+                max_seqlen_q=attn_metadata.max_query_len,
+                max_seqlen_k=attn_metadata.max_seq_len,
+                softmax_scale=self.scaling,
+                causal=True,
+                window_size=(-1, -1),
+                alibi_slopes=None,
+                block_table=attn_metadata.block_tables,
+                softcap=0,
+            )
         else:
             assert attn_metadata.seq_lens.numel() == num_tokens
             if kv_cache.numel():
-                # TODO(aurickq): This can happen when chunked prefill is
-                # disabled, need to fix it later. This means SwiftKV currently
-                # requires chunked prefill to be enabled.
                 assert attn_metadata.block_tables.numel()
                 attn_output = flash_attn_with_kvcache(
                     q=query.unsqueeze(1),
@@ -233,6 +212,8 @@ class LlamaSwiftKVAttention(nn.Module):
                     softcap=0,
                 ).squeeze(1)
             else:
+                # For profile run, we don't have kv_cache and block_tables.
+                assert not attn_metadata.block_tables.numel()
                 attn_output = flash_attn_func(
                     q=query.unsqueeze(1),
                     k=key.unsqueeze(1),
@@ -341,6 +322,9 @@ def _padded_size(size: int) -> int:
 class LlamaSwiftKVModel(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        if not vllm_config.scheduler_config.chunked_prefill_enabled:
+            raise ValueError("SwiftKV requires chunked prefill to be enabled")
+
         super().__init__()
 
         config = vllm_config.model_config.hf_config
