@@ -691,14 +691,12 @@ class LlamaSwiftKVModel(nn.Module):
                     kv_caches,
                     swiftkv_metadata,
                 )
-            positions, hidden_states, residual, kv_states, swiftkv_metadata = (
-                self._prepare_cuda_graph(
-                    positions,
-                    hidden_states,
-                    residual,
-                    kv_states,
-                    swiftkv_metadata,
-                )
+            self._prepare_cuda_graph(
+                positions,
+                hidden_states,
+                residual,
+                kv_states,
+                swiftkv_metadata,
             )
             self.cuda_graphs[padded_size].replay()
             hidden_states.copy_(self.cuda_graph_tensors["hidden_states"][:size])
