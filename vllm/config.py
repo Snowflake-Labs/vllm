@@ -2963,6 +2963,8 @@ class CompilationConfig(BaseModel):
                 self.splitting_ops = [
                     "vllm.unified_attention",
                     "vllm.unified_attention_with_output",
+                    "vllm.swiftkv_select",
+                    "vllm.swiftkv_expand",
                 ]
             else:
                 # v0 uses full graph compilation
