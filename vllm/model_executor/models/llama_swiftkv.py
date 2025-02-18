@@ -378,18 +378,17 @@ def swiftkv_select(
     rest_values: List[torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor],
            List[torch.Tensor]]:
-    return swiftkv_select_fake(
-        hidden_states,
-        residual,
-        positions,
-        rest_layer_names,
-        rest_kv_caches,
-        rest_keys,
-        rest_values,
-    )
     rest_layer_names = rest_layer_names.split(",")
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata
+    if attn_metadata is None:
+        return (
+            hidden_states.contiguous(),
+            residual.contiguous(),
+            positions.contiguous(),
+            [key.contiguous() for key in rest_keys],
+            [value.contiguous() for value in rest_values],
+        )
     for idx, layer_name in enumerate(rest_layer_names):
         kv_cache = rest_kv_caches[idx]
         key = rest_keys[idx]
@@ -406,7 +405,13 @@ def swiftkv_select(
                 attn._k_scale,
                 attn._v_scale,
             )
-    return hidden_states, residual, positions, rest_keys, rest_values
+    return (
+        hidden_states.contiguous(),
+        residual.contiguous(),
+        positions.contiguous(),
+        [key.contiguous() for key in rest_keys],
+        [value.contiguous() for value in rest_values],
+    )
     if attn_metadata is not None:
         logits_indices = attn_metadata.logits_indices
         swiftkv_metadata = get_swiftkv_metadata(attn_metadata, logits_indices)
@@ -450,7 +455,8 @@ def swiftkv_expand(
     orig_hidden_states: torch.Tensor,
     hidden_states: torch.Tensor,
 ) -> torch.Tensor:
-    return swiftkv_expand_fake(orig_hidden_states, hidden_states)
+    assert orig_hidden_states.shape == hidden_states.shape
+    return hidden_states.contiguous()
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata
     if attn_metadata is not None:
@@ -561,7 +567,6 @@ class LlamaSwiftKVModel(nn.Module):
         rest_keys = []
         rest_values = []
         swiftkv_hidden_states = self.norm_swiftkv(hidden_states + residual)
-        #swiftkv_hidden_states = self.norm_swiftkv(hidden_states)
         for idx, (layer, kv_cache) in enumerate(zip(
             self.layers[self.config.num_key_value_layers:],
             kv_caches[self.config.num_key_value_layers:],
@@ -589,7 +594,6 @@ class LlamaSwiftKVModel(nn.Module):
         )
         for idx, layer_idx in enumerate(range(self.config.num_key_value_layers,
                                               self.config.num_hidden_layers)):
-            if idx == 1: break
             layer = self.layers[layer_idx]
             hidden_states, residual = layer(
                 positions,
