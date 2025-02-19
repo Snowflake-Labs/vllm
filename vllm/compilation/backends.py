@@ -325,7 +325,9 @@ class VllmBackend:
         self.input_buffers = []
 
         self.vllm_config = vllm_config
-        self.compilation_config = vllm_config.compilation_config
+        self.compilation_config = vllm_config.compilation_config.model_copy()
+        self.compilation_config.inductor_compile_config = (
+            self.compilation_config.inductor_compile_config.copy())
 
         self.compiler_manager: CompilerManager = CompilerManager(
             self.compilation_config.use_inductor)

@@ -186,6 +186,14 @@ def _support_torch_compile(
                             arg.ndim + dim if dim < 0 else dim for dim in dims
                         ]
                         torch._dynamo.mark_dynamic(arg, dims)
+                    elif isinstance(arg, list):
+                        for tensor in arg:
+                            # In case dims is specified with negative indexing
+                            dims = [
+                                tensor.ndim + dim if dim < 0 else dim
+                                for dim in dims
+                            ]
+                            torch._dynamo.mark_dynamic(tensor, dims)
                     elif isinstance(arg, IntermediateTensors):
                         for tensor in arg.tensors.values():
                             # In case dims is specified with negative indexing
