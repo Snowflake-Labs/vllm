@@ -32,9 +32,7 @@ from vllm.attention.backends.abstract import AttentionType
 from vllm.attention.backends.flash_attn import FlashAttentionMetadata
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
-from vllm.distributed import (divide, get_tensor_model_parallel_rank,
-                              get_tensor_model_parallel_world_size)
-from vllm.distributed.parallel_state import graph_capture
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
@@ -56,10 +54,6 @@ from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs import LlamaSwiftKVConfig
-from vllm.vllm_flash_attn import (
-    flash_attn_varlen_func,
-    flash_attn_with_kvcache,
-)
 
 
 @dataclass
@@ -189,50 +183,6 @@ class LlamaSwiftKVAttention(nn.Module):
             attn_output = self.attn(q, k, v, kv_cache, attn_metadata,
                                     attn_type=self.attn_type)
         output, _ = self.o_proj(attn_output)
-        return output
-
-        num_tokens, hidden_size = query.shape
-        # Reshape the query, key, and value tensors.
-        query = query.view(-1, self.num_heads, self.head_dim)
-        if (key is not None) and (value is not None):
-            key = key.view(-1, self.num_kv_heads, self.head_dim)
-            value = value.view(-1, self.num_kv_heads, self.head_dim)
-
-        if attn_metadata.use_varlen:
-            # Should be neither capture nor profile run.
-            assert kv_cache.numel() and attn_metadata.block_table.numel()
-            attn_output = flash_attn_varlen_func(  # noqa
-                q=query,
-                k=kv_cache[0],
-                v=kv_cache[1],
-                cu_seqlens_q=attn_metadata.query_start_loc,
-                cu_seqlens_k=attn_metadata.seq_start_loc,
-                max_seqlen_q=attn_metadata.max_query_len,
-                max_seqlen_k=attn_metadata.max_seq_len,
-                softmax_scale=self.scaling,
-                causal=True,
-                window_size=(-1, -1),
-                alibi_slopes=None,
-                block_table=attn_metadata.block_table,
-                softcap=0,
-            )
-        else:
-            assert attn_metadata.seq_lens.numel() == num_tokens
-            assert kv_cache.numel() and attn_metadata.block_table.numel()
-            attn_output = flash_attn_with_kvcache(
-                q=query.unsqueeze(1),
-                k_cache=kv_cache[0],
-                v_cache=kv_cache[1],
-                block_table=attn_metadata.block_table,
-                cache_seqlens=attn_metadata.seq_lens,
-                softmax_scale=self.scaling,
-                causal=True,
-                window_size=(-1, -1),
-                alibi_slopes=None,
-                softcap=0,
-            ).squeeze(1)
-        output = attn_output.view(num_tokens, hidden_size)
-        output, _ = self.o_proj(output)
         return output
 
 
@@ -389,6 +339,7 @@ def swiftkv_select(
             [key.contiguous() for key in rest_keys],
             [value.contiguous() for value in rest_values],
         )
+    # print("select", hidden_states.shape[0], attn_metadata.logits_indices.numel())
     for idx, layer_name in enumerate(rest_layer_names):
         kv_cache = rest_kv_caches[idx]
         key = rest_keys[idx]
@@ -405,6 +356,22 @@ def swiftkv_select(
                 attn._k_scale,
                 attn._v_scale,
             )
+    logits_indices = attn_metadata.logits_indices
+    swiftkv_metadata = get_swiftkv_metadata(attn_metadata, logits_indices)
+    assert swiftkv_metadata.indices.numel() == logits_indices.numel()
+    attn_metadata.num_actual_tokens = swiftkv_metadata.indices.numel()
+    attn_metadata.max_query_len = swiftkv_metadata.max_query_len
+    attn_metadata.query_start_loc = swiftkv_metadata.query_start_loc
+    attn_metadata.max_seq_len = swiftkv_metadata.max_seq_len
+    attn_metadata.seq_lens = swiftkv_metadata.seq_lens
+    attn_metadata.block_table = swiftkv_metadata.block_table
+    attn_metadata.slot_mapping = swiftkv_metadata.slot_mapping
+    attn_metadata.num_input_tokens = attn_metadata.num_actual_tokens
+    hidden_states = hidden_states[logits_indices]
+    residual = residual[logits_indices]
+    positions = positions[logits_indices]
+    rest_keys = [key[logits_indices] for key in rest_keys]
+    rest_values = [value[logits_indices] for value in rest_values]
     return (
         hidden_states.contiguous(),
         residual.contiguous(),
@@ -412,24 +379,6 @@ def swiftkv_select(
         [key.contiguous() for key in rest_keys],
         [value.contiguous() for value in rest_values],
     )
-    if attn_metadata is not None:
-        logits_indices = attn_metadata.logits_indices
-        swiftkv_metadata = get_swiftkv_metadata(attn_metadata, logits_indices)
-        assert swiftkv_metadata.indices.numel() == logits_indices.numel()
-        attn_metadata.num_actual_tokens = swiftkv_metadata.indices.numel()
-        attn_metadata.max_query_len = swiftkv_metadata.max_query_len
-        attn_metadata.query_start_loc = swiftkv_metadata.query_start_loc
-        attn_metadata.max_seq_len = swiftkv_metadata.max_seq_len
-        attn_metadata.seq_lens = swiftkv_metadata.seq_lens
-        attn_metadata.block_table = swiftkv_metadata.block_table
-        attn_metadata.slot_mapping = swiftkv_metadata.slot_mapping
-        attn_metadata.num_input_tokens = attn_metadata.num_actual_tokens
-        hidden_states = hidden_states[logits_indices]
-        residual = residual[logits_indices]
-        positions = positions[logits_indices]
-        rest_keys = [key[logits_indices] for key in rest_keys]
-        rest_values = [value[logits_indices] for value in rest_values]
-    return hidden_states, residual, positions, rest_keys, rest_values
 
 
 def swiftkv_select_fake(
@@ -455,12 +404,11 @@ def swiftkv_expand(
     orig_hidden_states: torch.Tensor,
     hidden_states: torch.Tensor,
 ) -> torch.Tensor:
-    assert orig_hidden_states.shape == hidden_states.shape
-    return hidden_states.contiguous()
+    # print("expand", orig_hidden_states.shape[0], hidden_states.shape[0])
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata
     if attn_metadata is not None:
-        orig_hidden_states[attn_metadata.logits_indices] = hidden_states
+        orig_hidden_states[attn_metadata.logits_indices] = hidden_states[:attn_metadata.logits_indices.numel()]
     return orig_hidden_states
 
 
@@ -468,7 +416,7 @@ def swiftkv_expand_fake(
     orig_hidden_states: torch.Tensor,
     hidden_states: torch.Tensor,
 ) -> torch.Tensor:
-    return torch.empty_like(orig_hidden_states).contiguous()
+    return torch.empty_like(orig_hidden_states)
 
 
 direct_register_custom_op(
