@@ -325,9 +325,7 @@ class VllmBackend:
         self.input_buffers = []
 
         self.vllm_config = vllm_config
-        self.compilation_config = vllm_config.compilation_config.model_copy()
-        self.compilation_config.inductor_compile_config = (
-            self.compilation_config.inductor_compile_config.copy())
+        self.compilation_config = vllm_config.compilation_config
 
         self.compiler_manager: CompilerManager = CompilerManager(
             self.compilation_config.use_inductor)
@@ -451,7 +449,7 @@ class VllmBackend:
                                     self).run(*example_inputs)
 
         graph_path = os.path.join(local_cache_dir, "computation_graph.py")
-        if not os.path.exists(graph_path):
+        if False:  # not os.path.exists(graph_path):
             # code adapted from https://github.com/thuml/depyf/blob/dab831108a752d1facc00acdd6d4243891845c37/depyf/explain/patched_lazy_format_graph_code.py#L30 # noqa
             # use `print_readable` because it can include submodules
             src = "from __future__ import annotations\nimport torch\n" + \
