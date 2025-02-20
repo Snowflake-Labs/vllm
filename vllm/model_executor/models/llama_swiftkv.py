@@ -1,27 +1,3 @@
-# coding=utf-8
-# Adapted from
-# https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/llama/modeling_llama.py
-# Copyright 2023 The vLLM team.
-# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
-#
-# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-# and OPT implementations in this library. It has been modified from its
-# original forms to accommodate minor architectural differences compared
-# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""Inference-only LLaMA model compatible with HuggingFace weights."""
-from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -53,23 +29,6 @@ from vllm.model_executor.models.utils import (
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs import LlamaSwiftKVConfig
-
-
-@dataclass
-class SwiftKVMetadata:
-    use_varlen: bool
-    indices: Optional[torch.Tensor]
-    block_table: Optional[torch.Tensor]
-    slot_mapping: Optional[torch.Tensor]
-
-    # non-varlen args
-    seq_lens: Optional[torch.Tensor] = None
-
-    # varlen args
-    query_start_loc: Optional[torch.Tensor] = None
-    seq_start_loc: Optional[torch.Tensor] = None
-    max_query_len: Optional[int] = None
-    max_seq_len: Optional[int] = None
 
 
 class LlamaSwiftKVAttention(nn.Module):
@@ -175,12 +134,7 @@ class LlamaSwiftKVAttention(nn.Module):
     ) -> torch.Tensor:
         q, _ = self.q_proj_swiftkv(hidden_states)
         q, _ = self.rotary_emb(positions, q, torch.empty_like(k))
-
-        if self.attn_type is None:
-            attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
-        else:
-            attn_output = self.attn(q, k, v, kv_cache, attn_metadata,
-                                    attn_type=self.attn_type)
+        attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -242,7 +196,7 @@ class LlamaSwiftKVDecoderLayer(nn.Module):
         k_states: torch.Tensor,
         v_states: torch.Tensor,
         kv_cache: torch.Tensor,
-        attn_metadata: SwiftKVMetadata,
+        attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
@@ -266,52 +220,6 @@ class LlamaSwiftKVDecoderLayer(nn.Module):
             hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
-
-
-def get_swiftkv_metadata(
-        attn_metadata: FlashAttentionMetadata,
-        logits_indices: Optional[torch.Tensor],
-    ) -> SwiftKVMetadata:
-        sampling_indices = logits_indices.tolist()
-        swiftkv_indices = []
-        swiftkv_seq_ids = []
-        swiftkv_query_lens = []
-        swiftkv_seq_lens = []
-        idx = 0
-        query_start_loc = attn_metadata.query_start_loc.tolist()
-        for seq_id in range(len(query_start_loc) - 1):
-            seq_begin = query_start_loc[seq_id]
-            seq_end = query_start_loc[seq_id + 1]
-            while (idx < len(sampling_indices) and 
-                sampling_indices[idx] < seq_begin):
-                idx += 1
-            if idx >= len(sampling_indices):
-                break
-            if sampling_indices[idx] < seq_end:
-                indices = list(range(sampling_indices[idx], seq_end))
-                swiftkv_indices.extend(indices)
-                swiftkv_seq_ids.append(seq_id)
-                swiftkv_query_lens.append(len(indices))
-                swiftkv_seq_lens.append(attn_metadata.seq_lens[seq_id])
-        device = attn_metadata.query_start_loc.device
-        max_query_len = max(swiftkv_query_lens, default=0)
-        max_seq_len = max(swiftkv_seq_lens, default=0)
-        return SwiftKVMetadata(
-            use_varlen=True,
-            indices=torch.tensor(swiftkv_indices, device=device),
-            block_table=attn_metadata.block_table[swiftkv_seq_ids],
-            slot_mapping=attn_metadata.slot_mapping[swiftkv_indices],
-            seq_lens=torch.tensor(swiftkv_seq_lens, device=device,
-                                  dtype=torch.int32),
-            query_start_loc=torch.tensor(
-                [0] + swiftkv_query_lens, device=device,
-            ).cumsum(dim=0).to(torch.int32),
-            seq_start_loc=torch.tensor(
-                [0] + swiftkv_seq_lens, device=device,
-            ).cumsum(dim=0).to(torch.int32),
-            max_query_len=max_query_len,
-            max_seq_len=max_seq_len,
-        )
 
 
 @support_torch_compile
@@ -350,10 +258,7 @@ class LlamaSwiftKVPrefillRunner(nn.Module):
         rest_keys = IntermediateTensors({})
         rest_values = IntermediateTensors({})
         swiftkv_hidden_states = self.model.norm_swiftkv(hidden_states + residual)
-        for layer, kv_cache in zip(
-            self.model.layers[self.config.num_key_value_layers:],
-            kv_caches[self.config.num_key_value_layers:],
-        ):
+        for layer in self.model.layers[self.config.num_key_value_layers:]:
             kv, _ = layer.self_attn.kv_proj_swiftkv(swiftkv_hidden_states)
             k, v = kv.split(layer.self_attn.kv_size, dim=-1)
             q = torch.empty_like(hidden_states)  # Just temporary buffer
@@ -502,19 +407,14 @@ class LlamaSwiftKVModel(nn.Module):
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
             return hidden_states, residual, positions, rest_keys, rest_values
-        for idx, layer in enumerate(
-            self.layers[self.config.num_key_value_layers:],
-            start=self.config.num_key_value_layers,
-        ):
-            layer_name = layer.self_attn.attn.layer_name
-            kv_cache = kv_caches[idx]
-            key = rest_keys[layer_name]
-            value = rest_values[layer_name]
+        for layer in self.layers[self.config.num_key_value_layers:]:
             attn = layer.self_attn.attn
+            layer_name = attn.layer_name
+            kv_cache = attn.kv_cache[forward_context.virtual_engine]
             if kv_cache.numel():
                 torch.ops._C_cache_ops.reshape_and_cache_flash(
-                    key.view(-1, attn.num_kv_heads, attn.head_size),
-                    value.view(-1, attn.num_kv_heads, attn.head_size),
+                    rest_keys[layer_name].view(-1, attn.num_kv_heads, attn.head_size),
+                    rest_values[layer_name].view(-1, attn.num_kv_heads, attn.head_size),
                     kv_cache[0],
                     kv_cache[1],
                     attn_metadata.slot_mapping,
@@ -523,23 +423,22 @@ class LlamaSwiftKVModel(nn.Module):
                     attn._v_scale,
                 )
         logits_indices = attn_metadata.logits_indices
-        swiftkv_metadata = get_swiftkv_metadata(attn_metadata, logits_indices)
-        assert swiftkv_metadata.indices.numel() == logits_indices.numel()
-        attn_metadata.num_actual_tokens = swiftkv_metadata.indices.numel()
-        attn_metadata.max_query_len = swiftkv_metadata.max_query_len
-        attn_metadata.query_start_loc = swiftkv_metadata.query_start_loc
-        attn_metadata.max_seq_len = swiftkv_metadata.max_seq_len
-        attn_metadata.seq_lens = swiftkv_metadata.seq_lens
-        attn_metadata.block_table = swiftkv_metadata.block_table
-        attn_metadata.slot_mapping = swiftkv_metadata.slot_mapping
-        attn_metadata.num_input_tokens = attn_metadata.num_actual_tokens
+
+        attn_metadata.num_actual_tokens = logits_indices.numel()
+        attn_metadata.num_input_tokens = logits_indices.numel()
+        attn_metadata.query_start_loc = torch.searchsorted(
+            logits_indices, attn_metadata.query_start_loc, out_int32=True)
+        #attn_metadata.max_query_len = (
+        #    attn_metadata.query_start_loc.diff().max().item())
+        attn_metadata.slot_mapping = attn_metadata.slot_mapping[logits_indices]
+
         hidden_states = hidden_states[logits_indices]
         residual = residual[logits_indices]
         positions = positions[logits_indices]
-        rest_keys = IntermediateTensors({
-            n: key[logits_indices] for n, key in rest_keys.items()})
-        rest_values = IntermediateTensors({
-            n: value[logits_indices] for n, value in rest_values.items()})
+        rest_keys = IntermediateTensors(
+            {n: key[logits_indices] for n, key in rest_keys.items()})
+        rest_values = IntermediateTensors(
+            {n: value[logits_indices] for n, value in rest_values.items()})
         return hidden_states, residual, positions, rest_keys, rest_values
 
     def forward(
@@ -597,8 +496,7 @@ class LlamaSwiftKVModel(nn.Module):
         )
 
         if attn_metadata is not None:
-            orig_hidden_states[logits_indices] = (
-                hidden_states[:logits_indices.numel()])
+            orig_hidden_states[logits_indices] = hidden_states[:size]
 
         return orig_hidden_states
 
