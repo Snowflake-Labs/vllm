@@ -51,7 +51,6 @@ from vllm.model_executor.models.llama import LlamaDecoderLayer, LlamaMLP
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader, is_pp_missing_parameter, maybe_prefix)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
-from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs import LlamaSwiftKVConfig
 
@@ -409,18 +408,11 @@ class LlamaSwiftKVDecodeRunner(nn.Module):
 class LlamaSwiftKVModel(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        if not vllm_config.scheduler_config.chunked_prefill_enabled:
-            raise ValueError("SwiftKV requires chunked prefill to be enabled")
-
         super().__init__()
 
         config = vllm_config.model_config.hf_config
-        cache_config = vllm_config.cache_config
         self.quant_config = vllm_config.quant_config
         lora_config = vllm_config.lora_config
-        self.kv_cache_dtype = (
-            cache_config.cache_dtype if cache_config is not None else "auto"
-        )
 
         self.config = config
         self.padding_idx = config.pad_token_id
@@ -449,24 +441,32 @@ class LlamaSwiftKVModel(nn.Module):
         self.norm_swiftkv = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        vllm_config.compilation_config = vllm_config.compilation_config.model_copy()
+        self._init_prefill_runner(vllm_config)
+        self._init_decode_runner(vllm_config)
+
+    def _init_prefill_runner(self, vllm_config: VllmConfig):
+        vllm_config.compilation_config = (
+            vllm_config.compilation_config.model_copy())
         vllm_config.compilation_config.inductor_compile_config = (
             vllm_config.compilation_config.inductor_compile_config.copy())
         self.prefill_runner = LlamaSwiftKVPrefillRunner(
             vllm_config=vllm_config, model=self)
 
-        vllm_config.compilation_config = vllm_config.compilation_config.model_copy()
+    def _init_decode_runner(self, vllm_config: VllmConfig):
+        vllm_config.compilation_config = (
+            vllm_config.compilation_config.model_copy())
         vllm_config.compilation_config.inductor_compile_config = (
             vllm_config.compilation_config.inductor_compile_config.copy())
         self.decode_runner = LlamaSwiftKVDecodeRunner(
             vllm_config=vllm_config, model=self)
 
+        config = vllm_config.model_config.hf_config
         self.cuda_graph_max_batch_size = max(
             vllm_config.compilation_config.cudagraph_capture_sizes)
         num_kv_heads = self.layers[0].self_attn.num_kv_heads
         head_dim = self.layers[0].self_attn.head_dim
         kv_size = num_kv_heads * head_dim
-        self.cuda_graph_tensors = {
+        self.decode_runner_inputs = {
             "hidden_states": torch.empty(self.cuda_graph_max_batch_size,
                                          config.hidden_size),
             "residual": torch.empty(self.cuda_graph_max_batch_size,
@@ -560,15 +560,6 @@ class LlamaSwiftKVModel(nn.Module):
             attn_metadata,
         )
 
-        rest_layer_names = []
-        rest_kv_caches = []
-        for layer, kv_cache in zip(
-            self.layers[self.config.num_key_value_layers:],
-            kv_caches[self.config.num_key_value_layers:],
-        ):
-            rest_layer_names.append(layer.self_attn.attn.layer_name)
-            rest_kv_caches.append(kv_cache)
-
         orig_hidden_states = hidden_states
         hidden_states, residual, positions, rest_keys, rest_values = (
             self.swiftkv_select(
@@ -582,18 +573,18 @@ class LlamaSwiftKVModel(nn.Module):
         )
         size = hidden_states.shape[0]
         if size <= self.cuda_graph_max_batch_size:
-            self.cuda_graph_tensors["hidden_states"][:size].copy_(hidden_states)
-            hidden_states = self.cuda_graph_tensors["hidden_states"][:size]
-            self.cuda_graph_tensors["residual"][:size].copy_(residual)
-            residual = self.cuda_graph_tensors["residual"][:size]
-            self.cuda_graph_tensors["positions"][:size].copy_(positions)
-            positions = self.cuda_graph_tensors["positions"][:size]
+            self.decode_runner_inputs["hidden_states"][:size].copy_(hidden_states)
+            hidden_states = self.decode_runner_inputs["hidden_states"][:size]
+            self.decode_runner_inputs["residual"][:size].copy_(residual)
+            residual = self.decode_runner_inputs["residual"][:size]
+            self.decode_runner_inputs["positions"][:size].copy_(positions)
+            positions = self.decode_runner_inputs["positions"][:size]
             for name, key in rest_keys.items():
-                self.cuda_graph_tensors["keys"][name][:size].copy_(key)
-                rest_keys[name] = self.cuda_graph_tensors["keys"][name][:size]
+                self.decode_runner_inputs["keys"][name][:size].copy_(key)
+                rest_keys[name] = self.decode_runner_inputs["keys"][name][:size]
             for name, value in rest_values.items():
-                self.cuda_graph_tensors["values"][name][:size].copy_(value)
-                rest_values[name] = self.cuda_graph_tensors["values"][name][:size]
+                self.decode_runner_inputs["values"][name][:size].copy_(value)
+                rest_values[name] = self.decode_runner_inputs["values"][name][:size]
 
         hidden_states = self.decode_runner(
             hidden_states,
