@@ -1,6 +1,7 @@
 import argparse
 import dataclasses
 import json
+import os
 from dataclasses import dataclass
 from typing import (TYPE_CHECKING, Any, Dict, List, Literal, Mapping, Optional,
                     Tuple, Type, Union, cast, get_args)
@@ -190,6 +191,9 @@ class EngineArgs:
 
     override_neuron_config: Optional[Dict[str, Any]] = None
     override_pooler_config: Optional[PoolerConfig] = None
+
+    swiftkv_kv_layers: Optional[int] = None
+    swiftkv_group_size: Optional[int] = None
 
     def __post_init__(self):
         if not self.tokenizer:
@@ -876,6 +880,12 @@ class EngineArgs:
             default=None,
             help="Override or set the pooling method in the embedding model. "
             "e.g. {\"pooling_type\": \"mean\", \"normalize\": false}.'")
+        parser.add_argument(
+            '--swiftkv-kv-layers',
+            type=int)
+        parser.add_argument(
+            '--swiftkv-group-size',
+            type=int)
 
         return parser
 
@@ -1139,6 +1149,9 @@ class EngineArgs:
             collect_model_execute_time="worker" in detailed_trace_modules
             or "all" in detailed_trace_modules,
         )
+
+        os.env["SWIFTKV_KV_LAYERS"] = self.swiftkv_kv_layers
+        os.env["SWIFTKV_GROUP_SIZE"] = self.swiftkv_group_size
 
         return VllmConfig(
             model_config=model_config,

@@ -1,4 +1,5 @@
 """CacheEngine class for managing the KV cache."""
+import os
 from typing import List
 
 import torch
@@ -69,19 +70,24 @@ class CacheEngine:
         device: str,
     ) -> List[torch.Tensor]:
         """Allocates KV cache on the specified device."""
+        kv_layers = os.env["SWIFTKV_KV_LAYERS"]
+        group_size = os.env["SWIFTKV_GROUP_SIZE"]
         kv_cache_shape = self.attn_backend.get_kv_cache_shape(
             num_blocks, self.block_size, self.num_kv_heads, self.head_size)
         pin_memory = is_pin_memory_available() if device == "cpu" else False
         kv_cache: List[torch.Tensor] = []
-        for _ in range(self.num_attention_layers):
+        for layer_idx in range(self.num_attention_layers):
             # null block in CpuGpuBlockAllocator requires at least that
             # block to be zeroed-out.
             # We zero-out everything for simplicity.
-            kv_cache.append(
-                torch.zeros(kv_cache_shape,
-                            dtype=self.dtype,
-                            pin_memory=pin_memory,
-                            device=device))
+            if layer_idx < kv_layers or (layer_idx - kv_layers) % group_size == 0:
+                kv_cache.append(
+                    torch.zeros(kv_cache_shape,
+                                dtype=self.dtype,
+                                pin_memory=pin_memory,
+                                device=device))
+            else:
+                kv_cache.append(kv_cache[-1])
         return kv_cache
 
     def swap_in(self, src_to_dst: torch.Tensor) -> None:
@@ -103,10 +109,13 @@ class CacheEngine:
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
     ) -> int:
+        kv_layers = int(os.env["SWIFTKV_KV_LAYERS"])
+        group_size = int(os.env["SWIFTKV_GROUP_SIZE"])
         head_size = model_config.get_head_size()
         num_heads = model_config.get_num_kv_heads(parallel_config)
         num_attention_layers = model_config.get_num_attention_layers(
             parallel_config)
+        num_attention_layers = kv_layers + (num_attention_layers - kv_layers) // group_size
 
         key_cache_block = cache_config.block_size * num_heads * head_size
         value_cache_block = key_cache_block
