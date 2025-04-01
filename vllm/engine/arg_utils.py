@@ -1150,8 +1150,9 @@ class EngineArgs:
             or "all" in detailed_trace_modules,
         )
 
-        os.env["SWIFTKV_KV_LAYERS"] = self.swiftkv_kv_layers
-        os.env["SWIFTKV_GROUP_SIZE"] = self.swiftkv_group_size
+        os.environ["SWIFTKV_KV_LAYERS"] = str(self.swiftkv_kv_layers)
+        os.environ["SWIFTKV_GROUP_SIZE"] = str(self.swiftkv_group_size)
+        model_config.hf_config.num_key_value_layers = self.swiftkv_kv_layers
 
         return VllmConfig(
             model_config=model_config,

@@ -70,8 +70,8 @@ class CacheEngine:
         device: str,
     ) -> List[torch.Tensor]:
         """Allocates KV cache on the specified device."""
-        kv_layers = os.env["SWIFTKV_KV_LAYERS"]
-        group_size = os.env["SWIFTKV_GROUP_SIZE"]
+        kv_layers = int(os.environ["SWIFTKV_KV_LAYERS"])
+        group_size = int(os.environ["SWIFTKV_GROUP_SIZE"])
         kv_cache_shape = self.attn_backend.get_kv_cache_shape(
             num_blocks, self.block_size, self.num_kv_heads, self.head_size)
         pin_memory = is_pin_memory_available() if device == "cpu" else False
@@ -109,8 +109,8 @@ class CacheEngine:
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
     ) -> int:
-        kv_layers = int(os.env["SWIFTKV_KV_LAYERS"])
-        group_size = int(os.env["SWIFTKV_GROUP_SIZE"])
+        kv_layers = int(os.environ["SWIFTKV_KV_LAYERS"])
+        group_size = int(os.environ["SWIFTKV_GROUP_SIZE"])
         head_size = model_config.get_head_size()
         num_heads = model_config.get_num_kv_heads(parallel_config)
         num_attention_layers = model_config.get_num_attention_layers(
